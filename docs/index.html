@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WTQ账号池 · 预览</title>
+  <!--
+    Preview page for the plugin panel.
+
+    The iframe mounts the repository's own renderer/index.html, panel.css and
+    panel.js against a stubbed host bridge, so what you click is the shipping
+    component. Screenshots for the README are taken from this same page.
+
+    Run it:  node docs/serve.cjs      then open the printed address.
+  -->
+  <style>
+    /* Palette mirrors renderer/panel.css so the wrapper reads as part of the
+       plugin. Same design language: borders and spacing carry the hierarchy,
+       no shadows. */
+    :root {
+      color-scheme: light;
+      --bg: #f4f5f7;
+      --panel: #ffffff;
+      --card: #ffffff;
+      --fg: #1b1d21;
+      --muted: #6b7280;
+      --border: #e3e5ea;
+      --accent: #2e706a;
+      --on-accent: #ffffff;
+    }
+    :root[data-base="dark"] {
+      color-scheme: dark;
+      --bg: #101216;
+      --panel: #16181d;
+      --card: #1c1f25;
+      --fg: #e8eaee;
+      --muted: #9aa1ad;
+      --border: #2c3038;
+      --accent: #67c1b8;
+      --on-accent: #163633;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    a { color: var(--accent); }
+
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 56px; }
+
+    header.top {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px;
+      padding-bottom: 16px; border-bottom: 1px solid var(--border);
+    }
+    header.top h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.01em; }
+    header.top .tag {
+      font-size: 12px; color: var(--muted);
+      border: 1px solid var(--border); border-radius: 999px; padding: 1px 9px;
+    }
+    header.top .spacer { flex: 1 1 auto; }
+    header.top .links { display: flex; gap: 14px; font-size: 13px; }
+
+    .lede { margin: 18px 0 22px; max-width: 70ch; color: var(--fg); }
+    .lede p { margin: 0 0 8px; }
+    .lede .muted { color: var(--muted); font-size: 13px; }
+
+    .toolbar {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+      margin: 0 0 12px;
+    }
+    .toolbar .label { font-size: 12px; color: var(--muted); margin-right: 2px; }
+    .seg { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .seg button {
+      appearance: none; border: 0; background: transparent; color: var(--muted);
+      font: inherit; font-size: 13px; padding: 5px 12px; cursor: pointer;
+    }
+    .seg button + button { border-left: 1px solid var(--border); }
+    .seg button:hover { color: var(--fg); }
+    .seg button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+
+    .stage {
+      border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+      background: var(--panel);
+    }
+    .stage .caption {
+      display: flex; align-items: center; gap: 8px;
+      padding: 9px 14px; font-size: 12px; color: var(--muted);
+      border-bottom: 1px solid var(--border);
+    }
+    .stage .caption .dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+    }
+    iframe { display: block; width: 100%; height: 820px; border: 0; background: var(--panel); }
+
+    footer.foot {
+      margin-top: 18px; font-size: 12px; color: var(--muted);
+      display: flex; flex-wrap: wrap; gap: 6px 16px;
+    }
+    @media (max-width: 720px) { iframe { height: 720px; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <h1>WTQ账号池</h1>
+      <span class="tag">MIT</span>
+      <span class="spacer"></span>
+      <nav class="links">
+        <a href="https://github.com/chengzhi-c/dsh-wtq-pool#readme">README</a>
+        <a href="https://github.com/chengzhi-c/dsh-wtq-pool">GitHub</a>
+      </nav>
+    </header>
+
+    <div class="lede">
+      <p>把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 DeepSeek Harness。WorkBuddy 支持限流换号，Trae、Qoder 按请求分发。</p>
+      <p class="muted">
+        下面加载实际面板代码，使用虚构演示数据，支持来源切换、模型设置和主题预览，不读取本机账号或令牌。
+      </p>
+    </div>
+
+    <div class="toolbar">
+      <span class="label">主题</span>
+      <div class="seg" id="segBase">
+        <button type="button" data-base="light" aria-pressed="true">亮色</button>
+        <button type="button" data-base="dark" aria-pressed="false">暗色</button>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="caption"><span class="dot"></span>实际面板代码 · 演示数据</div>
+      <iframe id="panel" src="./preview-panel.html" title="WTQ Pool 面板预览"></iframe>
+    </div>
+
+    <footer class="foot">
+      <span>演示数据为虚构，不含任何真实账号或令牌。</span>
+      <span>本地运行：<code>node docs/serve.cjs</code></span>
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      "use strict";
+      var frame = document.getElementById("panel");
+      var root = document.documentElement;
+      var base = "light";
+
+      function press(segId, attr, value) {
+        var buttons = document.getElementById(segId).querySelectorAll("button");
+        for (var i = 0; i < buttons.length; i += 1) {
+          buttons[i].setAttribute("aria-pressed", String(buttons[i].getAttribute(attr) === value));
+        }
+      }
+
+      /* The panel ships its own source and view tabs, so the wrapper only has to
+         hand it the theme. The frame is same-origin, hence the direct call. */
+      function apply() {
+        if (frame.contentWindow.__previewSetAppearance) {
+          frame.contentWindow.__previewSetAppearance(base);
+        }
+      }
+
+      function onSegment(segId, attr, pick) {
+        document.getElementById(segId).addEventListener("click", function (event) {
+          var button = event.target.closest("button[" + attr + "]");
+          if (!button) return;
+          pick(button.getAttribute(attr));
+          press(segId, attr, button.getAttribute(attr));
+          apply();
+        });
+      }
+      onSegment("segBase", "data-base", function (v) { base = v; root.dataset.base = v; });
+
+      root.dataset.base = base;
+      // The panel boots asynchronously after the frame fetches its markup.
+      frame.addEventListener("load", function () { setTimeout(apply, 400); });
+    })();
+  </script>
+</body>
+</html>

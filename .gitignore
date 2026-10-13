@@ -1,0 +1,7 @@
+node_modules/
+*.log
+
+# Build output. The tarball is produced by `pnpm pack` from the tree, so it is a
+# release artifact rather than source: keeping it in history would carry a
+# ~180 KB binary through every version bump.
+dist/

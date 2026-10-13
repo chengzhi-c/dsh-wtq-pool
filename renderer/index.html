@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self' file:; style-src 'self' file: 'unsafe-inline'; img-src 'self' file: data:; font-src 'self' file:; connect-src 'none'; form-action 'none'; base-uri 'none'"
+  />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!--
+    This page is shown inside a frame on the Plugins page, so it carries no
+    window chrome of its own; the sticky header below is the whole top band.
+  -->
+  <meta name="dsh-panel" content="v1" />
+  <meta name="pi-plugin-chrome" content="v3" />
+  <title>WTQ Pool</title>
+  <link rel="stylesheet" href="./panel.css" />
+</head>
+<body>
+  <header class="bar" id="topBar">
+    <div class="bar-title">
+      <span class="dot" id="healthDot" aria-hidden="true"></span>
+      <strong id="barTitle">WTQ Pool</strong>
+      <span class="muted" id="barSub"></span>
+    </div>
+    <div class="bar-actions">
+      <button type="button" id="rescanBtn" class="ghost ic-scan"></button>
+      <button type="button" id="resetBtn" class="ghost ic-rewind"></button>
+      <button type="button" id="refreshBtn" class="ghost ic-refresh"></button>
+    </div>
+  </header>
+
+  <p class="sr-only" id="live" aria-live="polite"></p>
+
+  <main class="page">
+    <div id="banner" class="banner" hidden></div>
+
+    <!-- Source is the top level: WorkBuddy / Trae / Qoder each own one page of
+         every view below, so the three sources never mix on one screen. -->
+    <nav class="tabs" id="sourceTabs" role="tablist">
+      <button type="button" class="tab active" data-source="workbuddy" role="tab" aria-selected="true">WorkBuddy</button>
+      <button type="button" class="tab" data-source="trae" role="tab" aria-selected="false">Trae</button>
+      <button type="button" class="tab" data-source="qoder" role="tab" aria-selected="false">Qoder</button>
+    </nav>
+
+    <!-- Only appears when the host has not registered this plugin's model
+         groups yet, which needs one plugin reload to clear. -->
+    <p class="hint" id="hostHint" hidden></p>
+
+    <!-- Second level: the three views of the selected source. -->
+    <nav class="subtabs" id="viewTabs" role="tablist">
+      <button type="button" class="subtab active" data-tab="pool" role="tab" aria-selected="true"></button>
+      <button type="button" class="subtab" data-tab="models" role="tab" aria-selected="false"></button>
+      <button type="button" class="subtab" data-tab="check" role="tab" aria-selected="false"></button>
+    </nav>
+
+    <section id="poolView" class="view">
+      <div class="source-group" id="workbuddyGroup" data-source="workbuddy">
+        <div class="source-head" id="workbuddyHead"></div>
+        <nav class="regions" id="regionTabs" role="tablist"></nav>
+        <div class="strip" id="poolStrip"></div>
+        <div id="accounts"></div>
+      </div>
+      <div class="source-group" id="traeStrip" data-source="trae" hidden></div>
+      <div class="source-group" id="qoderStrip" data-source="qoder" hidden></div>
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title" id="composerTitle"></span>
+          <span class="muted" id="composerState"></span>
+        </div>
+        <div class="switch-row">
+          <button type="button" class="small" id="showComposerPoints"></button>
+          <span class="switch-copy">
+            <span class="switch-lead" id="composerPointsText"></span>
+            <span class="hint" id="composerPointsHint"></span>
+          </span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title" id="autoTitle"></span>
+          <span class="muted" id="autoState"></span>
+        </div>
+        <div class="seg" id="autoControl" role="group"></div>
+        <div class="auto-hours">
+          <label class="muted" for="autoHours" id="autoHoursLabel"></label>
+          <input type="text" id="autoHours" class="search" inputmode="numeric" />
+          <button type="button" id="autoHoursSave" class="small"></button>
+          <button type="button" id="autoRunNow" class="small"></button>
+        </div>
+        <!-- Its own box, below the controls rather than beside them: the lines
+             are a log of what a pass did, and sharing a row with the hour field
+             made both hard to read. -->
+        <div class="hint log-box" id="autoNote"></div>
+        <p class="hint" id="autoHint"></p>
+      </div>
+    </section>
+
+    <section id="modelsView" class="view" hidden>
+      <!-- One model page for all three sources: the region row and the two
+           columns below are shared. What differs - which roster, which stored
+           selection, which gateway the save writes - is answered in panel.js,
+           so Trae and Qoder get the pool's own editor instead of a copy. -->
+      <nav class="regions" id="modelRegionTabs" role="tablist"></nav>
+      <!-- Two columns: the roster on the left, the settings of the ticked
+           models on the right. The grid collapses to one column (roster above
+           settings) once the window is dragged narrower than 720px - see the
+           media query in panel.css. -->
+      <div class="model-columns">
+        <section class="model-col">
+          <div class="pane-head">
+            <input type="checkbox" id="modelSelectAll" class="row-check" />
+            <h3 class="pane-title" id="modelListTitle"></h3>
+            <button type="button" class="pane-action ic-download" id="modelFetchBtn"></button>
+          </div>
+          <div class="pane-search">
+            <input type="search" id="modelSearch" class="search" />
+          </div>
+          <div id="models" class="model-rows"></div>
+        </section>
+
+        <section class="model-col">
+          <div class="pane-head">
+            <h3 class="pane-title" id="modelEditTitle"></h3>
+            <span class="count-chip" id="modelEditCount"></span>
+          </div>
+          <div class="pane-search">
+            <input type="search" id="chosenSearch" class="search" />
+          </div>
+          <div id="chosen" class="model-rows"></div>
+        </section>
+      </div>
+
+      <!-- A gateway's own last error, or the note about what the desktop will
+           actually list. Empty for the pool. -->
+      <p class="hint" id="modelPageHint"></p>
+      <div class="savebar" id="savebar" hidden>
+        <span id="saveNote"></span>
+        <span class="spacer"></span>
+        <button type="button" id="discardBtn" class="ghost ic-x"></button>
+        <button type="button" id="saveBtn" class="primary ic-check"></button>
+      </div>
+    </section>
+
+    <section id="checkView" class="view" hidden>
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title" id="checkTitle"></span>
+          <button type="button" id="doctorBtn" class="ghost small ic-activity"></button>
+          <button type="button" id="copyBtn" class="ghost small ic-copy"></button>
+          <span class="copy-hint" id="copyHint"></span>
+        </div>
+        <div id="findings"></div>
+        <pre id="report" class="report"></pre>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <div class="foot-status" id="foot"></div>
+      <div class="foot-links">
+        <a href="https://github.com/chengzhi-c/dsh-wtq-pool" target="_blank" rel="noopener noreferrer" data-foot="github">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false">
+            <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+          </svg>
+          <span data-foot-label="github">GitHub</span>
+        </a>
+        <a href="https://www.npmjs.com/package/dsh-wtq-pool" target="_blank" rel="noopener noreferrer" data-foot="npm">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <rect x="2.5" y="4.5" width="11" height="7" rx="1" />
+            <path d="M5.5 6.7v2.6M8 6.7v2.6M10.5 6.7v2.6" />
+          </svg>
+          <span data-foot-label="npm">npm</span>
+        </a>
+        <a href="https://github.com/chengzhi-c/dsh-wtq-pool#readme" target="_blank" rel="noopener noreferrer" data-foot="docs">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <path d="M2.5 3.3c1.8-1 3.8-1 5.5 0 1.7-1 3.7-1 5.5 0v9.4c-1.8-1-3.8-1-5.5 0-1.7-1-3.7-1-5.5 0Z" />
+            <path d="M8 3.3v9.4" />
+          </svg>
+          <span data-foot-label="docs">Docs</span>
+        </a>
+        <a href="https://github.com/chengzhi-c/dsh-wtq-pool/blob/main/LICENSE" target="_blank" rel="noopener noreferrer" data-foot="license">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <path d="M8 1.8 13 3.6v4.3c0 3-2 5.2-5 6.3-3-1.1-5-3.3-5-6.3V3.6Z" />
+            <path d="M5.9 7.7 7.4 9.2l2.9-2.9" />
+          </svg>
+          <span data-foot-label="license">License</span>
+        </a>
+      </div>
+    </footer>
+  </main>
+
+  <script src="./panel.js"></script>
+</body>
+</html>

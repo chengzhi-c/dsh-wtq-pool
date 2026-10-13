@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WTQ Pool panel preview</title>
+  <!--
+    dsh frames this panel inside the Plugins page and gives it no window chrome
+    of its own, so panel.css already defaults --xd-titlebar to 0 and no override
+    is needed here.
+  -->
+</head>
+<body>
+  <script src="./preview-data.js"></script>
+  <script>
+    /*
+     * Stand-in for the host: the panel asks `window.pluginBridge` for everything
+     * it shows, so answering those calls is the whole of a host.
+     *
+     * The panel is fetched from renderer/ below and mounted as-is, so this
+     * preview never drifts from what ships.
+     */
+    (function () {
+      "use strict";
+      var data = window.__previewData;
+      var appearance = { base: "light", locale: "zh-CN" };
+      var handlers = {};
+      function copy(value) { return JSON.parse(JSON.stringify(value)); }
+
+      window.pluginBridge = {
+        invoke: function (channel, payload) {
+          if (channel === "xd.state") return Promise.resolve(copy(data.state));
+          if (channel === "xd.doctor") return Promise.resolve(copy(data.doctor));
+          if (channel === "app.getAppearance") {
+            return Promise.resolve({ base: appearance.base, locale: appearance.locale });
+          }
+          if (channel === "xd.checkin") {
+            return Promise.resolve({ state: copy(data.state), result: { credit: 20 } });
+          }
+          if (channel === "xd.checkinAll") {
+            return Promise.resolve({ state: copy(data.state), claimed: 0 });
+          }
+          if (channel === "xd.copyReport") return Promise.resolve({ ok: true });
+          if (channel === "shell.openExternal") {
+            window.open(payload.url, "_blank", "noopener,noreferrer");
+            return Promise.resolve();
+          }
+          // Every other channel is a write, and a write answers with the whole
+          // status document - which is what the panel redraws from.
+          return Promise.resolve(copy(data.state));
+        },
+        on: function (channel, handler) { handlers[channel] = handler; },
+      };
+
+      // Called by the hosting page's theme buttons.
+      window.__previewSetAppearance = function (base) {
+        if (base !== "light" && base !== "dark") return;
+        appearance.base = base;
+        if (handlers["appearance:changed"]) {
+          handlers["appearance:changed"]({ base: base, locale: appearance.locale });
+        }
+      };
+    })();
+
+    (function () {
+      "use strict";
+      var css = document.createElement("link");
+      css.rel = "stylesheet";
+      css.href = "../renderer/panel.css";
+      document.head.appendChild(css);
+
+      fetch("../renderer/index.html").then(function (response) {
+        return response.text();
+      }).then(function (html) {
+        var parsed = new DOMParser().parseFromString(html, "text/html");
+        // The panel names its stylesheet and script as siblings. Both are
+        // re-attached below with the paths this page needs, so the markup comes
+        // straight from the real file.
+        var owned = parsed.querySelectorAll("link[rel=stylesheet], script");
+        for (var i = 0; i < owned.length; i += 1) owned[i].remove();
+        document.body.innerHTML = parsed.body.innerHTML;
+
+        var js = document.createElement("script");
+        js.src = "../renderer/panel.js";
+        document.body.appendChild(js);
+      }).catch(function (error) {
+        // Opening this file straight from disk is the likely cause, so the
+        // message names the command that works.
+        document.body.textContent = "panel failed to load (" + error + "). " +
+          "Open the page through the local server instead: node docs/serve.cjs";
+      });
+    })();
+  </script>
+</body>
+</html>

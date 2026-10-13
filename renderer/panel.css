@@ -1,0 +1,1166 @@
+/*
+ * dsh-wtq-pool panel.
+ *
+ * Design language: quiet instrument. Hierarchy comes from borders, spacing and
+ * weight — never from shadows (deliberately zero box-shadow in this panel) or
+ * from colour blocks. The panel carries its own palette, one per base, selected
+ * by the `data-base` attribute the host's appearance bridge sets: the host
+ * injects no layout variables at all, so there is no host palette to borrow and
+ * both themes are declared below.
+ *
+ * Icons are 16px-grid stroke drawings shipped as data-URI masks and tinted
+ * with currentColor; the CSP allows data: images and forbids everything
+ * remote, so no webfonts and no external images anywhere.
+ */
+
+:root {
+  /* Native surfaces the panel does not paint itself — the <select> popup for a
+     model's default thinking level, scrollbars, form controls — are rendered by
+     the browser from `color-scheme`, not from these variables. Without it a dark
+     host still got a light native popup. */
+  color-scheme: light;
+  --xd-bg: #ffffff;
+  --xd-fg: #1b1d21;
+  --xd-muted: #6b7280;
+  --xd-border: #e3e5ea;
+  /* The panel owns its accent: one hue per role, shared by both bases, so a
+     role reads as the same colour at two strengths instead of four vivid hues.
+     --xd-on-accent / --xd-on-danger are the inks that sit on filled controls. */
+  --xd-accent: #2e706a;
+  --xd-on-accent: #ffffff;
+  --xd-card: #ffffff;
+  --xd-soft: color-mix(in srgb, var(--xd-fg) 4%, transparent);
+  --xd-softer: color-mix(in srgb, var(--xd-fg) 2.5%, transparent);
+  --xd-line: color-mix(in srgb, var(--xd-border) 60%, transparent);
+  --xd-danger: #7b352d;
+  --xd-on-danger: #ffffff;
+  --xd-warn: #7a5c29;
+  --xd-ok: #2e664a;
+  /* The panel is framed by the Plugins page and carries no window chrome, so
+     this is always zero; it stays as the one place a chrome band would go. */
+  --xd-titlebar: 0px;
+  --xd-radius: 8px;
+  --xd-radius-small: 6px;
+}
+
+/*
+ * Dark palette.
+ *
+ * Keyed off `[data-base="dark"]`, the attribute the embedding page sets from the
+ * appearance it is showing — NOT off
+ * `prefers-color-scheme`. The host theme and the OS theme are separate settings
+ * and routinely disagree (the app has its own appearance switch), so following
+ * the media query alone painted the light palette onto a dark host: `--xd-fg`
+ * stayed near-black, and every control that fills with it — the selected preset
+ * chip above all — came out black-on-black.
+ *
+ * The media query is kept as the fallback for a panel opened outside the host
+ * (a plain browser during development), where no attribute is ever set.
+ */
+:root[data-base="dark"] {
+  color-scheme: dark;
+  --xd-bg: #16181d;
+  --xd-fg: #e8eaee;
+  --xd-muted: #9aa1ad;
+  --xd-border: #2c3038;
+  --xd-card: #1c1f25;
+  --xd-accent: #67c1b8;
+  --xd-on-accent: #163633;
+  --xd-ok: #64b98f;
+  --xd-danger: #c8736a;
+  --xd-on-danger: #341b18;
+  --xd-warn: #cba462;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-base="light"]) {
+    color-scheme: dark;
+    --xd-bg: #16181d;
+    --xd-fg: #e8eaee;
+    --xd-muted: #9aa1ad;
+    --xd-border: #2c3038;
+    --xd-card: #1c1f25;
+    --xd-accent: #67c1b8;
+    --xd-on-accent: #163633;
+    --xd-ok: #64b98f;
+    --xd-danger: #c8736a;
+    --xd-on-danger: #341b18;
+    --xd-warn: #cba462;
+  }
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--xd-bg);
+  color: var(--xd-fg);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+body { padding-top: var(--xd-titlebar); }
+
+/* Browser-native surfaces carry the design too: selection, scrollbars. */
+::selection { background: color-mix(in srgb, var(--xd-accent) 25%, transparent); }
+
+html { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--xd-muted) 40%, transparent) transparent; }
+html::-webkit-scrollbar { width: 8px; }
+html::-webkit-scrollbar-track { background: transparent; }
+html::-webkit-scrollbar-thumb { border-radius: 4px; background: color-mix(in srgb, var(--xd-muted) 40%, transparent); }
+
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------------------------------------------------------------- header */
+
+.bar {
+  position: sticky;
+  top: var(--xd-titlebar);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: var(--xd-bg);
+  border-bottom: 1px solid var(--xd-border);
+}
+
+/* Indeterminate refresh line: lives on the fixed header, so the poll rebuilds
+   never restart it — the class simply appears and disappears. */
+.bar::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: -1px;
+  height: 2px;
+  background: var(--xd-accent);
+  transform: translateX(-100%);
+  opacity: 0;
+  pointer-events: none;
+}
+.bar.refreshing::after { opacity: .8; animation: xd-slide 1.1s ease-in-out infinite; }
+@keyframes xd-slide {
+  0% { transform: translateX(-100%); }
+  55% { transform: translateX(0); }
+  100% { transform: translateX(100%); }
+}
+
+.bar-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+/*
+ * The title must never push into the action buttons. At the panel's full
+ * 760px there is room for both the name and the summary line; on a narrow
+ * work panel the summary is dropped and the name ellipsizes instead.
+ */
+.bar-title { min-width: 0; overflow: hidden; }
+.bar-title strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 650;
+}
+.bar-title .muted {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 620px) {
+  .bar-title .muted { display: none; }
+}
+.bar-actions { display: flex; gap: 6px; flex-shrink: 0; }
+
+.dot {
+  position: relative;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: var(--xd-muted);
+  flex-shrink: 0;
+}
+.dot.ok { background: var(--xd-ok); }
+.dot.idle { background: var(--xd-warn); }
+
+/* Breathing ring while a detection pass runs behind the cached document. */
+.dot.busy::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  color: inherit;
+  background: none;
+  animation: xd-breathe 1.6s ease-out infinite;
+}
+@keyframes xd-breathe {
+  0% { transform: scale(.6); opacity: .9; }
+  70%, 100% { transform: scale(1.5); opacity: 0; }
+}
+
+.muted { color: var(--xd-muted); }
+.hint { color: var(--xd-muted); margin: 6px 0 0; font-size: 12.5px; }
+
+/* The check-in log: a box of its own, because it is a log rather than a
+   caption. The same quiet surface the panel uses elsewhere, so it reads as part
+   of the card without competing with the controls above it. */
+.log-box {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--xd-line);
+  border-radius: var(--xd-radius-small);
+  background: var(--xd-softer);
+  font-size: 12.5px;
+}
+/* One source per line, so a pass over three of them reads down the box instead
+   of across it. */
+.log-line { display: flex; align-items: baseline; gap: 7px; }
+.log-line + .log-line { margin-top: 4px; }
+.log-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--xd-muted);
+  /* Sits on the text's baseline rather than the box's, so the rows line up. */
+  transform: translateY(-1px);
+}
+/* The dot is the outcome: collected, skipped, failed. A source that had nothing
+   to do keeps the muted dot, so a healthy pass is not a wall of colour. */
+.log-line.ok .log-dot { background: var(--xd-ok); }
+.log-line.skip .log-dot { background: var(--xd-warn); }
+.log-line.fail .log-dot { background: var(--xd-danger); }
+.log-text { color: var(--xd-muted); }
+.log-line.ok .log-text { color: var(--xd-fg); }
+
+/* --------------------------------------------------------------- buttons */
+
+button {
+  font: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border-radius: var(--xd-radius-small);
+  padding: 7px 14px;
+  border: 1px solid var(--xd-border);
+  background: transparent;
+  color: var(--xd-fg);
+  cursor: pointer;
+  transition: background-color .13s ease, border-color .13s ease, color .13s ease;
+}
+button:hover:not(:disabled) { background: var(--xd-soft); }
+button:active:not(:disabled) { background: color-mix(in srgb, var(--xd-fg) 8%, transparent); }
+button:disabled { opacity: .45; cursor: default; }
+button.ghost { border-color: transparent; }
+/* The quiet header buttons only gain an edge where a pointer rests on them. */
+.bar-actions button.ghost:hover:not(:disabled),
+.bar-actions button.ghost:active:not(:disabled) { border-color: var(--xd-border); }
+button.small { padding: 4px 11px; font-size: 12.5px; }
+button.primary {
+  background: var(--xd-accent);
+  border-color: var(--xd-accent);
+  color: var(--xd-on-accent);
+  font-weight: 600;
+}
+button.primary:hover:not(:disabled) { filter: brightness(1.07); background: var(--xd-accent); }
+button.primary:active:not(:disabled) { filter: brightness(.96); }
+
+.region-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
+/* One whole source's switch: same place as the region's, so both sit at the
+   bottom of the content instead of beside a title one stray click away. The
+   rule separates it from the region's switch without crowding it. */
+.source-switch {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--xd-line);
+}
+/* One region's own switch: bottom right, and filled rather than outlined so
+   the colour - not a shape - tells 停用 from the 启用 button beside it. */
+button.park {
+  background: var(--xd-danger);
+  border-color: var(--xd-danger);
+  color: var(--xd-on-danger);
+  font-weight: 600;
+}
+button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--xd-danger); }
+
+:focus-visible { outline: 2px solid var(--xd-accent); outline-offset: 1px; }
+
+/* ------------------------------------------------------- icon vocabulary
+ *
+ * One 16px stroke drawing per action, shipped as a data-URI mask and tinted
+ * with currentColor. Pseudo-elements survive the render loop's textContent
+ * writes, so icons need no cooperation from panel.js.
+ */
+
+.ic-scan::before, .ic-rewind::before, .ic-refresh::before, .ic-download::before,
+.ic-activity::before, .ic-copy::before, .ic-check::before, .ic-x::before,
+.ic-calendar::before {
+  content: "";
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  flex: none;
+  background-color: currentColor;
+  -webkit-mask: center / contain no-repeat;
+  mask: center / contain no-repeat;
+}
+
+.ic-scan::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round'%3E%3Ccircle cx='7' cy='7' r='4.4'/%3E%3Cpath d='M10.4 10.4 14 14'/%3E%3Cpath d='M4.8 7h4.4'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round'%3E%3Ccircle cx='7' cy='7' r='4.4'/%3E%3Cpath d='M10.4 10.4 14 14'/%3E%3Cpath d='M4.8 7h4.4'/%3E%3C/svg%3E");
+}
+.ic-rewind::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 8a5 5 0 1 0 1.5-3.6'/%3E%3Cpath d='M4.5 1.6v3h3'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 8a5 5 0 1 0 1.5-3.6'/%3E%3Cpath d='M4.5 1.6v3h3'/%3E%3C/svg%3E");
+}
+.ic-refresh::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13 8a5 5 0 1 1-1.5-3.6'/%3E%3Cpath d='M11.5 1.6v3h3'/%3E%3Cpath d='M8 6.2V8l1.4 1.2'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13 8a5 5 0 1 1-1.5-3.6'/%3E%3Cpath d='M11.5 1.6v3h3'/%3E%3Cpath d='M8 6.2V8l1.4 1.2'/%3E%3C/svg%3E");
+}
+.ic-download::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 2.5v7.5'/%3E%3Cpath d='M4.8 7l3.2 3 3.2-3'/%3E%3Cpath d='M3 13.5h10'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 2.5v7.5'/%3E%3Cpath d='M4.8 7l3.2 3 3.2-3'/%3E%3Cpath d='M3 13.5h10'/%3E%3C/svg%3E");
+}
+.ic-activity::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1.5 8h3l2-4.5 3 9 2-4.5h3'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1.5 8h3l2-4.5 3 9 2-4.5h3'/%3E%3C/svg%3E");
+}
+.ic-copy::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linejoin='round'%3E%3Crect x='5.5' y='5.5' width='8' height='8' rx='1.5'/%3E%3Cpath d='M10.5 3.5v-1h-8v8h1'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linejoin='round'%3E%3Crect x='5.5' y='5.5' width='8' height='8' rx='1.5'/%3E%3Cpath d='M10.5 3.5v-1h-8v8h1'/%3E%3C/svg%3E");
+}
+.ic-check::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 8.6 6.4 12 13 4.6'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 8.6 6.4 12 13 4.6'/%3E%3C/svg%3E");
+}
+.ic-x::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round'%3E%3Cpath d='M4 4l8 8M12 4l-8 8'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round'%3E%3Cpath d='M4 4l8 8M12 4l-8 8'/%3E%3C/svg%3E");
+}
+.ic-calendar::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2.5' y='3.5' width='11' height='10' rx='1.5'/%3E%3Cpath d='M2.5 6.5h11M5.5 2v3M10.5 2v3'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2.5' y='3.5' width='11' height='10' rx='1.5'/%3E%3Cpath d='M2.5 6.5h11M5.5 2v3M10.5 2v3'/%3E%3C/svg%3E");
+}
+
+/* ------------------------------------------------------------------ page */
+
+.page { padding: 14px 16px 28px; }
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--xd-border);
+}
+
+.tab {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--xd-radius-small) var(--xd-radius-small) 0 0;
+  padding: 8px 15px;
+  margin-bottom: -1px;
+  color: var(--xd-muted);
+}
+/* View glyphs hang off data-tab attributes on purpose: selectTab() rewrites the
+   className of every view tab on each switch, which would strip icon classes. */
+.subtab::before {
+  content: "";
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  background-color: currentColor;
+  -webkit-mask: center / contain no-repeat;
+  mask: center / contain no-repeat;
+}
+.subtab[data-tab="pool"]::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round'%3E%3Ccircle cx='6' cy='5.5' r='2.5'/%3E%3Cpath d='M1.8 13.2c.6-2.2 2.2-3.4 4.2-3.4s3.6 1.2 4.2 3.4'/%3E%3Cpath d='M10.5 3.4a2.5 2.5 0 0 1 0 4.2'/%3E%3Cpath d='M11.6 9.9c1.3.5 2.2 1.6 2.6 3.3'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round'%3E%3Ccircle cx='6' cy='5.5' r='2.5'/%3E%3Cpath d='M1.8 13.2c.6-2.2 2.2-3.4 4.2-3.4s3.6 1.2 4.2 3.4'/%3E%3Cpath d='M10.5 3.4a2.5 2.5 0 0 1 0 4.2'/%3E%3Cpath d='M11.6 9.9c1.3.5 2.2 1.6 2.6 3.3'/%3E%3C/svg%3E");
+}
+.subtab[data-tab="models"]::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round'%3E%3Cpath d='M2 5h5M10.5 5H14M2 11h3.5M9 11h5'/%3E%3Ccircle cx='8.5' cy='5' r='1.6'/%3E%3Ccircle cx='7' cy='11' r='1.6'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round'%3E%3Cpath d='M2 5h5M10.5 5H14M2 11h3.5M9 11h5'/%3E%3Ccircle cx='8.5' cy='5' r='1.6'/%3E%3Ccircle cx='7' cy='11' r='1.6'/%3E%3C/svg%3E");
+}
+.subtab[data-tab="check"]::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1.5 8h3l2-4.5 3 9 2-4.5h3'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1.5 8h3l2-4.5 3 9 2-4.5h3'/%3E%3C/svg%3E");
+}
+.tab:hover:not(:disabled) { background: transparent; color: var(--xd-fg); }
+.tab.active {
+  color: var(--xd-fg);
+  border-bottom-color: var(--xd-accent);
+  font-weight: 600;
+  background: transparent;
+}
+
+.regions { display: flex; gap: 6px; margin-bottom: 12px; }
+.regions button { border-radius: 999px; padding: 5px 14px; }
+.regions button.active {
+  border-color: color-mix(in srgb, var(--xd-accent) 45%, var(--xd-border));
+  color: var(--xd-accent);
+  font-weight: 600;
+}
+
+/* Two levels of switching: the source tabs on top (WorkBuddy / Trae / Qoder,
+   each owning a whole page of every view), the view tabs right below. */
+.subtabs { display: flex; gap: 6px; margin-bottom: 14px; }
+.subtab { display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; padding: 5px 14px; }
+.subtab.active {
+  border-color: color-mix(in srgb, var(--xd-accent) 45%, var(--xd-border));
+  color: var(--xd-accent);
+  font-weight: 600;
+}
+
+.banner {
+  margin-bottom: 12px;
+  padding: 9px 12px;
+  border-radius: var(--xd-radius);
+  border: 1px solid var(--xd-danger);
+  color: var(--xd-danger);
+  background: color-mix(in srgb, var(--xd-danger) 8%, transparent);
+  white-space: pre-wrap;
+}
+.banner.warn { border-color: var(--xd-warn); color: var(--xd-warn); background: color-mix(in srgb, var(--xd-warn) 8%, transparent); }
+
+/* The overview line reads as a flat band, not a card: the cards below it are
+   the interactive things, and they should stand out against it. */
+.strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border-radius: var(--xd-radius);
+  background: var(--xd-softer);
+  flex-wrap: wrap;
+}
+.strip strong { font-variant-numeric: tabular-nums; }
+
+/* The all-accounts check-in is the one action in a head row that does something
+   the user asked for, so it keeps a real border rather than the `ghost` treatment
+   the quiet header buttons get — it was invisible against the card surface. */
+.checkin-all:not(:disabled) {
+  border-color: color-mix(in srgb, var(--xd-accent) 40%, var(--xd-border));
+  color: var(--xd-accent);
+  font-weight: 600;
+}
+
+/* A non-pool source's own section: its own accounts, quota, and check-in pool,
+   stacked the way the pool's cards are — a titled block, not one crowded line. */
+.source-group { margin-bottom: 12px; }
+.source-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.source-head strong { font-variant-numeric: tabular-nums; }
+.source-head .checkin-all { margin-left: auto; }
+.source-accounts .card { margin-bottom: 8px; }
+.source-foot { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12.5px; margin-top: 4px; }
+
+
+.card {
+  border: 1px solid var(--xd-border);
+  border-radius: var(--xd-radius);
+  background: var(--xd-card);
+  padding: 14px 16px;
+  margin-bottom: 12px;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.card-title { font-weight: 600; }
+
+.acct-label { font-weight: 600; }
+
+/* One account's own controls, pushed to the right end of the head row. */
+.acct-controls { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+
+/* A switch, not a checkbox: "this account is in the pool right now". */
+.acct-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--xd-border);
+  background: transparent;
+  color: var(--xd-muted);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.acct-toggle.on { color: var(--xd-fg); border-color: var(--xd-border); }
+.acct-toggle-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--xd-muted);
+  transition: background-color .13s ease;
+}
+/* "On" reads from the filled dot alone; the label stays ink-coloured so an
+   open account never paints green on green with the badges beside it. */
+.acct-toggle.on .acct-toggle-dot { background: var(--xd-ok); }
+
+.acct-remove {
+  padding: 4px 10px;
+  font-size: 12.5px;
+  color: var(--xd-muted);
+  border-color: transparent;
+}
+.acct-remove:hover:not(:disabled) { color: var(--xd-danger); border-color: color-mix(in srgb, var(--xd-danger) 40%, transparent); background: transparent; }
+
+/* Switched off: visibly parked without being hidden. */
+.card-off { border-style: dashed; background: transparent; }
+
+.removed-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.removed-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card.removed { background: var(--xd-softer); }
+.card.removed .hint { margin-bottom: 4px; }
+.region-tag {
+  font-size: 11.5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--xd-border);
+  color: var(--xd-muted);
+}
+
+.badge {
+  font-size: 12px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--xd-border);
+  color: var(--xd-muted);
+  white-space: nowrap;
+  font-weight: 500;
+}
+/*
+ * Badge colour discipline: healthy is the default state and stays neutral;
+ * colour marks deviation only. Chips are outline + coloured text, never
+ * tinted blocks, so a card reads calm even when several badges show at once.
+ */
+.badge.ok { color: var(--xd-muted); }
+.badge.cool { color: var(--xd-warn); border-color: color-mix(in srgb, var(--xd-warn) 40%, transparent); }
+.badge.next { color: var(--xd-accent); border-color: color-mix(in srgb, var(--xd-accent) 40%, transparent); }
+.badge.free { color: var(--xd-ok); }
+.badge.off { color: var(--xd-muted); border-style: dashed; }
+
+/* Credits: the total stays on the header line, the package breakdown opens on
+   demand. Several accounts at once is the normal case, so a list that is always
+   open costs the reader every account below it. */
+.credits { margin-top: 8px; }
+.credits-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: var(--xd-radius-small);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+/* A quota figure with nothing to expand keeps the shape without the affordance. */
+.credits-head.static { cursor: default; }
+.credits-head.static:hover { background: transparent; }
+.credits-head:hover { background: var(--xd-soft); }
+.credits-head .caret {
+  margin-left: auto;
+  color: var(--xd-muted);
+  font-size: 13px;
+  line-height: 1;
+  transform: rotate(90deg);
+  transition: transform .15s ease;
+}
+.credits:not(.open) .credits-head .caret { transform: rotate(0deg); }
+
+.credit-total {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--xd-fg);
+  font-variant-numeric: tabular-nums;
+}
+
+.credits-body { padding: 2px 6px 0 6px; }
+
+/* The credit floor for one account: number, unit, save, then the outcome. */
+.reserve {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--xd-line);
+}
+.reserve-label { font-size: 12.5px; }
+.reserve-input {
+  width: 86px;
+  padding: 3px 6px;
+  border-radius: var(--xd-radius-small);
+  border: 1px solid var(--xd-border);
+  background: var(--xd-bg);
+  color: var(--xd-fg);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.reserve-unit { color: var(--xd-muted); font-size: 12px; }
+.reserve-save { padding: 3px 9px; font-size: 12px; }
+.reserve .hint { flex-basis: 100%; margin: 2px 0 0; }
+.badge.keep { color: var(--xd-warn); border-color: color-mix(in srgb, var(--xd-warn) 40%, transparent); }
+.pack { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; }
+.pack-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pack-num { flex: none; color: var(--xd-muted); font-variant-numeric: tabular-nums; }
+.pack-when { flex: none; color: var(--xd-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.pack-when.pack-soon { color: var(--xd-warn); font-weight: 600; }
+.hint.warn { color: var(--xd-warn); }
+
+.checkin {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  margin-top: 8px;
+  border-top: 1px solid var(--xd-line);
+}
+
+/* A spinning ring while a claim is in flight; the class only exists while the
+   request is running, so the poll rebuilds never make it jump. */
+.is-busy::before {
+  content: "";
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+  animation: xd-spin .7s linear infinite;
+}
+@keyframes xd-spin { to { transform: rotate(360deg); } }
+
+/* ---------------------------------------------------------------- models */
+
+.search {
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 10px 7px 30px;
+  border-radius: var(--xd-radius-small);
+  border: 1px solid var(--xd-border);
+  background: var(--xd-bg);
+  color: var(--xd-fg);
+  font: inherit;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round'%3E%3Ccircle cx='7' cy='7' r='4.4'/%3E%3Cpath d='M10.4 10.4 14 14'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 10px center;
+  background-size: 14px 14px;
+}
+.search:focus { outline: 2px solid var(--xd-accent); outline-offset: -1px; }
+.pane-search .search { margin-top: 0; }
+
+.model-meta { color: var(--xd-muted); font-size: 12.5px; display: flex; gap: 10px; flex-wrap: wrap; margin-top: 5px; font-variant-numeric: tabular-nums; }
+
+.savebar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-top: 4px;
+  border: 1px solid var(--xd-border);
+  border-radius: var(--xd-radius);
+  background: var(--xd-card);
+}
+.savebar #saveNote { color: var(--xd-muted); }
+.spacer { flex: 1; }
+
+.seg { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.seg button { border: 1px solid var(--xd-border); border-radius: var(--xd-radius-small); white-space: nowrap; padding: 5px 13px; }
+.seg button.active {
+  border-color: color-mix(in srgb, var(--xd-accent) 45%, var(--xd-border));
+  color: var(--xd-accent);
+  font-weight: 600;
+}
+.seg button.active:hover:not(:disabled) { background: var(--xd-soft); }
+
+/* The usage-mode block lives inside a source's account-picker card, so a rule
+   separates it instead of a card border of its own. */
+.dist-inline { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--xd-border); }
+.dist-inline .seg { margin-top: 6px; }
+
+.auto-hours { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+/* The hours box borrows .search for its chrome; it is a number field, not a
+   search, so it loses the magnifier and its width cap. */
+.auto-hours .search { width: 6em; padding-left: 9px; background-image: none; }
+
+/* A switch the user has to find on their own: its own card, a real heading, and
+   a click row wide enough to hit. It used to sit under the check-in card as a
+   line of 12.5px muted text, which read as a caption for the block above it. */
+.switch-row { display: flex; align-items: flex-start; gap: 10px; margin-top: 10px; }
+/* The composer readout switch. Rounded like the other controls inside a card —
+   the pill shape belongs to the outer category tabs, and a second pill one level
+   down reads as a peer of those tabs rather than as a form control.
+   The on state is the panel's own idiom for a selected small control: an accent
+   border and accent text with no fill, as `.subtab.active` and
+   `.regions button.active` already do. The dot rides `currentColor`, so the two
+   states differ in colour alone.
+   Deliberately not `button.primary`: that class fills with the accent, which
+   would put this button's own accent-coloured text on an accent-coloured
+   background. */
+.switch-row > button {
+  flex: none;
+  margin-top: 1px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border-radius: var(--xd-radius-small);
+  padding: 5px 12px;
+  font-size: 12.5px;
+}
+.switch-row > button::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: .4;
+}
+.switch-row > button.on {
+  border-color: color-mix(in srgb, var(--xd-accent) 45%, var(--xd-border));
+  color: var(--xd-accent);
+  font-weight: 600;
+}
+.switch-row > button.on::before { opacity: 1; }
+.switch-copy { display: flex; flex-direction: column; gap: 3px; }
+.switch-copy .hint { margin: 0; max-width: 52ch; }
+.switch-lead { font-size: 13px; }
+
+.count-chip {
+  font-size: 11.5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--xd-border);
+  color: var(--xd-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------- model columns */
+
+/*
+ * The panel keeps its declared 760px width, so the two columns have to earn
+ * their place inside 732px of usable width. Both panes read comfortably at
+ * ~356px: the roster row is an id, a name and a limits pair, and the sheet's
+ * widest control is the context-window ladder at five chips.
+ *
+ * Below 720px the grid collapses to one column - roster first, settings under
+ * it - because a narrower roster would ellipsize the model id, which is the
+ * one thing a row has to show in full.
+ */
+.model-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+
+.model-col { min-width: 0; }
+
+/* Each column scrolls on its own, so the roster stays put while a long sheet
+   is scrolled. The scrollbar is drawn thin and quiet: inside a 52vh pane the
+   default chunky bar costs more attention than it informs. */
+.model-col > .model-rows {
+  max-height: 52vh;
+  overflow-y: auto;
+  padding-right: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--xd-muted) 45%, transparent) transparent;
+}
+.model-col > .model-rows::-webkit-scrollbar { width: 8px; }
+.model-col > .model-rows::-webkit-scrollbar-track { background: transparent; }
+.model-col > .model-rows::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--xd-muted) 40%, transparent);
+}
+.model-col > .model-rows::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--xd-muted) 65%, transparent);
+}
+
+@media (max-width: 719px) {
+  .model-columns { grid-template-columns: 1fr; }
+  .model-col > .model-rows { max-height: none; }
+}
+
+/* ------------------------------------------------------- model roster */
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  margin-bottom: 6px;
+  border-radius: var(--xd-radius-small);
+  background: var(--xd-softer);
+}
+.pane-head .count-chip { margin-left: auto; }
+
+.pane-title {
+  margin: 0;
+  color: var(--xd-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.pane-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 27px;
+  padding: 0 10px;
+  border: 1px solid var(--xd-border);
+  border-radius: var(--xd-radius-small);
+  background: transparent;
+  color: var(--xd-muted);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background-color .13s ease, border-color .13s ease, color .13s ease;
+}
+.pane-action:hover:not(:disabled) { background: var(--xd-soft); color: var(--xd-fg); }
+.pane-action:disabled { opacity: .55; cursor: default; }
+
+/* One search per column, on its own row under the heading. */
+.pane-search { margin-bottom: 6px; }
+
+.row-check {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  accent-color: var(--xd-accent);
+  cursor: pointer;
+}
+
+/* ---- roster rows */
+
+.row {
+  border-radius: var(--xd-radius-small);
+  list-style: none;
+  transition: background-color .13s ease;
+}
+.row:hover { background: var(--xd-soft); }
+/* A whisper of accent so enabled rows group visually without painting the
+   whole roster blue. */
+.row:has(.row-check:checked) { background: color-mix(in srgb, var(--xd-accent) 5%, transparent); }
+
+.row-label {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+
+.row-copy {
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.row-id {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--xd-fg);
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-limits {
+  flex: none;
+  color: color-mix(in srgb, var(--xd-muted) 78%, transparent);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.row-tags { flex: none; display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.row-open-hint { flex: none; color: var(--xd-muted); font-size: 13px; padding-left: 2px; }
+
+/* ---- the model sheet */
+
+.chosen-list { list-style: none; margin: 0; padding: 0; }
+
+.chosen-row {
+  border: 1px solid var(--xd-border);
+  border-radius: var(--xd-radius);
+  background: var(--xd-card);
+  margin-bottom: 8px;
+}
+.chosen-row:has(.chosen-advanced.on) { border-color: color-mix(in srgb, var(--xd-accent) 40%, var(--xd-border)); }
+.chosen-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 11px 12px;
+  flex-wrap: wrap;
+}
+.chosen-id {
+  min-width: 0;
+  overflow: hidden;
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chosen-limits { margin-left: auto; color: var(--xd-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+.chosen-advanced {
+  border: 1px solid var(--xd-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--xd-muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 11px;
+  cursor: pointer;
+}
+.chosen-advanced:hover { background: var(--xd-soft); color: var(--xd-fg); }
+.chosen-advanced.on { color: var(--xd-accent); border-color: color-mix(in srgb, var(--xd-accent) 45%, transparent); font-weight: 600; }
+
+.chosen-remove {
+  border: 0;
+  background: transparent;
+  color: var(--xd-muted);
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 4px;
+  border-radius: var(--xd-radius-small);
+  cursor: pointer;
+}
+.chosen-remove:hover { background: var(--xd-soft); color: var(--xd-danger); }
+
+.sheet-body { padding: 2px 12px 12px; border-top: 1px solid var(--xd-line); }
+
+.field { margin-top: 12px; }
+.field-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+  flex-wrap: wrap;
+}
+.field-label { font-weight: 600; font-size: 12.5px; }
+.field-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--xd-border);
+  color: var(--xd-muted);
+  font-size: 10px;
+  cursor: help;
+}
+
+.field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 620px) { .field-pair { grid-template-columns: 1fr; } }
+
+.text-input, .num-input, .select {
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--xd-radius-small);
+  border: 1px solid var(--xd-border);
+  background: var(--xd-bg);
+  color: var(--xd-fg);
+  font: inherit;
+}
+.num-input { font-variant-numeric: tabular-nums; margin-top: 6px; }
+.select { width: auto; }
+
+.preset-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.preset {
+  border: 1px solid var(--xd-border);
+  background: transparent;
+  color: var(--xd-fg);
+  border-radius: 999px;
+  padding: 4px 13px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.preset.active {
+  background: var(--xd-fg);
+  color: var(--xd-bg);
+  border-color: var(--xd-fg);
+  font-weight: 600;
+}
+/*
+ * The selected preset is the sheet's one filled chip, so it needs its own
+ * pointer states: the generic `button:hover:not(:disabled)` rule is (0,2,1) and
+ * outranks `.preset.active` at (0,2,0), which replaced the fill with a
+ * near-transparent wash and left the inverted label on a background of its own
+ * colour - white on white in the light theme, black on black in the dark one.
+ * The other filled buttons (`.primary`, `.park`) already re-declare their fill
+ * for the same reason; this one keeps it and mixes a little of the page
+ * background in, which reads as feedback in both themes where a brightness
+ * filter would clip, since the dark fill is already near white.
+ */
+.preset.active:hover:not(:disabled),
+.preset.active:active:not(:disabled) {
+  background: color-mix(in srgb, var(--xd-fg) 88%, var(--xd-bg));
+  border-color: var(--xd-fg);
+  color: var(--xd-bg);
+}
+
+.default-level { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+
+.level-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.level {
+  border: 1px solid var(--xd-border);
+  background: transparent;
+  color: var(--xd-muted);
+  border-radius: 999px;
+  padding: 4px 15px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.level.active {
+  color: var(--xd-fg);
+  border-color: var(--xd-fg);
+  font-weight: 600;
+}
+
+.check-row { display: flex; gap: 16px; flex-wrap: wrap; }
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+
+/* ---------------------------------------------------------------- doctor */
+
+.finding {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--xd-line);
+}
+.finding:last-child { border-bottom: 0; }
+.finding-id { font-family: ui-monospace, Consolas, "Cascadia Mono", monospace; font-size: 12.5px; min-width: 200px; }
+.finding-pass, .finding-fail {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  padding: 2px 9px;
+  border-radius: 999px;
+}
+.finding-pass { color: var(--xd-ok); border: 1px solid color-mix(in srgb, var(--xd-ok) 35%, transparent); }
+.finding-fail { color: var(--xd-danger); border: 1px solid color-mix(in srgb, var(--xd-danger) 40%, transparent); }
+.finding-detail { color: var(--xd-muted); font-size: 12.5px; flex: 1; }
+
+.report {
+  margin-top: 10px;
+  padding: 11px;
+  border-radius: var(--xd-radius-small);
+  background: var(--xd-softer);
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--xd-muted) 45%, transparent) transparent;
+}
+.report::-webkit-scrollbar { width: 8px; }
+.report::-webkit-scrollbar-thumb { border-radius: 4px; background: color-mix(in srgb, var(--xd-muted) 40%, transparent); }
+
+.copy-hint { color: var(--xd-muted); font-size: 12px; }
+
+.foot {
+  color: var(--xd-muted);
+  font-size: 12px;
+  margin-top: 16px;
+  padding-top: 10px;
+  border-top: 1px solid var(--xd-line);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.foot-status { display: flex; gap: inherit; flex-wrap: wrap; }
+.foot-links { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+.foot a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--xd-accent) 35%, var(--xd-border));
+  border-radius: var(--xd-radius-small);
+  background: color-mix(in srgb, var(--xd-accent) 8%, var(--xd-bg));
+  color: var(--xd-accent);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.foot a svg { width: 14px; height: 14px; flex-shrink: 0; }
+.foot a:hover {
+  border-color: var(--xd-accent);
+  background: color-mix(in srgb, var(--xd-accent) 14%, var(--xd-bg));
+}
+.foot a:focus-visible { outline: 2px solid var(--xd-accent); outline-offset: 2px; }
+
+/* Empty states: dashed outline, one drawn glyph, one sentence of guidance. */
+.empty {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--xd-muted);
+  border: 1px dashed var(--xd-border);
+  border-radius: var(--xd-radius);
+  display: grid;
+  justify-items: center;
+  gap: 2px;
+}
+.empty::before {
+  content: "";
+  width: 22px;
+  height: 22px;
+  margin-bottom: 6px;
+  background-color: color-mix(in srgb, var(--xd-muted) 70%, transparent);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linejoin='round'%3E%3Cpath d='M2 9.5V12a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 14 12V9.5'/%3E%3Cpath d='M2 9.5h3.5l1 1.8h3l1-1.8H14'/%3E%3Cpath d='M3.6 3 2 9.5M12.4 3 14 9.5M3.6 3h8.8'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linejoin='round'%3E%3Cpath d='M2 9.5V12a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 14 12V9.5'/%3E%3Cpath d='M2 9.5h3.5l1 1.8h3l1-1.8H14'/%3E%3Cpath d='M3.6 3 2 9.5M12.4 3 14 9.5M3.6 3h8.8'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+.empty p { margin: 0; }
+.empty .hint { margin: 0; max-width: 46ch; }
+
+/* ------------------------------------------------------------ reductions */
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: .01ms !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

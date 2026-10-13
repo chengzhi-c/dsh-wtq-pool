@@ -1,0 +1,6 @@
+# Register the WTQ Pool host half. Discovery is read-only: the plugin reuses the
+# WorkBuddy, Trae and Qoder desktop apps' own sign-in files and never starts a
+# separate OAuth flow. Requests rotate across every discovered account.
+- insert:
+    - id: llm-dsh-xdpool
+      name: dsh-wtq-pool
