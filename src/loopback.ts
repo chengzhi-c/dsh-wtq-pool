@@ -28,7 +28,13 @@ export function hostnameOfHost(host: string): string {
   return hostname
 }
 
-/** Host must name loopback; drops DNS-rebinding attempts before routing. */
+/**
+ * Host must name loopback.
+ *
+ * Used by the gateway handlers. The panel routes rely on the peer and Origin
+ * checks instead: a browser that could reach the panel is already same-origin
+ * loopback, so a forged Host adds nothing there.
+ */
 export function hostIsLoopback(host: string | undefined): boolean {
   if (host === undefined || host.trim() === '') return false
   return LOOPBACK_HOSTS.has(hostnameOfHost(host))

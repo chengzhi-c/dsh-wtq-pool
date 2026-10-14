@@ -197,15 +197,25 @@ function unwrapVolatileDeep<T>(value: T): T {
 
 // --------------------------------------------------------------------- host
 
+/**
+ * The slice of `ctx.llm` this plugin uses.
+ *
+ * Declared structurally rather than imported so the same source still compiles
+ * against a host that predates one of the calls. The return types mirror the
+ * published handles: both registrations hand back a disposer (the real ones also
+ * carry `replace`, which this plugin does not use), and `registerModelDiscovery`
+ * returns the disposer the activation effect relies on. Calling any of them
+ * after the fiber is disposed throws, so a stale write cannot leave an orphan.
+ */
 interface LlmSeam {
-  registerAdapter(providerIds: string[], adapter: unknown): (() => void) | undefined
+  registerAdapter(providerIds: string[], adapter: unknown): () => void
   registerConfigurableProviders(rows: Array<{
     provider: string
     displayName: string
     settingsNs: string
     settingsPath: string[]
     declared: boolean
-  }>): (() => void) | undefined
+  }>): () => void
   registerModelDiscovery(
     ns: string,
     fn: (request: { provider?: string }, signal?: AbortSignal) => Promise<Array<{
@@ -215,7 +225,7 @@ interface LlmSeam {
       maxTokens?: number
       inputModalities?: string[]
     }>>,
-  ): void
+  ): () => void
 }
 
 interface SettingsService {
@@ -502,12 +512,31 @@ export function apply(ctx: ClientContext, config: Config = {}): void {
 
   const settingsService = ctx.settings as SettingsService
 
+  /**
+   * How many of this plugin's own settings writes are in flight.
+   *
+   * DSH answers a plugin's volatile write by emitting `loader/volatile-update`
+   * back at the writer's own fiber, and the loader delivers it synchronously
+   * inside `mutate`. So a save this plugin made arrives here looking exactly
+   * like an edit from the host's settings UI, and treating it as one cleared the
+   * whole credit cache: every account switch blanked the readout to `—` until a
+   * warm-up poll refilled it. PI's host never echoes a plugin's own write, which
+   * is why only this build showed it. The writer is the one place that can tell
+   * the two apart, so the echo is dropped here instead of guessed at downstream.
+   */
+  let writesInFlight = 0
+
   /** Replace patched top-level fields without merging their dictionaries. */
   const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
     const mutate = settingsService?.mutate
     if (mutate === undefined) throw new Error('this host exposes no settings mutate()')
-    await mutate.call(settingsService, settingsNamespace,
-      Object.entries(patch).map(([key, value]) => ({ op: 'set', path: [key], value })))
+    writesInFlight += 1
+    try {
+      await mutate.call(settingsService, settingsNamespace,
+        Object.entries(patch).map(([key, value]) => ({ op: 'set', path: [key], value })))
+    } finally {
+      writesInFlight -= 1
+    }
   }
 
   installPi({
@@ -519,7 +548,10 @@ export function apply(ctx: ClientContext, config: Config = {}): void {
       return dir
     },
     onSettingsChanged: (handler) => {
-      const listener = (): void => handler(current() as Record<string, unknown>)
+      const listener = (): void => {
+        if (writesInFlight > 0) return
+        handler(current() as Record<string, unknown>)
+      }
       const dispose = ctx.on('loader/volatile-update', listener)
       if (typeof dispose === 'function') unsubscribes.push(dispose)
       else unsubscribes.push(() => ctx.off?.('loader/volatile-update', listener))
@@ -571,10 +603,10 @@ export function apply(ctx: ClientContext, config: Config = {}): void {
      */
     declareProviders: (descriptors) => {
       // Teardown releases the current registration before `onUnload` runs, and
-      // `onUnload` republishes. A write landing after that point would create a
-      // registration whose effect lives on the llm service's own fiber - nobody
-      // is left holding a disposer for it, and the next activation would then
-      // find the routes taken. So a stopped loader answers as a refusal instead.
+      // `onUnload` republishes. A write landing in that window races the
+      // teardown's own release: the registration it creates is disposed by the
+      // same fiber unload, so the next activation can find the routes still
+      // held. So a stopped loader answers as a refusal instead.
       if (stopped) return { ok: false, changed: false, error: 'the plugin is unloading' }
       try {
         const next = registrationFingerprint(descriptors)

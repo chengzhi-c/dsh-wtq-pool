@@ -2,7 +2,7 @@
   "name": "dsh-wtq-pool",
   "displayName": "WTQ Pool",
   "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 DeepSeek Harness。WorkBuddy 被限流时自动换号。三家各有开关，国内与国际各自成组。",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "license": "MIT",
   "author": "chengzhi-c",
   "homepage": "https://github.com/chengzhi-c/dsh-wtq-pool#readme",
@@ -42,7 +42,6 @@
   "files": [
     "lib",
     "renderer",
-    "docs",
     "cordis.patch.yml",
     "README.md",
     "README.en.md",

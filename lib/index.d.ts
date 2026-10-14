@@ -81,15 +81,25 @@ interface Config {
   sourceDistributions?: Record<string, string>;
 }
 declare const Config: z<Config>;
+/**
+ * The slice of `ctx.llm` this plugin uses.
+ *
+ * Declared structurally rather than imported so the same source still compiles
+ * against a host that predates one of the calls. The return types mirror the
+ * published handles: both registrations hand back a disposer (the real ones also
+ * carry `replace`, which this plugin does not use), and `registerModelDiscovery`
+ * returns the disposer the activation effect relies on. Calling any of them
+ * after the fiber is disposed throws, so a stale write cannot leave an orphan.
+ */
 interface LlmSeam {
-  registerAdapter(providerIds: string[], adapter: unknown): (() => void) | undefined;
+  registerAdapter(providerIds: string[], adapter: unknown): () => void;
   registerConfigurableProviders(rows: Array<{
     provider: string;
     displayName: string;
     settingsNs: string;
     settingsPath: string[];
     declared: boolean;
-  }>): (() => void) | undefined;
+  }>): () => void;
   registerModelDiscovery(ns: string, fn: (request: {
     provider?: string;
   }, signal?: AbortSignal) => Promise<Array<{
@@ -98,7 +108,7 @@ interface LlmSeam {
     contextWindow?: number;
     maxTokens?: number;
     inputModalities?: string[];
-  }>>): void;
+  }>>): () => void;
 }
 interface SettingsService {
   configure?(presentation: {

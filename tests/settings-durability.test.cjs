@@ -1,8 +1,6 @@
 /**
- * Regressions for the settings-document and credential-expiry defects.
+ * Regressions for the settings-document and credential-expiry paths.
  *
- * The same faults were fixed in the PI-Desktop entry (`pi-desktop-wtq-pool`);
- * this is the DSH port's copy of those cases, so the two engines stay in step.
  * Each case is stated as the observable the user or the panel sees.
  *
  * `src/host.ts` carries no type annotations of its own and is transpiled here
@@ -236,15 +234,15 @@ test('a retired account name no longer disables rotation', async () => {
 })
 
 /**
- * An expiry past `Date`'s range used to fail the whole panel document.
+ * An expiry past `Date`'s range must not fail the whole panel document.
  *
  * `xd.state` formats each row's expiry with `toISOString()`, which throws for a
  * timestamp outside `Date`'s range. A hand-edited or upstream-garbled sentinel
- * (1e15, 1e16) is exactly that, and one bad row took the entire panel down
+ * (1e15, 1e16) is exactly that, and one bad row would take the entire panel down
  * instead of the one field.
  */
 test('an absurd stored expiry cannot fail the panel document', () => {
-  // The control first: this is the value that used to throw at the format site.
+  // The control first: this is the value that throws at the format site.
   assert.throws(() => new Date(1e16).toISOString(), RangeError)
   const { parseWorkBuddyAuth } = require('../src/accounts.ts')
   const absurd = parseWorkBuddyAuth(JSON.stringify({ auth: { accessToken: 'test-token', expiresAt: 1e16 } }), 'fixture')

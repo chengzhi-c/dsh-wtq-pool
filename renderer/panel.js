@@ -1512,6 +1512,10 @@ function paintAutoNote(host, auto) {
     line.appendChild(el("span", "log-text", row.text));
     host.appendChild(line);
   });
+  // The log is a scroll region capped at a few rows, so a fresh pass would
+  // otherwise leave the newest line - the one the user just waited for - below
+  // the fold.
+  host.scrollTop = host.scrollHeight;
 }
 function renderAccounts() {
   var host = $("accounts");
@@ -2579,16 +2583,25 @@ function modelSheetBody(model, entry) {
 }
 
 
+/**
+ * The ceiling the host enforces on a token budget (`MAX_TOKEN_BUDGET`).
+ *
+ * A number past it invalidates the whole selection payload there, so the save
+ * drops every edit in this pass rather than clamping one field. Keeping the
+ * bound in the browser means the field itself refuses the value.
+ */
+var MAX_TOKEN_BUDGET = 0xffffffff;
 function numberInput(value, onChange) {
   var input = document.createElement("input");
   input.type = "number";
   input.className = "num-input";
+  input.max = String(MAX_TOKEN_BUDGET);
   input.min = "1";
   input.step = "1000";
   input.value = String(value);
   input.addEventListener("change", function () {
     var next = Number(input.value);
-    if (!Number.isFinite(next) || next <= 0) {
+    if (!Number.isFinite(next) || next <= 0 || next > MAX_TOKEN_BUDGET) {
       input.value = String(value);
       return;
     }
@@ -2973,8 +2986,15 @@ function parseCheckinHours(text) {
 /** Switch the daily automatic check-in, or move its hours, in one request. */
 function setAutoCheckin(enabled, hours) {
   if (hours === null) {
-    note(t("auto.badHours"));
-    return Promise.resolve();
+    // Only switching ON needs a readable hour list. Switching OFF must not: the
+    // box can hold stale invalid text from an earlier edit, and bailing out there
+    // leaves the timer running while the panel reports the schedule as off.
+    if (enabled === true) {
+      note(t("auto.badHours"));
+      return Promise.resolve();
+    }
+    var current = state && state.autoCheckin && state.autoCheckin.hours;
+    hours = Array.isArray(current) ? current : [];
   }
   return runBusy("autoCheckin", function () {
     return invoke("xd.setAutoCheckin", { enabled: enabled === true, hours: hours });

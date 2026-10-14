@@ -1,35 +1,62 @@
-# WTQ账号池
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/logo.png">
+    <img src="https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/logo.png" width="240" alt="WTQ账号池">
+  </picture>
+</p>
+
+<h1 align="center">WTQ账号池</h1>
+
+<p align="center"><b>把本机已登录的 WorkBuddy、Trae、Qoder 账号接入 DeepSeek Harness，限流或额度用尽时自动换号。</b></p>
+
+<p align="center">
+  <a href="README.en.md">English</a> | <b>简体中文</b>
+</p>
+
+<p align="center">
+  <a href="#安装">安装</a> ·
+  <a href="#功能">功能</a> ·
+  <a href="#设置">设置</a> ·
+  <a href="CHANGELOG.md">更新日志</a> ·
+  <a href="https://github.com/chengzhi-c/dsh-wtq-pool/issues">问题反馈</a>
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/dsh-wtq-pool"><img src="https://img.shields.io/npm/v/dsh-wtq-pool?style=flat-square&amp;label=npm&amp;color=cb3837" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/dsh-wtq-pool"><img src="https://img.shields.io/npm/d18m/dsh-wtq-pool?style=flat-square&amp;label=downloads&amp;color=cb3837" alt="npm downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/chengzhi-c/dsh-wtq-pool?style=flat-square" alt="MIT license"></a>
+  <a href="https://github.com/chengzhi-c/dsh-wtq-pool/releases"><img src="https://img.shields.io/github/v/release/chengzhi-c/dsh-wtq-pool?style=flat-square&amp;label=release" alt="release"></a>
+  <a href="https://github.com/chengzhi-c/dsh-wtq-pool/stargazers"><img src="https://img.shields.io/github/stars/chengzhi-c/dsh-wtq-pool?style=flat-square" alt="GitHub stars"></a>
+</p>
 
 把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 DeepSeek Harness。WorkBuddy 被限流或额度用尽时自动换号；Trae、Qoder 按请求选择账号，不保证失败后重试。三个来源独立开关，国内与国际账号分别成组。
-
-[English](./README.en.md)
 
 ## 预览
 
 设置面板界面如下（默认亮色）：
 
-![账号池](docs/preview-pool.png)
+![账号池](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-pool.png)
 
 面板载入时读取 DeepSeek Harness 的外观设置；宿主切换主题后须重新载入面板：
 
-![暗色主题](docs/preview-dark.png)
+![暗色主题](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-dark.png)
 
 模型页可以改显示名、上下文窗口、输出上限、思考等级和贴图。Trae 目录给出费率的模型会带上 `x0.79` 这样的费率标签，未给出费率的模型（以及 Qoder 全部模型）不标注：
 
-![模型设置](docs/preview-models.png)
+![模型设置](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-models.png)
 
 在线预览：<https://chengzhi-c.github.io/dsh-wtq-pool/>。
 
 `docs/index.html` 加载实际面板代码并使用虚构演示数据，支持来源切换、模型设置和主题预览，不读取本机账号或令牌。
 
-![预览页](docs/preview-page.png)
+![预览页](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-page.png)
 
 开启 `showComposerPoints` 后，输入区显示当前模型的账号积分，点击可查看该组账号并切换账号。下图由实际输入框扩展离屏渲染，非对话测试截图：
 
-![输入框积分](docs/preview-composer.png)
+![输入框积分](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-composer.png)
 
-本地运行：`node docs/serve.cjs`，然后打开它输出的地址。
-（`docs/index.html` 需经本地服务器打开：`file://` 页面无法读取同目录的面板文件。）
+本地预览需先克隆仓库，再运行 `node docs/serve.cjs` 并打开它输出的地址。该页面不能用 `file://` 打开，浏览器不允许它读取同目录的面板文件。
 
 ## 功能
 
@@ -45,7 +72,7 @@
 本地包：在源码目录执行 `pnpm install && pnpm run build && npm pack --pack-destination dist`，再安装生成的 `.tgz`：
 
 ```powershell
-$package = (Resolve-Path .\dist\dsh-wtq-pool-1.0.1.tgz).Path
+$package = (Resolve-Path .\dist\dsh-wtq-pool-1.0.2.tgz).Path
 dsh plugin --profile desktop add $package
 ```
 

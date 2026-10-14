@@ -219,12 +219,18 @@ html::-webkit-scrollbar-thumb { border-radius: 4px; background: color-mix(in srg
    caption. The same quiet surface the panel uses elsewhere, so it reads as part
    of the card without competing with the controls above it. */
 .log-box {
-  margin: 10px 0 0;
-  padding: 8px 10px;
+  margin: 8px 0 0;
+  padding: 7px 10px;
   border: 1px solid var(--xd-line);
   border-radius: var(--xd-radius-small);
   background: var(--xd-softer);
   font-size: 12.5px;
+  /* A pass over three sources plus their retries is a long list, and an
+     unbounded log pushed everything below it off the page. The box scrolls on
+     its own instead. Five rows exactly: a cap that falls inside a line would
+     leave half a sentence showing. */
+  max-height: 120px;
+  overflow-y: auto;
 }
 /* One source per line, so a pass over three of them reads down the box instead
    of across it. */
@@ -464,20 +470,19 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
 
 /* A non-pool source's own section: its own accounts, quota, and check-in pool,
    stacked the way the pool's cards are — a titled block, not one crowded line. */
-.source-group { margin-bottom: 12px; }
+.source-group { margin-bottom: 10px; }
 .source-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .source-head strong { font-variant-numeric: tabular-nums; }
 .source-head .checkin-all { margin-left: auto; }
 .source-accounts .card { margin-bottom: 8px; }
 .source-foot { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12.5px; margin-top: 4px; }
 
-
 .card {
   border: 1px solid var(--xd-border);
   border-radius: var(--xd-radius);
   background: var(--xd-card);
-  padding: 14px 16px;
-  margin-bottom: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
 }
 
 .card-head {
@@ -595,7 +600,7 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
 .credits:not(.open) .credits-head .caret { transform: rotate(0deg); }
 
 .credit-total {
-  font-size: 24px;
+  font-size: 20px;
   font-weight: 700;
   color: var(--xd-fg);
   font-variant-numeric: tabular-nums;

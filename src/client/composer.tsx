@@ -209,6 +209,16 @@ const PANEL_MARGIN = 8
 /** The popup's own width cap, in px. */
 const PANEL_MAX_WIDTH = 360
 
+/**
+ * The width the popup is padded out to, in px.
+ *
+ * The stylesheet sizes the box to its contents, and a real row is only an
+ * address and a balance, so the box collapsed to roughly 220px and read as
+ * cramped next to the composer. A floor keeps that space without forcing the
+ * box wide for rows that do not need it.
+ */
+const PANEL_MIN_WIDTH = 280
+
 /** How tall the popup is allowed to get, in px. */
 const PANEL_MAX_HEIGHT = 320
 
@@ -219,18 +229,33 @@ const PANEL_MAX_HEIGHT = 320
  * the bottom of the window, so above is where the room is. Flipped below when
  * the trigger is near the top and the popup would not fit above it: a fixed
  * position is not scrolled into view by anything, so the rows above the trigger
- * would simply be cut off, and so would the popup's own first rows. The width is
- * capped to the window for the same reason, rather than trusting the viewport
- * to be wider than the stylesheet's own cap.
+ * would simply be cut off, and so would the popup's own first rows.
+ *
+ * Right-aligned by pinning `right`, not by a width this code would have to
+ * guess: the stylesheet sizes the box to its contents, so a two-column table of
+ * account and balance costs what it needs. A left edge plus a fixed width could
+ * only be right-aligned by knowing that width here, and the fixed 360px box it
+ * produced sat around rows that never filled it.
+ *
+ * The cap counts the column the right anchor already took, so the box stops at
+ * the window's left edge. Subtracting only the margin let a wide box hang past
+ * that edge whenever the trigger sat away from the right one.
  */
 function positionStyle(rect: DOMRect): React.CSSProperties {
+  const above = rect.top - PANEL_MARGIN >= PANEL_MAX_HEIGHT
+  const right = typeof window === 'undefined'
+    ? PANEL_MARGIN
+    : Math.max(PANEL_MARGIN, window.innerWidth - rect.right)
   const width = typeof window === 'undefined'
     ? PANEL_MAX_WIDTH
-    : Math.max(0, Math.min(PANEL_MAX_WIDTH, window.innerWidth - PANEL_MARGIN * 2))
-  const above = rect.top - PANEL_MARGIN >= PANEL_MAX_HEIGHT
+    : Math.max(0, Math.min(PANEL_MAX_WIDTH, window.innerWidth - right - PANEL_MARGIN))
+  // The floor is clamped the same way the cap is, so a window too narrow for it
+  // narrows the box instead of pushing it off the edge.
+  const floor = Math.min(PANEL_MIN_WIDTH, width)
   return {
-    width: width + 'px',
-    left: Math.max(PANEL_MARGIN, rect.right - width) + 'px',
+    right: right + 'px',
+    minWidth: floor + 'px',
+    maxWidth: width + 'px',
     top: (above ? rect.top - PANEL_MARGIN : rect.bottom + PANEL_MARGIN) + 'px',
     transform: above ? 'translateY(-100%)' : undefined,
   }
@@ -241,14 +266,28 @@ const CSS = `
 .xd-points-btn{border:0;background:transparent;color:inherit;font:inherit;font-size:12px;line-height:1;display:inline-flex;align-items:center;gap:5px;padding:4px 7px;border-radius:999px;cursor:pointer;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .xd-points-btn:hover{background:var(--dsw-alias-bg-layer-3,rgba(127,127,127,.12))}
 .xd-points-mark{display:inline-block;width:6px;height:6px;flex:0 0 auto;border-radius:50%;background:var(--dsw-alias-state-success-primary,#4f9f7c)}
-.xd-points-panel{position:fixed;z-index:40;min-width:240px;max-width:${PANEL_MAX_WIDTH}px;max-height:${PANEL_MAX_HEIGHT}px;overflow:auto;padding:8px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#1c1d21);color:var(--dsw-alias-label-primary,#e8e8ea);box-shadow:0 8px 28px rgba(0,0,0,.28);border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25))}
-.xd-points-table{width:100%;border-collapse:collapse;font-size:12px}
+.xd-points-panel{position:fixed;z-index:40;box-sizing:border-box;width:max-content;max-width:${PANEL_MAX_WIDTH}px;max-height:${PANEL_MAX_HEIGHT}px;overflow:auto;padding:8px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#1c1d21);color:var(--dsw-alias-label-primary,#e8e8ea);box-shadow:0 8px 28px rgba(0,0,0,.28);border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25))}
+.xd-points-table{width:100%;border-collapse:collapse;font-size:11px;line-height:1.4}
 .xd-points-table th{text-align:left;font-weight:600;padding:4px 6px;color:var(--dsw-alias-label-tertiary,#8b8d93)}
 .xd-points-table td{padding:4px 6px;vertical-align:top}
+/* The row reuses the trigger's button, which is sized for a chip standing alone
+   in the composer: its 12px type, 1px leading and 220px cap all fight the cell,
+   and its padding would stack on the cell's and double the row's height. Those
+   are restated for the table, so the row follows the popup's own type and a long
+   account name is bounded by the cell instead of stretching the panel. */
+.xd-points-table .xd-points-btn{font-size:inherit;line-height:inherit;padding:0;max-width:250px}
+/* The selected row's name is a disabled button. The hosts disagree about how to
+   dim one - PI-Desktop has a global button:disabled rule that fades it, DeepSeek
+   Harness has none - so the fade is stated here and both read the same. */
+.xd-points-table .xd-points-btn:disabled{opacity:.5}
+/* A fixed green rather than the host's success token: that one resolves to a
+   saturated #22c55e here, which reads brighter than the same dot in the
+   PI-Desktop build of this plugin. The two panels are one product, so they carry
+   one colour. */
+.xd-points-dot{display:inline-block;width:6px;height:6px;margin-right:6px;border-radius:50%;background:#4f9f7c;vertical-align:middle}
 .xd-points-row{cursor:pointer}
 .xd-points-row:hover{background:var(--dsw-alias-bg-layer-3,rgba(127,127,127,.12))}
 .xd-points-row.is-active{cursor:default}
-.xd-points-dot{display:inline-block;width:6px;height:6px;margin-right:6px;border-radius:50%;background:var(--dsw-alias-state-success-primary,#4f9f7c);vertical-align:middle}
 .xd-points-packs{margin:2px 0 0;padding:0;list-style:none;color:var(--dsw-alias-label-tertiary,#8b8d93)}
 .xd-points-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
 .xd-points-refresh{border:0;background:transparent;color:var(--dsw-alias-label-tertiary,#8b8d93);font:inherit;font-size:12px;padding:3px 8px;border-radius:999px;cursor:pointer}
@@ -519,6 +558,10 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
                 React.createElement('button', {
                   type: 'button',
                   className: 'xd-points-btn',
+                  // The name is the row's identity and is bounded by the cell, so
+                  // a long one is ellipsised rather than stretching the panel.
+                  // The full value stays reachable on hover instead of being lost.
+                  title: account.label ?? '',
                   disabled: account.active === true || busy,
                   onClick: () => pick(account),
                 }, account.label ?? '—'),

@@ -1,34 +1,62 @@
-# WTQ Pool
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/logo.png">
+    <img src="https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/logo.png" width="240" alt="WTQ Pool">
+  </picture>
+</p>
+
+<h1 align="center">WTQ Pool</h1>
+
+<p align="center"><b>Use local WorkBuddy, Trae and Qoder sign-ins in DeepSeek Harness, with automatic failover when an account is rate-limited or out of quota.</b></p>
+
+<p align="center">
+  <b>English</b> | <a href="README.md">简体中文</a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#settings">Settings</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="https://github.com/chengzhi-c/dsh-wtq-pool/issues">Issues</a>
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/dsh-wtq-pool"><img src="https://img.shields.io/npm/v/dsh-wtq-pool?style=flat-square&amp;label=npm&amp;color=cb3837" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/dsh-wtq-pool"><img src="https://img.shields.io/npm/d18m/dsh-wtq-pool?style=flat-square&amp;label=downloads&amp;color=cb3837" alt="npm downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/chengzhi-c/dsh-wtq-pool?style=flat-square" alt="MIT license"></a>
+  <a href="https://github.com/chengzhi-c/dsh-wtq-pool/releases"><img src="https://img.shields.io/github/v/release/chengzhi-c/dsh-wtq-pool?style=flat-square&amp;label=release" alt="release"></a>
+  <a href="https://github.com/chengzhi-c/dsh-wtq-pool/stargazers"><img src="https://img.shields.io/github/stars/chengzhi-c/dsh-wtq-pool?style=flat-square" alt="GitHub stars"></a>
+</p>
 
 Use local WorkBuddy, Trae and Qoder desktop sign-ins in DeepSeek Harness. WorkBuddy fails over when an account is rate-limited or out of quota; Trae and Qoder select an account per request and do not guarantee retries after failure. Each source has its own switch, with domestic and international accounts grouped separately.
-
-[中文文档](./README.md)
 
 ## Preview
 
 The settings panel, in its default light theme:
 
-![Account pool](docs/preview-pool.png)
+![Account pool](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-pool.png)
 
 The panel reads DeepSeek Harness's appearance setting on load. Reload the panel after changing the host theme:
 
-![Dark theme](docs/preview-dark.png)
+![Dark theme](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-dark.png)
 
 The model page edits the display name, context window, output limit, thinking levels and image support. A Trae model whose directory states a rate carries a cost tag such as `x0.79`; models that state none (and every Qoder model) stay unlabelled:
 
-![Model settings](docs/preview-models.png)
+![Model settings](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-models.png)
 
 Live preview: <https://chengzhi-c.github.io/dsh-wtq-pool/>.
 
 `docs/index.html` loads the actual panel code with synthetic demo data. It supports source switching, model settings and theme previews without reading local accounts or tokens.
 
-![Preview page](docs/preview-page.png)
+![Preview page](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-page.png)
 
 With `showComposerPoints` enabled, the composer shows the current model's account credits. Click it to inspect the group and switch accounts. The image below is an off-screen render of the actual composer extension, not a conversation-test screenshot:
 
-![Composer credits](docs/preview-composer.png)
+![Composer credits](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-composer.png)
 
-Run it locally: `node docs/serve.cjs`, then open the address it prints. (`docs/index.html` has to be served over http: a `file://` page cannot read the panel files beside it.)
+Run it locally after cloning the repo: `node docs/serve.cjs`, then open the address it prints. (`docs/index.html` has to be served over http: a `file://` page cannot read the panel files beside it.)
 
 ## Features
 
@@ -44,7 +72,7 @@ Run it locally: `node docs/serve.cjs`, then open the address it prints. (`docs/i
 For a local package, run `pnpm install && pnpm run build && npm pack --pack-destination dist` in the source directory, then install the generated `.tgz`:
 
 ```powershell
-$package = (Resolve-Path .\dist\dsh-wtq-pool-1.0.1.tgz).Path
+$package = (Resolve-Path .\dist\dsh-wtq-pool-1.0.2.tgz).Path
 dsh plugin --profile desktop add $package
 ```
 

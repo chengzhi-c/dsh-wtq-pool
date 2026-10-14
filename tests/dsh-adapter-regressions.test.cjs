@@ -45,13 +45,24 @@ function indexFixture() {
   vm.runInContext(transpile(selected.map(node => node.getText(file)).join('\n')), context)
   return (settings = {}, config = {}, fiber = { entry: { options: { id: 'fixture' } } }) => {
     const effects = []
-    const state = { fail: null, adapters: 0, providers: 0, bridge: null, discovery: null }
+    const volatileListeners = []
+    const state = { fail: null, adapters: 0, providers: 0, bridge: null, discovery: null, volatileListeners }
     installing = state
     module.exports.apply({
       settings, logger: { info() {}, warn() {}, error() {} }, get: () => undefined,
       fiber,
-      on: () => () => {}, inject() {}, emit() {},
+      // `loader/volatile-update` is captured because DSH answers a plugin's own
+      // volatile write by emitting it straight back at that plugin's fiber, and
+      // a test has to be able to reproduce that echo.
+      on(name, listener) {
+        if (name === 'loader/volatile-update') volatileListeners.push(listener)
+        return () => {
+          const index = volatileListeners.indexOf(listener)
+          if (index >= 0) volatileListeners.splice(index, 1)
+        }
+      },
       effect(callback) { const dispose = callback(); if (typeof dispose === 'function') effects.push(dispose) },
+      inject() {}, emit() {},
       llm: {
         registerAdapter() {
           if (state.fail === 'adapter') throw new Error('fixture adapter registration failure')
@@ -361,4 +372,39 @@ test('discovery rows belong to one activation and are empty as soon as it is dis
     await second.dispose()
     assert.deepEqual(json(await second.discovery({})), [])
   } finally { await first.dispose(); await second.dispose() }
+})
+
+test('a settings write this plugin made is not read as an edit from the host', async () => {
+  // DSH answers a plugin's volatile write by emitting `loader/volatile-update`
+  // back at the writer's own fiber, and the loader delivers it synchronously
+  // inside `mutate`. Taken for a host edit it cleared the whole credit cache, so
+  // every account switch from the popup blanked the readout to `—` until a
+  // warm-up poll refilled it. PI's host does not echo a plugin's own write,
+  // which is why only the DSH build showed it.
+  const activate = indexFixture()
+  let echo = () => {}
+  const written = {}
+  const settings = {
+    update: SettingsForms.prototype.update,
+    async mutate(_ns, ops) {
+      for (const op of ops) written[op.path[0]] = op.value
+      echo()
+    },
+    async write() {},
+  }
+  const state = activate(settings)
+  try {
+    echo = () => { for (const listener of state.volatileListeners) listener() }
+    let applied = 0
+    state.bridge.onSettingsChanged(() => { applied += 1 })
+
+    await state.bridge.setSettings({ showComposerPoints: true })
+    assert.deepEqual(written, { showComposerPoints: true }, 'the write must reach the settings service')
+    assert.equal(applied, 0, 'the write this plugin made must not read as an edit from the host')
+
+    // The same event outside a write is the host's own settings UI, and still has
+    // to land: dropping it unconditionally would ignore real edits.
+    echo()
+    assert.equal(applied, 1, 'an edit made in the host settings UI must still reach the plugin')
+  } finally { await state.dispose() }
 })

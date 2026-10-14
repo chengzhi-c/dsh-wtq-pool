@@ -3498,23 +3498,26 @@ async function onPanelInvoke(channel, payload) {
      * The popup lists one route's accounts, so the refresh covers exactly those:
      * a WorkBuddy region drops its probe cache and reads it back, a Trae or Qoder
      * region re-probes each of its rows. The polled readout stays cache-only;
-     * this channel is the one the click is allowed to wait on.
+     * this channel is the one the click is allowed to wait on, and it waits only
+     * as long as the readout's own call deadline leaves room for the answer.
      */
     case "xd.composerRefresh": {
       const hit = matchComposerModel(payload);
       if (hit === undefined) return composerPoints(payload);
+      const deadline = Date.now() + COMPOSER_REFRESH_BUDGET_MS;
       if (hit.source === "workbuddy") {
         for (const account of core.pool.list(hit.region)) probeCache.delete(account.id);
-        await settleWithin(statusDocument({ allowNetwork: true, budgetMs: PANEL_STEP_BUDGET_MS }), PANEL_STEP_BUDGET_MS);
+        await settleWithin(
+          statusDocument({ allowNetwork: true, budgetMs: COMPOSER_REFRESH_BUDGET_MS }),
+          COMPOSER_REFRESH_BUDGET_MS,
+        );
       } else {
         const rows = hit.source === "trae" ? traeAccountRows : qoderAccountRows;
         const found = hit.source === "trae" ? await discoverTraeCredentials() : await discoverQoderCredentials();
         // One bounded probe per account, and no shared budget, is minutes on a
-        // machine with several sign-ins - and nothing in DSH caps a panel call,
-        // so the bound has to live here. Past it a row keeps the figures the
-        // popup is already showing; the readout polls on, so a late probe still
-        // lands on the next poll rather than being lost.
-        const deadline = Date.now() + SOURCE_ACCOUNTS_BUDGET_MS;
+        // machine with several sign-ins, so the bound lives here. Past it a row
+        // keeps the figures the popup is already showing; the readout polls on,
+        // so a late probe still lands on the next poll rather than being lost.
         for (const row of rows) {
           if (row.region !== hit.region) continue;
           if (Date.now() >= deadline) break;
@@ -3523,7 +3526,6 @@ async function onPanelInvoke(channel, payload) {
             const itemRegion = hit.source === "trae" ? traeRegionOfCredential(item) : item.region;
             return itemLabel === row.label && itemRegion === row.region;
           });
-          if (credential === undefined) continue;
           if (credential === undefined) continue;
           // The previous row is the fallback: a failed read keeps the figures the
           // popup is already showing instead of blanking them.
@@ -3698,6 +3700,16 @@ const PANEL_STEP_BUDGET_MS = 20000;
  * reads: `allowNetwork: true` still probes inside this share.
  */
 const DOCUMENT_BUDGET_MS = 4000;
+/**
+ * What the composer popup's refresh may spend before it answers.
+ *
+ * The readout's own call deadline is 20 s (`INVOKE_TIMEOUT_MS`), and the route
+ * still has to serialize the answer inside it, so this pass stops short of the
+ * full figure. Past it the popup keeps the figures it already has and its poll
+ * picks up whatever the abandoned probe wrote, which is what keeps a slow
+ * credentials read from turning the click into a client-side timeout.
+ */
+const COMPOSER_REFRESH_BUDGET_MS = 15000;
 
 /** The one line a check-in pass reports, whichever way it finished. */
 function checkinSummaryText(result) {

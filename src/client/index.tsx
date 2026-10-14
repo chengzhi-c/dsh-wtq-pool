@@ -76,6 +76,7 @@ interface CardProps {
  */
 function PanelCard({ t, view }: CardProps): React.ReactElement | null {
   const [generation, setGeneration] = React.useState(0)
+  const [measured, setMeasured] = React.useState(0)
   const frameRef = React.useRef<HTMLIFrameElement | null>(null)
 
   const appearance = React.useMemo(() => {
@@ -87,6 +88,33 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
         && window.matchMedia?.('(prefers-color-scheme: dark)').matches === true)
     return { base: dark ? 'dark' : 'light', lang: root.lang === '' ? 'zh-CN' : root.lang }
   }, [generation])
+
+  // Follow the panel's own height.
+  //
+  // The frame is same-origin (the host half serves the panel on this host), so
+  // its document can be measured directly. Watching beats measuring once: the
+  // panel redraws itself from a poll, and its pages differ in length, so a single
+  // reading at load would fix the frame to whichever view happened to be up. The
+  // panel posts nothing to its parent, so there is no event to subscribe to.
+  React.useEffect(() => {
+    if (view === 'summary') return undefined
+    const frame = frameRef.current
+    const measure = () => {
+      const doc = frame === null ? null : frame.contentDocument
+      // `body` is null between the new document being installed and its content
+      // arriving, and the read below has no other guard. Measured there it threw,
+      // which is a page error on every load and a skipped reading.
+      if (doc === null || doc.body === null) return
+      // `body.scrollHeight`, not `documentElement`'s: the root element's own
+      // height is at least the frame's viewport, so measuring it can only ever
+      // report a frame that never shrinks - the panel would keep the box its
+      // longest page needed.
+      const height = Math.min(FRAME_MAX_HEIGHT, doc.body.scrollHeight + FRAME_BORDER)
+      setMeasured((current) => (current === height ? current : height))
+    }
+    const timer = window.setInterval(measure, 400)
+    return () => window.clearInterval(timer)
+  }, [view, generation])
 
   if (view === 'summary') {
     return React.createElement('p', { style: SUMMARY_STYLE }, t('row.desc'))
@@ -104,6 +132,7 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
         onClick: () => {
           // Reloading is the action here: it is also how the panel picks up a
           // theme that changed while it was on screen.
+          setMeasured(0)
           setGeneration((value) => value + 1)
           const frame = frameRef.current
           if (frame !== null) frame.src = panelUrl(appearance)
@@ -115,7 +144,7 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
       ref: frameRef,
       title: t('card.frameTitle'),
       src: panelUrl(appearance),
-      style: FRAME_STYLE,
+      style: measured === 0 ? FRAME_PENDING : { ...FRAME_PENDING, height: measured, minHeight: 0 },
     }),
   )
 }
@@ -150,14 +179,32 @@ const BUTTON_STYLE: React.CSSProperties = {
   cursor: 'pointer',
 }
 
-const FRAME_STYLE: React.CSSProperties = {
+/* The frame's box, before it has measured the panel. */
+const FRAME_PENDING: React.CSSProperties = {
   width: '100%',
   height: '72vh',
   minHeight: 460,
   border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,.25))',
   borderRadius: 10,
   background: 'transparent',
+  // `border-box`, so the measured height describes the whole frame: set from the
+  // panel's content alone it would leave the panel the border's worth of
+  // overflow, and the panel would grow a scrollbar for those 2px.
+  boxSizing: 'border-box',
 }
+
+/* The frame's border, which `border-box` counts inside the height it is given. */
+const FRAME_BORDER = 2
+
+/* Where the frame stops growing.
+ *
+ * The frame is sized to the panel's own content so the page scrolls as one,
+ * instead of the panel scrolling inside a box that was either too short for its
+ * content or too tall for it. The cap is the height four account cards need,
+ * measured in the panel at roughly 1.9k px: past it the panel keeps its own
+ * scrollbar, so a machine with a dozen accounts cannot stretch the settings page
+ * without bound. */
+const FRAME_MAX_HEIGHT = 1900
 
 /**
  * Register the card on the Plugins page.
