@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto'
 import type { TraeStreamEvent } from './trae-sse'
 import { SseDecoder, decodeTraeEvent } from './trae-sse'
-import { redactSecrets } from './loopback'
+import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, redactSecrets, replaySource, retryAfterHeader } from './loopback'
 
 /** What the gateway must answer when Trae refuses inside the stream. */
 export interface TraeFailure {
@@ -18,7 +18,20 @@ export interface TraeFailure {
   extra?: unknown
 }
 
-export type TraeRelayErrorKind = 'hard_credit' | 'client' | 'server'
+export type TraeRelayErrorKind = 'hard_credit' | 'soft_rate' | 'authentication' | 'client' | 'server'
+
+/**
+ * Words a Trae refusal uses for a sign-in the upstream no longer accepts.
+ *
+ * Trae answers a stale login inside the stream, on the same `event: error`
+ * frame a bad request uses, and it often carries no code at all — the sentence
+ * is the whole refusal. Matching only on the code answered those as a 502
+ * server failure, which is the one class the gateway does not rotate on, so
+ * every request paid one round trip and the healthy sign-ins beside it were
+ * never tried. The Qoder path in this same plugin classifies the identical
+ * frame as an authentication failure.
+ */
+const TRAE_SIGN_IN_PATTERN = /login expired|not logged in|unauthori[sz]ed|invalid token|token.*(expire|invalid)|\b9095\b/i
 
 interface OpenAIToolCallDelta {
   index: number
@@ -53,17 +66,144 @@ export function normalizeTraeToolCalls(value: unknown): OpenAIToolCallDelta[] {
   return calls
 }
 
-/** Recognise the failure Trae hides in an otherwise healthy stream. */
+/**
+ * A code wherever the frame chose to put it: top level, or one level down.
+ *
+ * The nested containers spell it as a string (`"errorCode": "1005"`), so both
+ * spellings are read; the floor below is what keeps a success-range code from
+ * counting as a refusal.
+ */
+function numericCodeOf(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim() !== '') {
+    const numeric = Number(value)
+    if (Number.isFinite(numeric)) return numeric
+  }
+  return undefined
+}
+
+/** A JSON document a frame hid inside its `message` field. */
+function embeddedJson(text: string): Record<string, unknown> | undefined {
+  const trimmed = text.trim()
+  if (!trimmed.startsWith('{')) return undefined
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>
+    }
+  } catch { /* not a document; the text stays the message */ }
+  return undefined
+}
+
+/**
+ * Recognise the failure Trae hides in an otherwise healthy stream.
+ *
+ * The shape decides, not the event name. A refusal has arrived as `event:
+ * error`, as a bare top-level `code`, nested under `error`/`details`, as a JSON
+ * document inside `message`, and on the `output` and `done` event names - which
+ * the shape decoder files as an empty delta and a terminator, so a refusal that
+ * arrived either way was answered with an empty 200 turn and no error at all.
+ *
+ * Two boundaries keep the widening honest. A frame that already carries output
+ * is content, whatever else it says: the peek stops at the first byte of a
+ * reply, and a refusal only counts when the turn produced nothing. And a bare
+ * code in the 400..1004 band counts for nothing on its own - Trae's business
+ * codes start at 1005 and its wire errors sit at 4000 and above, while that
+ * band is where bookkeeping frames carry codes that are not refusals, so a code
+ * there needs a message to name the failure. Bookkeeping frames themselves
+ * (usage, queue, progress) are never refusals.
+ */
 export function traeFailureOf(decoded: TraeStreamEvent): TraeFailure | undefined {
-  if (decoded.type !== 'unknown') return undefined
-  const payload = decoded.data as Record<string, unknown> | undefined
-  const code = typeof payload?.['code'] === 'number' ? payload['code'] : undefined
-  if (decoded.event !== 'error' && !(code !== undefined && code >= 4000)) return undefined
+  if (decoded.type === 'usage' || decoded.type === 'queue' || decoded.type === 'progress') return undefined
+  if (decoded.type === 'delta' && (decoded.text !== ''
+    || (decoded.reasoning !== undefined && decoded.reasoning !== '')
+    || normalizeTraeToolCalls(decoded.toolCalls).length > 0)) return undefined
+  const payload = decoded.type === 'unknown'
+    ? decoded.data as Record<string, unknown> | undefined
+    : decoded.raw
+  if (payload === undefined) return undefined
+  const eventName = decoded.event
+  let code = numericCodeOf(payload['code'])
+  let message = typeof payload['message'] === 'string' ? payload['message'] : ''
+  let extra = payload['extra']
+  // Whether the words came from an error-shaped place. A frame that names its
+  // own error is a refusal whatever else it carries, while a bare `message` is
+  // too generic to be one on its own.
+  let named = false
+  // A container that arrived as a bare string is the message. Trae spells a
+  // refusal `{"error":"Login expired"}` as often as it spells one with a code,
+  // and reading only the object form let those through as an empty turn.
+  const flat = typeof payload['error'] === 'string' ? payload['error']
+    : typeof payload['details'] === 'string' ? payload['details']
+      : undefined
+  if (message === '' && flat !== undefined && flat.length > 0) {
+    message = flat
+    named = true
+  }
+  if (code === undefined) {
+    for (const container of [payload['error'], payload['details']]) {
+      if (typeof container !== 'object' || container === null || Array.isArray(container)) continue
+      const record = container as Record<string, unknown>
+      const found = numericCodeOf(record['code'] ?? record['errorCode'])
+      if (found === undefined && (message !== '' || typeof record['message'] !== 'string')) continue
+      if (found !== undefined) code = found
+      if (message === '' && typeof record['message'] === 'string') {
+        message = record['message']
+        named = true
+      }
+      if (extra === undefined) extra = record['extra']
+      if (found !== undefined) break
+    }
+  }
+  if (code === undefined && message !== '') {
+    const embedded = embeddedJson(message)
+    if (embedded !== undefined) {
+      code = numericCodeOf(embedded['code'] ?? embedded['errorCode'])
+      if (code === undefined) {
+        // The document hid its error as a string rather than a code: the same
+        // spelling the outer frame uses, one layer down.
+        const nested = typeof embedded['error'] === 'string' ? embedded['error']
+          : typeof embedded['details'] === 'string' ? embedded['details']
+            : undefined
+        if (nested !== undefined && nested.length > 0) {
+          message = nested
+          named = true
+        }
+      }
+      if (code !== undefined && typeof embedded['message'] === 'string') message = embedded['message']
+    }
+  }
+  // A keepalive that happens to carry `code: 0`, or a success-range code, is an
+  // acknowledgement rather than a refusal.
+  if (code !== undefined && code < 400) code = undefined
+  // A code in the undocumented band needs words to be a refusal; above it the
+  // code is Trae's own and speaks for itself.
+  if (code !== undefined && code < 1005 && message.trim() === '') code = undefined
+  if (eventName !== 'error' && code === undefined && !named) return undefined
   return {
     ...code === undefined ? {} : { code },
-    message: typeof payload?.['message'] === 'string' ? payload['message'] : '',
-    ...payload?.['extra'] === undefined ? {} : { extra: payload['extra'] },
+    message,
+    ...extra === undefined ? {} : { extra },
   }
+}
+
+/**
+ * The wait a Trae failure asks for, when it asks.
+ *
+ * A queue or limit frame carries it inside its message as a JSON document, the
+ * same envelope Qoder uses. Reading it is what lets a queued Trae account be
+ * answered 429 with the wait and rotated past, instead of a 502 that ends the
+ * turn.
+ */
+export function traeRetryAfterSeconds(failure: TraeFailure): number | undefined {
+  const embedded = embeddedJson(failure.message)
+  const direct = Number(embedded?.['retryAfterSeconds'])
+  if (Number.isFinite(direct) && direct > 0) return direct
+  const extra = typeof failure.extra === 'object' && failure.extra !== null
+    ? failure.extra as Record<string, unknown>
+    : undefined
+  const nested = Number(extra?.['retryAfterSeconds'])
+  return Number.isFinite(nested) && nested > 0 ? nested : undefined
 }
 
 /**
@@ -83,7 +223,17 @@ export function describeTraeFailure(failure: TraeFailure): string {
   // frame it builds is sent straight to the client: an upstream error frame
   // that quotes the request it was sent carries the credential in `message`,
   // and `extra` is an opaque diagnostic object that may carry it too.
-  return redactSecrets(detail === '' ? parts.join(' · ') : `${parts.join(' · ')} · upstream: ${detail}`)
+  //
+  // The leading separator is dropped when there is nothing in front of it: a
+  // refusal with no code and no extra used to be assembled as " · upstream:
+  // ...", and that stray bullet reached the client in the error frame and in
+  // the peeked 502 body.
+  const head = parts.join(' · ')
+  const text = detail === '' ? head : head === '' ? `upstream: ${detail}` : `${head} · upstream: ${detail}`
+  // A refusal with neither a code nor words still has to say something: an
+  // empty message left the client with an error frame that named nothing at
+  // all, and the log with nothing to read either.
+  return redactSecrets(text === '' ? 'Trae SOLO refused the request' : text)
 }
 
 /**
@@ -99,9 +249,21 @@ export function describeTraeFailure(failure: TraeFailure): string {
  * the wire, so the leading digit is the class. A frame with no code at all is
  * upstream's fault too: there is no client mistake the gateway could name.
  */
-export function classifyTraeFailure(failure: TraeFailure): { status: number; kind: TraeRelayErrorKind } {
+export function classifyTraeFailure(failure: TraeFailure): { status: number; kind: TraeRelayErrorKind; retryAfterSeconds?: number } {
   if (failure.code === 1005) return { status: 402, kind: 'hard_credit' }
   const code = failure.code
+  // A queue or limit frame names its own wait, inside its message as a JSON
+  // document. Answering it as a server failure told the client to retry at once
+  // and kept this sign-in out of the rotation, where the Qoder path answers
+  // 429 with the wait and moves to the next one.
+  const retryAfterSeconds = traeRetryAfterSeconds(failure)
+  if (retryAfterSeconds !== undefined) return { status: 429, kind: 'soft_rate', retryAfterSeconds }
+  // Read before the code bands: a code-less frame whose sentence names the
+  // sign-in is the same refusal a 401 carries, and it is the shape Trae uses
+  // most often for one.
+  if (TRAE_SIGN_IN_PATTERN.test(`${code ?? ''} ${failure.message}`)) {
+    return { status: 401, kind: 'authentication' }
+  }
   if (code === undefined) return { status: 502, kind: 'server' }
   if (code >= 5000) return { status: 502, kind: 'server' }
   if (code >= 4290 && code < 4300) return { status: 429, kind: 'client' }
@@ -172,11 +334,13 @@ export function bridgeTraeStream(
     if (cancelled) return
     const decoded = decodeTraeEvent(event)
     if (decoded.type === 'done' || event.event === 'done') upstreamDone = true
-    if (decoded.type === 'unknown') {
-      const failure = traeFailureOf(decoded)
-      if (failure !== undefined) throw new Error(describeTraeFailure(failure))
-      return
-    }
+    // Every frame, not only the ones the decoder could not place: a refusal
+    // riding on the `output` or `done` event name reaches the bridge as an empty
+    // delta or a terminator, and answering it as content gave the client an
+    // empty turn. The peek looks at all of them for the same reason.
+    const failure = traeFailureOf(decoded)
+    if (failure !== undefined) throw new Error(describeTraeFailure(failure))
+    if (decoded.type === 'unknown') return
     if (decoded.type === 'delta') {
       const delta: Record<string, unknown> = {}
       if (decoded.text !== '') delta['content'] = decoded.text
@@ -217,18 +381,40 @@ export function bridgeTraeStream(
     controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : decoded.finishReason || 'stop'))
   }
 
+  let released = false
+  /**
+   * Release the upstream reader, once, on the way out.
+   *
+   * Cancelling it is what frees the upstream socket; a turn that ended normally
+   * used to leave the source uncancelled and the reader locked.
+   */
+  const release = async (): Promise<void> => {
+    if (released) return
+    released = true
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
+
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
+    // Driven by the consumer, one upstream read per `pull`, rather than by
+    // `start`: a loop in `start` drained the whole upstream turn into this
+    // stream's queue whatever the consumer was doing, so a slow reader was fed
+    // the entire reply from memory.
+    async pull(controller) {
       try {
-        while (!cancelled) {
-          const next = await reader.read()
-          if (cancelled) return
-          if (next.done) break
-          for (const event of sse.push(decoder.decode(next.value, { stream: true }))) consume(event, controller)
-          if (upstreamDone) break
-        }
+        const next = await reader.read()
         if (cancelled) return
-        for (const event of sse.finish()) consume(event, controller)
+        if (!next.done) {
+          for (const event of sse.push(decoder.decode(next.value, { stream: true }))) consume(event, controller)
+          // More to come: the next chunk is read when the consumer has room.
+          if (!upstreamDone) return
+        }
+        // The decoder is flushed before the SSE tail: a stream that ends in the
+        // middle of a multi-byte character holds those bytes, and `finish()`
+        // alone left them on the floor with the rest of the tail.
+        const rest = decoder.decode()
+        const events = rest === '' ? sse.finish() : [...sse.push(rest), ...sse.finish()]
+        for (const event of events) consume(event, controller)
         // A clean EOF is a valid termination even without an explicit done
         // event; the client still needs a non-null finish_reason.
         if (!emittedFinishReason) {
@@ -270,46 +456,10 @@ export function bridgeTraeStream(
           controller.enqueue(encoder.encode('data: [DONE]\n\n'))
           controller.close()
         }
-      } finally {
-        await reader.cancel().catch(() => {})
-        reader.releaseLock()
       }
+      await release()
     },
     cancel(reason) { cancelled = true; return reader.cancel(reason) },
-  })
-}
-
-/** How far {@link openTraeResponse} reads before giving up on finding a failure. */
-const PEEK_MAX_CHUNKS = 64
-const PEEK_MAX_BYTES = 262_144
-
-/** Replay the bytes the peek consumed, then drain the rest of the upstream. */
-function replaySource(
-  buffered: readonly Uint8Array[],
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  ended: boolean,
-): ReadableStream<Uint8Array> {
-  let index = 0
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      const chunk = buffered[index]
-      if (chunk !== undefined) {
-        index += 1
-        controller.enqueue(chunk)
-        return
-      }
-      if (ended) {
-        controller.close()
-        return
-      }
-      const next = await reader.read()
-      if (next.done) {
-        controller.close()
-        return
-      }
-      controller.enqueue(next.value)
-    },
-    async cancel(reason) { await reader.cancel(reason).catch(() => {}) },
   })
 }
 
@@ -373,8 +523,11 @@ export async function openTraeResponse(
         ended = true
         // Flush the tail: a stream cut off before its blank line holds exactly
         // the failure this peek exists to catch, and `push` alone never
-        // dispatches it.
-        inspect(sse.finish())
+        // dispatches it. The decoder is flushed first for the same reason the
+        // relay's is: bytes of a split character would otherwise be dropped
+        // before the tail they belong to is read.
+        const rest = decoder.decode()
+        inspect(rest === '' ? sse.finish() : [...sse.push(rest), ...sse.finish()])
         break
       }
       buffered.push(next.value)
@@ -394,10 +547,11 @@ export async function openTraeResponse(
   // real status code. Once output has started, the stream is already committed.
   if (failure !== undefined && !sawOutput) {
     await reader.cancel().catch(() => {})
-    const { status, kind } = classifyTraeFailure(failure)
+    const { status, kind, retryAfterSeconds } = classifyTraeFailure(failure)
+    const wait = retryAfterHeader(retryAfterSeconds)
     return Response.json(
       { error: { message: describeTraeFailure(failure), type: 'upstream_error', code: kind === 'hard_credit' ? 402 : status } },
-      { status },
+      { status, ...wait === undefined ? {} : { headers: { 'Retry-After': wait } } },
     )
   }
   const replayed = replaySource(buffered, reader, ended)

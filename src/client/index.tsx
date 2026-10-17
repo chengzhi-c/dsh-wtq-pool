@@ -12,7 +12,7 @@
 import * as React from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 
-import { panelUrl } from './panel-url.ts'
+import { panelUrl, PANEL_BASE } from './panel-url.ts'
 import { ComposerPoints, COMPOSER_SLOT_ID, composerEn, composerZh } from './composer.tsx'
 import { PLUGIN_NAME, ROW_ID } from '../ids.ts'
 
@@ -77,6 +77,7 @@ interface CardProps {
 function PanelCard({ t, view }: CardProps): React.ReactElement | null {
   const [generation, setGeneration] = React.useState(0)
   const [measured, setMeasured] = React.useState(0)
+  const [missing, setMissing] = React.useState(false)
   const frameRef = React.useRef<HTMLIFrameElement | null>(null)
 
   const appearance = React.useMemo(() => {
@@ -88,6 +89,35 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
         && window.matchMedia?.('(prefers-color-scheme: dark)').matches === true)
     return { base: dark ? 'dark' : 'light', lang: root.lang === '' ? 'zh-CN' : root.lang }
   }, [generation])
+
+  // Whether the host half is serving the panel at all.
+  //
+  // The frame is same-origin, so a build whose host half is not serving shows
+  // the route's own JSON error body where the panel should be, and that reads
+  // as a broken panel rather than a missing one. One probe per frame generation
+  // tells the two apart. `panel.css` is the file to ask for: it is the panel's
+  // own, it is already in the frame's critical path, and only a served panel
+  // can answer for it.
+  //
+  // Retried before concluding: a host half that is still loading has not
+  // registered its routes yet, and that 404 is a wait rather than a verdict.
+  React.useEffect(() => {
+    if (view === 'summary') return undefined
+    let live = true
+    setMissing(false)
+    const attempts = 3
+    const probe = (remaining: number): void => {
+      fetch(`${PANEL_BASE}/panel.css`)
+        .then((response) => {
+          if (!live) return
+          if (response.ok || remaining <= 1) setMissing(!response.ok)
+          else setTimeout(() => probe(remaining - 1), 500)
+        })
+        .catch(() => { if (live && remaining <= 1) setMissing(true) })
+    }
+    probe(attempts)
+    return () => { live = false }
+  }, [view, generation])
 
   // Follow the panel's own height.
   //
@@ -139,13 +169,15 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
         },
       }, t('card.open')),
     ),
-    React.createElement('iframe', {
-      key: generation,
-      ref: frameRef,
-      title: t('card.frameTitle'),
-      src: panelUrl(appearance),
-      style: measured === 0 ? FRAME_PENDING : { ...FRAME_PENDING, height: measured, minHeight: 0 },
-    }),
+    missing
+      ? React.createElement('div', { style: MISSING_STYLE }, t('card.missing'))
+      : React.createElement('iframe', {
+        key: generation,
+        ref: frameRef,
+        title: t('card.frameTitle'),
+        src: panelUrl(appearance),
+        style: measured === 0 ? FRAME_PENDING : { ...FRAME_PENDING, height: measured, minHeight: 0 },
+      }),
   )
 }
 
@@ -205,6 +237,23 @@ const FRAME_BORDER = 2
  * scrollbar, so a machine with a dozen accounts cannot stretch the settings page
  * without bound. */
 const FRAME_MAX_HEIGHT = 1900
+
+/* The frame's box, standing in for the panel the host half did not serve.
+ *
+ * The box stays so the card keeps the height the panel would have given it: a
+ * card that collapsed to two lines reads as the whole plugin having failed,
+ * which is a different and worse story than the one being told. */
+const MISSING_STYLE: React.CSSProperties = {
+  ...FRAME_PENDING,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  margin: 0,
+  padding: '0 16px',
+  opacity: 0.75,
+  fontSize: 13,
+  textAlign: 'center',
+}
 
 /**
  * Register the card on the Plugins page.

@@ -16,8 +16,22 @@ export interface SseEvent {
 
 /** Incremental SSE decoder supporting CRLF, chunk splits and multi-line data. */
 
-/** One unterminated line may not grow without bound; chat deltas are small. */
-const MAX_LINE_CHARS = 8 * 1024 * 1024
+/**
+ * One unterminated line may not grow without bound; chat deltas are small.
+ * The ceiling is a memory guard on the upstream's answer, which no request-body
+ * limit bounds: a frame this size is a stream gone wrong, not a chat delta.
+ */
+const MAX_LINE_CHARS = 64 * 1024 * 1024
+
+/**
+ * How much one event's accumulated `data:` lines may hold.
+ *
+ * The line guard above measures the unterminated tail, which stays small on a
+ * stream that keeps ending its lines: every `data:` line lands in `data` and
+ * only a blank line drains it, so an upstream that emits framed events without
+ * ever separating them grew this array without any ceiling touching it.
+ */
+const MAX_DATA_CHARS = 4 * 1024 * 1024
 
 export class SseDecoder {
   private buffer = ''
@@ -25,13 +39,17 @@ export class SseDecoder {
   private id: string | undefined
   private retry: number | undefined
   private data: string[] = []
+  private dataChars = 0
 
   push(chunk: string): SseEvent[] {
     this.buffer += chunk
     const events: SseEvent[] = []
     while (true) {
-      const match = /\r?\n/.exec(this.buffer)
+      // A lone trailing CR is held back: it may be the first half of a CRLF the
+      // next chunk completes, and splitting on it early cut a line in two.
+      const match = /\r\n|\n|\r/.exec(this.buffer)
       if (match === null || match.index === undefined) break
+      if (match[0] === '\r' && match.index + 1 === this.buffer.length) break
       const line = this.buffer.slice(0, match.index)
       this.buffer = this.buffer.slice(match.index + match[0].length)
       const emitted = this.consumeLine(line)
@@ -44,6 +62,11 @@ export class SseDecoder {
       this.buffer = ''
       throw new Error('sse line exceeded ' + MAX_LINE_CHARS + ' characters without a newline')
     }
+    if (this.dataChars > MAX_DATA_CHARS) {
+      this.data = []
+      this.dataChars = 0
+      throw new Error('sse event exceeded ' + MAX_DATA_CHARS + ' characters of data without a separator')
+    }
     return events
   }
 
@@ -51,7 +74,10 @@ export class SseDecoder {
   finish(): SseEvent[] {
     const events: SseEvent[] = []
     if (this.buffer !== '') {
-      const emitted = this.consumeLine(this.buffer)
+      // A stream that ended on a bare carriage return leaves it on the buffer,
+      // and consuming it as part of the value kept `[DONE]` from matching.
+      const tail = this.buffer.endsWith('\r') ? this.buffer.slice(0, -1) : this.buffer
+      const emitted = this.consumeLine(tail)
       this.buffer = ''
       if (emitted !== undefined) events.push(emitted)
     }
@@ -68,7 +94,10 @@ export class SseDecoder {
     let value = colon === -1 ? '' : line.slice(colon + 1)
     if (value.startsWith(' ')) value = value.slice(1)
     if (field === 'event') this.event = value
-    else if (field === 'data') this.data.push(value)
+    else if (field === 'data') {
+      this.data.push(value)
+      this.dataChars += value.length + 1
+    }
     else if (field === 'id' && !value.includes('\0')) this.id = value
     else if (field === 'retry' && /^\d+$/.test(value)) this.retry = Number(value)
     return undefined
@@ -89,6 +118,7 @@ export class SseDecoder {
     this.event = undefined
     this.retry = undefined
     this.data = []
+    this.dataChars = 0
     return result
   }
 }
@@ -97,7 +127,7 @@ export class SseDecoder {
 export type TraeStreamEvent =
   | { type: 'queue'; position?: number }
   | { type: 'progress'; notice: unknown }
-  | { type: 'delta'; text: string; reasoning?: string; toolCalls?: unknown; finishReason?: string }
+  | { type: 'delta'; text: string; reasoning?: string; toolCalls?: unknown; finishReason?: string; event?: string; raw?: Record<string, unknown> }
   | {
     type: 'usage'
     inputTokens?: number
@@ -115,7 +145,7 @@ export type TraeStreamEvent =
     cacheReadTokens?: number
     cacheWriteTokens?: number
   }
-  | { type: 'done'; finishReason: string }
+  | { type: 'done'; finishReason: string; event?: string; raw?: Record<string, unknown> }
   | { type: 'unknown'; event?: string; data: unknown }
 
 /** Normalise one decoded SSE event. Never throws on malformed payloads. */
@@ -150,11 +180,17 @@ export function decodeTraeEvent(event: SseEvent): TraeStreamEvent {
     ...record['tool_calls'] === undefined || record['tool_calls'] === null ? {} : { toolCalls: record['tool_calls'] },
     ...typeof record['finish_reason'] === 'string' ? { finishReason: record['finish_reason'] }
       : event.event === 'done' ? { finishReason: 'stop' } : {},
+    // The frame as it arrived, kept so a refusal riding on an `output` or
+    // `done` event name can still be recognised: the shape decoder files those
+    // as an empty delta or a terminator, and the code and message it carried
+    // would otherwise be invisible.
+    raw: record,
+    ...event.event === undefined ? {} : { event: event.event },
   }
   if (delta.text !== '' || (delta.reasoning !== undefined && delta.reasoning !== '')
     || (Array.isArray(delta.toolCalls) && delta.toolCalls.length > 0)) return delta
   if (event.event === 'done' || delta.finishReason !== undefined) {
-    return { type: 'done', finishReason: delta.finishReason ?? 'stop' }
+    return { type: 'done', finishReason: delta.finishReason ?? 'stop', raw: record, ...event.event === undefined ? {} : { event: event.event } }
   }
   if (event.event === 'output' || record['response'] !== undefined || record['reasoning_content'] !== undefined || delta.toolCalls !== undefined) {
     return delta

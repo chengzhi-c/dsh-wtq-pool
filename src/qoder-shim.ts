@@ -9,7 +9,19 @@
 import { randomUUID } from 'node:crypto'
 import { QODER_EFFORT_ORDER, type QoderChatModel } from './qoder-client'
 import { QoderFrameDecoder, decodeQoderFrame, type QoderFrame } from './qoder-sse'
-import { redactSecrets } from './loopback'
+import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, redactSecrets, replaySource, retryAfterHeader } from './loopback'
+
+/**
+ * How long a turn that has already emitted its finish chunk waits for anything
+ * trailing before the relay ends it itself.
+ *
+ * Qoder finishes a turn by leaving the socket open: the finish chunk and the
+ * usage frame arrive and then nothing, with no `[DONE]` and no close. A relay
+ * that waited for the upstream to end left the client on a turn that was already
+ * over - measured against the live gateway at seven minutes with no terminal
+ * frame. A vendor that does close its stream wins this race and pays nothing.
+ */
+const TAIL_GRACE_MS = 1_000
 
 /** What the gateway must answer when Qoder refuses inside the stream. */
 export interface QoderFailure {
@@ -306,6 +318,8 @@ export function bridgeQoderStream(
           if (!emittedFinishReason) {
             emittedFinishReason = true
             controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : finish))
+            // Over for the client; the vendor's socket is not necessarily over.
+            endSoon()
           }
         }
       }
@@ -313,21 +327,69 @@ export function bridgeQoderStream(
     if (inner['usage'] !== undefined && inner['usage'] !== null && typeof inner['usage'] === 'object') {
       usage = inner['usage'] as Record<string, unknown>
       controller.enqueue(chunk(null))
+      // The usage frame follows the finish chunk and nothing comes after it, so
+      // the turn ends here rather than at the grace deadline above.
+      if (emittedFinishReason) endTurn()
     }
   }
 
+  let released = false
+  let tailTimer: ReturnType<typeof setTimeout> | undefined
+  /**
+   * Wake the pending read so the tail below runs.
+   *
+   * Cancelling the source resolves the read as an end rather than rejecting it,
+   * and that is the path which already emits the terminal frames. The reader
+   * itself is released by `release`, on the way out.
+   */
+  const endTurn = (): void => { void reader.cancel().catch(() => {}) }
+  const endSoon = (): void => {
+    if (tailTimer !== undefined) return
+    tailTimer = setTimeout(endTurn, TAIL_GRACE_MS)
+    tailTimer.unref?.()
+  }
+  const clearTail = (): void => {
+    if (tailTimer !== undefined) clearTimeout(tailTimer)
+    tailTimer = undefined
+  }
+  /**
+   * Release the upstream reader, once, on the way out.
+   *
+   * Done here rather than only in the failure path: a stream that ran to EOF
+   * closes its controller instead of erroring, and that exit skips the catch
+   * entirely, so the cancel and the unlock would otherwise only ever run for a
+   * failed turn - leaving a normal one with the upstream reader locked and its
+   * source uncancelled.
+   */
+  const release = async (): Promise<void> => {
+    if (released) return
+    released = true
+    clearTail()
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
+
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
+    // Driven by the consumer, one upstream read per `pull`, rather than by
+    // `start`: a loop in `start` drained the whole upstream turn into this
+    // stream's queue whatever the consumer was doing, so a slow reader was fed
+    // the entire reply from memory.
+    async pull(controller) {
       try {
-        while (!cancelled) {
-          const next = await reader.read()
-          if (cancelled) return
-          if (next.done) break
-          for (const payload of frames.push(decoder.decode(next.value, { stream: true }))) consume(payload, controller)
-          if (frames.ended) break
-        }
+        const next = await reader.read()
         if (cancelled) return
-        for (const payload of frames.finish()) consume(payload, controller)
+        if (!next.done) {
+          for (const payload of frames.push(decoder.decode(next.value, { stream: true }))) consume(payload, controller)
+          // More to come: the next chunk is read when the consumer has room.
+          if (!frames.ended) return
+        }
+        // The decoder is flushed before the frame decoder's tail, for the same
+        // reason the WorkBuddy relay's is: bytes of a multi-byte character split
+        // across the last two chunks would otherwise be dropped.
+        const rest = decoder.decode()
+        for (const payload of (rest === '' ? frames.finish() : [...frames.push(rest), ...frames.finish()])) {
+          consume(payload, controller)
+        }
         // A clean EOF is a valid termination even without an explicit finish
         // chunk, and even when nothing was produced at all: the client still
         // needs a non-null finish_reason and a [DONE]. Trae and WorkBuddy close
@@ -375,51 +437,10 @@ export function bridgeQoderStream(
           controller.enqueue(encoder.encode('data: [DONE]\n\n'))
           controller.close()
         }
-      } finally {
-        // The reader is released here rather than in the catch: a stream that
-        // ran to EOF closes its controller instead of erroring, and that exit
-        // skips the catch entirely - so the cancel and the unlock only ever
-        // ran for a failed turn, and a normal one left the upstream reader
-        // locked and its source uncancelled.
-        await reader.cancel().catch(() => {})
-        reader.releaseLock()
       }
+      await release()
     },
-    cancel(reason) { cancelled = true; return reader.cancel(reason) },
-  })
-}
-
-/** How far {@link openQoderResponse} reads before giving up on finding a failure. */
-const PEEK_MAX_CHUNKS = 64
-const PEEK_MAX_BYTES = 262_144
-
-/** Replay the bytes the peek consumed, then drain the rest of the upstream. */
-function replaySource(
-  buffered: readonly Uint8Array[],
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  ended: boolean,
-): ReadableStream<Uint8Array> {
-  let index = 0
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      const bytes = buffered[index]
-      if (bytes !== undefined) {
-        index += 1
-        controller.enqueue(bytes)
-        return
-      }
-      if (ended) {
-        controller.close()
-        return
-      }
-      const next = await reader.read()
-      if (next.done) {
-        controller.close()
-        return
-      }
-      controller.enqueue(next.value)
-    },
-    async cancel(reason) { await reader.cancel(reason).catch(() => {}) },
+    cancel(reason) { cancelled = true; clearTail(); return reader.cancel(reason) },
   })
 }
 
@@ -480,7 +501,10 @@ export async function openQoderResponse(
       const next = await reader.read()
       if (next.done) {
         ended = true
-        inspect(frames.finish())
+        // The decoder is flushed before the frame decoder's tail: a stream cut
+        // off mid-character holds exactly the bytes the failure may sit behind.
+        const rest = decoder.decode()
+        inspect(rest === '' ? frames.finish() : [...frames.push(rest), ...frames.finish()])
         break
       }
       buffered.push(next.value)
@@ -503,6 +527,9 @@ export async function openQoderResponse(
     const retryAfter = error instanceof QoderQueueRejection || error instanceof QoderDailyLimitRejection
       ? error.retryAfterSeconds
       : undefined
+    // Validated and bounded like the HTTP path's: a wait of years is not a wait
+    // any client should honour, and a malformed one is not a value at all.
+    const wait = retryAfter === undefined ? undefined : retryAfterHeader(retryAfter)
     return Response.json(
       {
         error: {
@@ -514,7 +541,7 @@ export async function openQoderResponse(
       },
       {
         status,
-        ...retryAfter === undefined || !(retryAfter > 0) ? {} : { headers: { 'Retry-After': String(Math.ceil(retryAfter)) } },
+        ...wait === undefined ? {} : { headers: { 'Retry-After': wait } },
       },
     )
   }

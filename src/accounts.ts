@@ -16,6 +16,7 @@ import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { regionOf, type WorkBuddyRegion } from './upstream'
 import { encryptedFieldOpener, isEncryptedFieldWrapper } from './at-rest'
+import { LOG_PREFIX } from './log'
 
 /** Minimal upstream surface the pool needs to refresh a token (no circular import). */
 export interface TokenRefresher {
@@ -28,10 +29,10 @@ export interface TokenRefresher {
 }
 
 /** Live auth file name the WorkBuddy desktop app writes. */
-export const WORKBUDDY_LIVE_FILENAME = 'workbuddy-desktop.info'
+const WORKBUDDY_LIVE_FILENAME = 'workbuddy-desktop.info'
 
 /** Env override for the auth file or its directory. */
-export const WORKBUDDY_AUTH_FILE_ENV = 'WORKBUDDY_AUTH_FILE'
+const WORKBUDDY_AUTH_FILE_ENV = 'WORKBUDDY_AUTH_FILE'
 
 /** One parsed WorkBuddy credential. */
 export interface WorkBuddyCredential {
@@ -96,7 +97,7 @@ function nonEmptyEnv(value: unknown): string | undefined {
  * Windows probes Local before Roaming; a redirected profile still resolves
  * through the env location.
  */
-export function defaultDesktopAuthDirs(
+function defaultDesktopAuthDirs(
   platform: NodeJS.Platform = process.platform,
   home: string = homedir(),
   env: NodeJS.ProcessEnv = process.env,
@@ -202,9 +203,16 @@ export function parseWorkBuddyAuth(
 
   const refreshExpiresAtMs =
     typeof auth['refreshExpiresAt'] === 'number' ? expiryToMs(auth['refreshExpiresAt']) : undefined
-  if (refreshExpiresAtMs !== undefined && refreshExpiresAtMs > 0 && refreshExpiresAtMs < Date.now()) {
-    return undefined
-  }
+  const refreshToken = decryptableString(auth['refreshToken'], decrypt)
+  // A refresh token past its own expiry cannot renew anything, but the access
+  // token issued beside it may still have hours left. Returning the whole
+  // credential as unreadable took the account out of the pool for that window,
+  // and the panel reported "no WorkBuddy sign-in found" over a token that was
+  // still serving. Without the refresh token the request path lands in the
+  // no-refresh branch instead, which warns once and keeps serving.
+  const refreshExpired = refreshExpiresAtMs !== undefined
+    && refreshExpiresAtMs > 0
+    && refreshExpiresAtMs < Date.now()
 
   const lastRefreshAtMs = typeof auth['lastRefreshTime'] === 'number'
     ? expiryToMs(auth['lastRefreshTime'])
@@ -213,9 +221,9 @@ export function parseWorkBuddyAuth(
 
   return {
     accessToken,
-    refreshToken: decryptableString(auth['refreshToken'], decrypt),
+    refreshToken: refreshExpired ? '' : refreshToken,
     expiresAtMs: typeof auth['expiresAt'] === 'number' ? expiryToMs(auth['expiresAt']) : 0,
-    ...refreshExpiresAtMs === undefined ? {} : { refreshExpiresAtMs },
+    ...refreshExpiresAtMs === undefined || refreshExpired ? {} : { refreshExpiresAtMs },
     ...lastRefreshAtMs === undefined ? {} : { lastRefreshAtMs },
     ...nickname === undefined ? {} : { nickname },
     ...optionalString(identity['uin']) === undefined ? {} : { uin: optionalString(identity['uin']) },
@@ -289,15 +297,31 @@ function isFresher(candidate: WorkBuddyCredential, incumbent: WorkBuddyCredentia
 }
 
 export function workbuddyAccountId(
-  credential: Pick<WorkBuddyCredential, 'uin' | 'uid' | 'nickname'>,
+  credential: Pick<WorkBuddyCredential, 'uin' | 'uid' | 'nickname' | 'sourcePath'>,
 ): string {
-  const stable = credential.uin ?? credential.uid ?? credential.nickname ?? 'unknown'
+  // The source path is the last resort so two sign-ins with no identity at all
+  // stay two accounts: a shared constant hashed them into one pool entry and
+  // silently dropped the second.
+  const stable = credential.uin ?? credential.uid ?? credential.nickname ?? `path:${credential.sourcePath}`
   return createHash('sha256').update(`workbuddy\0${stable}`).digest('hex').slice(0, 16)
 }
 
 /** Human label; the nickname alone, so the pool reads as names rather than keys. */
 function accountLabel(credential: WorkBuddyCredential): string {
   return credential.nickname ?? 'WorkBuddy'
+}
+
+/**
+ * Whether a credential can no longer serve a request at all.
+ *
+ * Only a token that has already died AND that carries nothing to renew it with.
+ * A credential with no recorded expiry is live (`expiresAtMs <= 0` is the
+ * sentinel for "the file did not say"), and one that is merely near its expiry
+ * is renewed by `ensureFresh` before the request is spent on it.
+ */
+function credentialUnusable(credential: WorkBuddyCredential, now: number): boolean {
+  if (credential.expiresAtMs <= 0 || credential.expiresAtMs > now) return false
+  return credential.refreshToken === ''
 }
 
 /**
@@ -344,15 +368,47 @@ async function authFilesIn(dir: string): Promise<string[] | undefined> {
   return files.map(name => join(dir, name))
 }
 
-async function readCredential(path: string): Promise<WorkBuddyCredential | undefined> {
+/**
+ * One credential file's reading.
+ *
+ * `sealed` is the case that used to read as `absent`: a 5.6+ sign-in whose
+ * `$wbEncrypted` fields cannot be opened because the at-rest key is not
+ * available right now. The file is intact and the account was usable a moment
+ * ago, so the pool keeps the incumbent instead of reporting an empty pool.
+ */
+type CredentialRead =
+  | { kind: 'credential'; credential: WorkBuddyCredential }
+  | { kind: 'sealed' }
+  | { kind: 'absent' }
+
+/** True when the document's access token is a `$wbEncrypted` envelope. */
+function sealedAccessToken(text: string): boolean {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return false
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false
+  const document = parsed as Record<string, unknown>
+  const auth = typeof document['auth'] === 'object' && document['auth'] !== null
+    ? document['auth'] as Record<string, unknown>
+    : document
+  return isEncryptedFieldWrapper(auth['accessToken'])
+}
+
+async function readCredential(path: string): Promise<CredentialRead> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
   } catch {
-    return undefined
+    return { kind: 'absent' }
   }
   const decrypt = text.includes('"$wbEncrypted"') ? await encryptedFieldOpener() : undefined
-  return parseWorkBuddyAuth(text, path, decrypt)
+  const credential = parseWorkBuddyAuth(text, path, decrypt)
+  if (credential !== undefined) return { kind: 'credential', credential }
+  if (sealedAccessToken(text)) return { kind: 'sealed' }
+  return { kind: 'absent' }
 }
 
 
@@ -361,8 +417,36 @@ const REFRESH_MARGIN_MS = 5 * 60 * 1000
 /**
  * Longest one penalize may cool an account: same 2h ceiling as the parse
  * layer, so a raw caller-supplied timestamp cannot sleep a pool all day.
+ *
+ * A hold the pool itself decides is exempt: a spent account or a dead session
+ * does not come back on its own, and clamping it to two hours put the account
+ * back at the head of the queue while it was still unusable. The exemption is
+ * keyed on the caller naming a hold rather than a timestamp, so no untrusted
+ * value can reach it.
  */
 const PENALIZE_CAP_MS = 2 * 60 * 60 * 1000
+/** How long a hold the pool itself decided may keep an account out of rotation. */
+const POOL_HOLD_CAP_MS = 24 * 60 * 60 * 1000
+/**
+ * Live per-model cooldown keys kept per account.
+ *
+ * The key is whatever model string the request carried, so a client that
+ * sprays distinct ids could otherwise grow one map per account forever.
+ */
+const MAX_MODEL_COOLDOWN_KEYS = 128
+
+/** Drop expired per-model cooldowns, then cap what is left, soonest first. */
+function pruneModelCooldowns(account: WorkBuddyAccount, now: number): void {
+  for (const [modelId, until] of Object.entries(account.modelCooldowns)) {
+    if (until <= now) delete account.modelCooldowns[modelId]
+  }
+  const keys = Object.keys(account.modelCooldowns)
+  if (keys.length <= MAX_MODEL_COOLDOWN_KEYS) return
+  keys.sort((a, b) => (account.modelCooldowns[a] ?? 0) - (account.modelCooldowns[b] ?? 0))
+  for (const key of keys.slice(0, keys.length - MAX_MODEL_COOLDOWN_KEYS)) {
+    delete account.modelCooldowns[key]
+  }
+}
 /**
  * Lifetime assumed for a refreshed token whose answer carries no `expiresIn`.
  *
@@ -373,7 +457,7 @@ const PENALIZE_CAP_MS = 2 * 60 * 60 * 1000
  */
 const ASSUMED_TOKEN_LIFETIME_MS = 60 * 60 * 1000
 /** Soonest future one-off expiry. Missing or past sorts last. None left → list head. */
-export function pickSoonestExpiry<T extends { id: string }>(
+function pickSoonestExpiry<T extends { id: string }>(
   pool: readonly T[],
   expiryMs: ReadonlyMap<string, number>,
   now: number,
@@ -497,6 +581,27 @@ export class WorkBuddyAccountPool {
   /** Soonest remaining one-off pack, ms. Cleared when that pack is spent or past. */
   private creditExpiries = new Map<string, number>()
   private refreshInflight = new Map<string, Promise<void>>()
+  /** The one scan in progress; concurrent callers await it instead of duplicating it. */
+  private scanInflight: Promise<WorkBuddyAccount[]> | undefined
+  /** The directories the in-flight scan is reading, so a repoint supersedes it. */
+  private scanDirs: readonly string[] = []
+  /**
+   * Accounts whose "expired with no refresh token" warning has been logged.
+   *
+   * A credential with no expiry and no refresh token stays on the expiring path
+   * forever, so without this the same warning fired on every request.
+   */
+  private noRefreshWarned = new Set<string>()
+  /**
+   * Accounts a hold the pool itself decided is keeping out of rotation.
+   *
+   * Separate from `cooldownUntilMs` because the two are released by different
+   * things: an upstream's rate-limit window expires on its own, while a hold
+   * ends when the condition behind it changes. A balance read that finds credits
+   * again is that signal for a spent account, and it has to be able to tell a
+   * hold from a rate limit to release the right one.
+   */
+  private heldIds = new Set<string>()
 
   constructor(options: AccountPoolOptions = {}) {
     this.logger = options.logger
@@ -512,6 +617,11 @@ export class WorkBuddyAccountPool {
    * Re-apply configuration that only affects discovery and cooldown policy,
    * without rebuilding the pool. A later `scan()` uses the new auth dirs and
    * cooldown window; existing accounts keep their in-memory state.
+   *
+   * Answers whether the auth directory set changed, which is the one case that
+   * empties the pool: the caller has to know, because nothing downstream reads
+   * the disk on its own and the pool would otherwise stay empty until a chat
+   * request happened to scan it.
    */
   applyConfig(options: {
     authDirs?: readonly string[]
@@ -521,13 +631,17 @@ export class WorkBuddyAccountPool {
     disabledAccountIds?: readonly string[]
     /** Per-account credit floor, keyed by account id. Replaced wholesale. */
     creditReserves?: Readonly<Record<string, number>>
-  }): void {
+  }): boolean {
+    let emptied = false
     if (options.authDirs !== undefined && options.authDirs.length > 0) {
       // Pointed somewhere else entirely, so nothing already in the pool can
       // still be valid: `scan()` seeds from the accounts it holds, which is what
       // keeps cooldowns across a rescan but would otherwise pin the pool to the
       // previous directory forever.
-      if (!sameDirs(this.authDirs, options.authDirs)) this.accounts = []
+      if (!sameDirs(this.authDirs, options.authDirs)) {
+        this.accounts = []
+        emptied = true
+      }
       this.authDirs = options.authDirs
     }
     if (options.cooldownMs !== undefined && options.cooldownMs >= 1000) {
@@ -547,6 +661,7 @@ export class WorkBuddyAccountPool {
       }
       this.creditReserves = next
     }
+    return emptied
   }
 
   /** Remember an account's last known balance, from the panel's probe. */
@@ -558,6 +673,18 @@ export class WorkBuddyAccountPool {
       this.creditExpiries.set(accountId, nearestExpiryMs)
     } else {
       this.creditExpiries.delete(accountId)
+    }
+    // A balance that is there again is the one signal that a spent account has
+    // been topped up. The hold the pool put on it for that reason is released
+    // here; without this, the account stayed out of rotation for the whole hold
+    // after the user had already fixed it, and the only way back was a manual
+    // cooldown reset. A rate-limit cooldown is NOT released: it belongs to the
+    // upstream's window, which a balance says nothing about.
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account !== undefined && total > 0 && this.heldIds.delete(accountId)
+      && account.cooldownUntilMs > Date.now()) {
+      account.cooldownUntilMs = 0
+      this.logger?.info?.(`${LOG_PREFIX}: ${account.label} has credits again; releasing the hold`)
     }
   }
 
@@ -592,18 +719,45 @@ export class WorkBuddyAccountPool {
 
   /** Rescan the auth directories and merge newly discovered accounts. */
   async scan(): Promise<WorkBuddyAccount[]> {
+    // The chat path calls this whenever the pool is empty, and without the guard
+    // every concurrent request started its own walk of the auth directories,
+    // each with its own at-rest key fetch. The walk in flight is reused only
+    // while it reads the same directories: `applyConfig` empties the pool the
+    // moment `authFile` is repointed, and a walk that started before that would
+    // otherwise end by writing the previous directory's accounts back over the
+    // clear.
+    const dirs = [...this.authDirs]
+    if (this.scanInflight !== undefined && sameDirs(this.scanDirs, dirs)) return this.scanInflight
+    const inflight = this.scanOnce(dirs).finally(() => {
+      // The identity check keeps a superseded walk's exit from clearing the
+      // walk that replaced it.
+      if (this.scanInflight === inflight) {
+        this.scanInflight = undefined
+        this.scanDirs = []
+      }
+    })
+    this.scanDirs = dirs
+    this.scanInflight = inflight
+    return inflight
+  }
+
+  private async scanOnce(dirs: readonly string[]): Promise<WorkBuddyAccount[]> {
     const found: WorkBuddyCredential[] = []
     // Directories that answered. An account is dropped only when its own directory
     // answered and no longer contains it — a directory that could not be read
     // keeps the accounts already held, cooldown included.
     const readableDirs = new Set<string>()
-    for (const dir of this.authDirs) {
+    // Directories holding a sealed token this build cannot open. Treated like an
+    // unreadable directory: the account is kept until the key is available again.
+    const sealedDirs = new Set<string>()
+    for (const dir of dirs) {
       const files = await authFilesIn(dir)
       if (files === undefined) continue
       readableDirs.add(resolve(dir))
       for (const file of files) {
-        const credential = await readCredential(file)
-        if (credential !== undefined) found.push(credential)
+        const read = await readCredential(file)
+        if (read.kind === 'credential') found.push(read.credential)
+        else if (read.kind === 'sealed') sealedDirs.add(resolve(dir))
       }
     }
 
@@ -634,9 +788,24 @@ export class WorkBuddyAccountPool {
     }
 
     const foundIds = new Set(found.map(credential => workbuddyAccountId(credential)))
+    const scanNow = Date.now()
+    for (const account of byId.values()) pruneModelCooldowns(account, scanNow)
     for (const [id, account] of byId) {
       const home = resolve(dirname(account.credential.sourcePath))
-      if (readableDirs.has(home) && !foundIds.has(id)) byId.delete(id)
+      if (sealedDirs.has(home)) continue
+      if (readableDirs.has(home) && !foundIds.has(id)) {
+        byId.delete(id)
+        // The warn-once flag is keyed by id, so a re-sign-in later must be able
+        // to warn again.
+        this.noRefreshWarned.delete(id)
+        // Every per-account map the pool keeps, dropped with the account: a
+        // balance and an expiry that outlive their account are inherited by the
+        // next sign-in under the same id, which then reads as unpickable on a
+        // reserve floor nobody set for it.
+        this.creditBalances.delete(id)
+        this.creditExpiries.delete(id)
+        this.heldIds.delete(id)
+      }
     }
 
     // A stable, predictable order is what makes "prefer the first account"
@@ -647,6 +816,10 @@ export class WorkBuddyAccountPool {
     ordered.sort((a, b) => compareFreshness(a.credential, b.credential))
     for (const account of ordered) account.label = accountLabel(account.credential)
     disambiguateLabels(ordered)
+    // A directory set that changed while this walk was reading is not this
+    // walk's answer: `applyConfig` already emptied the pool for the new set, and
+    // assigning here would put the previous directory's accounts back.
+    if (!sameDirs(this.authDirs, dirs)) return this.accounts
     this.accounts = ordered
     this.lastScanAtMs = Date.now()
     return this.accounts
@@ -680,6 +853,13 @@ export class WorkBuddyAccountPool {
       if (this.disabledIds.has(account.id)) return false
       // Reserved credits: stop at the floor the user set for this account.
       if (this.reserveHolds(account.id)) return false
+      // A credential whose access token has died and that carries nothing to
+      // refresh it with cannot serve a request. Leading with one spent the turn
+      // on a guaranteed 401, and the refresh-and-retry that follows is spent on
+      // a call that cannot change the answer. One that still has a refresh
+      // token stays eligible: `ensureFresh` renews it on the way through, which
+      // is the only thing that ever puts it back.
+      if (credentialUnusable(account.credential, now)) return false
       if (account.cooldownUntilMs > now) return false
       if (modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now) return false
       // A region-scoped caller (one of the two providers) must never pick
@@ -723,7 +903,15 @@ export class WorkBuddyAccountPool {
     const account = pool.find(item => item.id === preferredId) ?? this.pick(pool, conversationKey)
     if (account === undefined) return undefined
     await this.ensureFresh(account)
-    return account
+    // A cooldown that landed while the refresh was in flight must not be
+    // ridden: the pick above happened before it, and the request would spend
+    // its turn on an account that is already cooling.
+    const eligible = this.available(Date.now(), modelId, region)
+    if (eligible.includes(account)) return account
+    const next = eligible.find(item => item.id === preferredId) ?? this.pick(eligible, conversationKey)
+    if (next === undefined) return undefined
+    await this.ensureFresh(next)
+    return next
   }
 
   private pick(pool: WorkBuddyAccount[], conversationKey?: string): WorkBuddyAccount | undefined {
@@ -803,7 +991,13 @@ export class WorkBuddyAccountPool {
       if (credential.refreshToken === '') {
         // Nothing to refresh with; only worth failing if already expired.
         if (credential.expiresAtMs > Date.now() + 30_000) return
-        this.logger?.warn(`dsh-wtq-pool: ${account.label} token expired with no refresh token; sign in again`)
+        // Once per account rather than once per request: this branch is reached
+        // on every turn for a credential with no expiry, and the repeated
+        // warning buried everything else in the log.
+        if (!this.noRefreshWarned.has(account.id)) {
+          this.noRefreshWarned.add(account.id)
+          this.logger?.warn(`${LOG_PREFIX}: ${account.label} token expired with no refresh token; sign in again`)
+        }
         return
       }
       try {
@@ -822,13 +1016,21 @@ export class WorkBuddyAccountPool {
           // the margin above, or `ensureFresh` would still see it as expiring.
           expiresAtMs: refreshExpiryMs(outcome.expiresInSec),
           ...outcome.domain === undefined || outcome.domain === '' ? {} : { domain: outcome.domain },
+          // Stamped with the moment the upstream issued this token. A file on
+          // disk keeps the issue time it was written with, so without this
+          // stamp the refreshed credential ties with its own on-disk snapshot
+          // and then loses the expiry tiebreaker to the very token it replaced:
+          // the next scan swapped the working token back out and every request
+          // rode the revoked one until it was refreshed again.
+          lastRefreshAtMs: Date.now(),
         }
-        this.logger?.info?.(`dsh-wtq-pool: refreshed token for ${account.label}`)
+        this.noRefreshWarned.delete(account.id)
+        this.logger?.info?.(`${LOG_PREFIX}: refreshed token for ${account.label}`)
       } catch (error: unknown) {
         if (credential.expiresAtMs > Date.now() + 30_000) {
-          this.logger?.warn?.(`dsh-wtq-pool: token refresh failed but token still valid for ${account.label}`, error)
+          this.logger?.warn?.(`${LOG_PREFIX}: token refresh failed but token still valid for ${account.label}`, error)
         } else {
-          this.logger?.error?.(`dsh-wtq-pool: token refresh failed and token expired for ${account.label}`, error)
+          this.logger?.error?.(`${LOG_PREFIX}: token refresh failed and token expired for ${account.label}`, error)
         }
       }
     })()
@@ -847,27 +1049,40 @@ export class WorkBuddyAccountPool {
    * other models stay in rotation, matching the upstream's per-model rate
    * limit ("可切换其他模型继续使用"). Without a model id the whole account is
    * cooled, which callers should reserve for limits that truly span every model.
+   *
+   * `hold` marks a decision of the pool's own rather than a timestamp read off
+   * an upstream answer — a spent account, a dead session. It is bounded by
+   * POOL_HOLD_CAP_MS instead of PENALIZE_CAP_MS, because the two-hour ceiling
+   * exists to stop a mis-parsed reset from parking an account all day, and
+   * neither of these conditions clears by itself.
    */
-  penalize(accountId: string, resetAtMs?: number, modelId?: string): void {
+  penalize(accountId: string, resetAtMs?: number, modelId?: string, hold = false): void {
     const account = this.accounts.find(item => item.id === accountId)
     if (account === undefined) return
     account.rateLimitHits += 1
     // Cap even a caller-supplied reset: the parse layer already caps, but a
-    // raw timestamp passed straight in must not sleep an account all day.
+    // raw timestamp passed straight in must not sleep an account all day. The
+    // configured window is the user's own choice and is not capped.
     const now = Date.now()
-    const raw = resetAtMs !== undefined && resetAtMs > now ? resetAtMs : now + this.cooldownMs
-    const until = Math.min(raw, now + PENALIZE_CAP_MS)
+    const cap = hold ? POOL_HOLD_CAP_MS : PENALIZE_CAP_MS
+    const until = resetAtMs !== undefined && resetAtMs > now
+      ? Math.min(resetAtMs, now + cap)
+      : now + this.cooldownMs
     if (modelId !== undefined && modelId !== '') {
+      pruneModelCooldowns(account, now)
       account.modelCooldowns[modelId] = Math.max(account.modelCooldowns[modelId] ?? 0, until)
       this.logger?.warn(
-        `dsh-wtq-pool: ${account.label} rate-limited on model ${modelId}; ` +
+        `${LOG_PREFIX}: ${account.label} rate-limited on model ${modelId}; ` +
           `cooling that model until ${new Date(until).toISOString()}`,
       )
       return
     }
     account.cooldownUntilMs = Math.max(account.cooldownUntilMs, until)
+    // Recorded only for the account-wide hold, which is the only shape a balance
+    // read can release: a per-model cooldown belongs to the upstream's window.
+    if (hold) this.heldIds.add(accountId)
     this.logger?.warn(
-      `dsh-wtq-pool: account ${account.label} rate-limited; cooling until ${new Date(until).toISOString()}`,
+      `${LOG_PREFIX}: account ${account.label} rate-limited; cooling until ${new Date(until).toISOString()}`,
     )
   }
 
@@ -878,6 +1093,7 @@ export class WorkBuddyAccountPool {
       account.modelCooldowns = {}
       account.rateLimitHits = 0
     }
+    this.heldIds.clear()
   }
 
   /** Diagnostics snapshot. Account-wide cooling count (per-model cooling excluded:

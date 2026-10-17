@@ -16,7 +16,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import type { WorkBuddyAccountPool } from './accounts'
 import type { WorkBuddyCatalog } from './catalog'
@@ -64,10 +64,11 @@ export interface WorkBuddyShimOptions {
 }
 
 /**
- * Loopback guards and the request body bound live in `./loopback` — one copy,
- * shared with the Trae and Qoder gateways.
+ * Loopback guards, the request body bound and the server shell live in
+ * `./loopback` — one copy, shared with the Trae and Qoder gateways.
  */
-import { answerRequest, guardsPass, isJsonContentType, listedModels, readRequestBody, writeJson, writeOpenAIError } from './loopback'
+import { createLoopbackServer, guardsPass, isJsonContentType, listedModels, readRequestBody, safeMessage, writeJson, writeOpenAIError } from './loopback'
+import { LOG_PREFIX } from './log'
 /** HTTP status each upstream failure class surfaces as. */
 const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   hard_credit: 402,
@@ -77,6 +78,8 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   not_found: 502,
   server: 502,
   client: 400,
+  transport: 502,
+  aborted: 499,
 }
 
 
@@ -111,41 +114,42 @@ function isContextTooLong(body: string): boolean {
   return false
 }
 
+/**
+ * How long a spent or dead session is held out of rotation.
+ *
+ * Neither condition clears by itself: the credit balance has to change, or the
+ * user has to sign in again. The configured cooldown window is sized for a
+ * limit that expires, and using it here put a spent account back at the head of
+ * the queue every minute, where it failed again and burned the attempts of the
+ * healthy accounts behind it. This hold is a fallback, not a verdict: a manual
+ * cooldown reset, a re-scan and a balance read that finds credits again all
+ * release it.
+ */
+const SPENT_ACCOUNT_HOLD_MS = 6 * 60 * 60 * 1000
+
+/**
+ * The hold as the absolute reset `penalize` expects.
+ *
+ * `penalize` takes a timestamp, not a duration: handing it the duration put the
+ * reset in 1970, which reads as already past and falls back to the configured
+ * cooldown, so the hold never took effect at all.
+ */
+const spentAccountHoldUntil = (): number => Date.now() + SPENT_ACCOUNT_HOLD_MS
+
+/** Turn an upstream `Retry-After` (seconds) into the absolute reset `penalize` wants. */
+function resetFromRetryAfter(seconds: number | undefined): number | undefined {
+  if (seconds === undefined) return undefined
+  return Date.now() + seconds * 1000
+}
+
 export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim {
   const { pool, client, catalog } = options
   const region = options.region
   const logger = options.logger
   const maxAttempts = 8
 
-
-  const server: Server = createServer((req, res) => {
-    void answerRequest(res, () => handle(req, res), logger)
-  })
-
-  const ready = new Promise<void>((resolve, reject) => {
-    server.once('listening', () => resolve())
-    server.once('error', reject)
-  })
-  server.listen(options.port ?? 0, '127.0.0.1')
-  // Registered once, here, rather than per close: `stopRuntime` can run twice,
-  // and a listener per call would pile up on a server that is already down.
-  // An unhandled 'error' on the server would take the plugin's process with it.
-  server.on('error', (error: unknown) => {
-    logger?.warn?.('dsh-wtq-pool: workbuddy shim server error', error)
-  })
-
-  /** The bound port, or 0 before `listening` (or after close). */
-  const port = (): number => {
-    const address = server.address()
-    return address === null || typeof address === 'string' ? 0 : address.port
-  }
-  const baseUrl = (): string => {
-    const address = server.address()
-    if (address === null || typeof address === 'string') {
-      throw new Error('workbuddy shim has no listening address')
-    }
-    return `http://127.0.0.1:${address.port}`
-  }
+  const server = createLoopbackServer({ port: options.port, label: 'workbuddy shim', handle, logger })
+  const ready = server.ready
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!guardsPass(req, res)) return
@@ -241,17 +245,21 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           // WAF block waited out, and only a 429 clears on its own. Calling
           // every one of them "rate-limited" sent the user looking for a
           // cooldown that was never the problem.
-          const model = modelId === undefined ? '' : ` for model ${modelId}`
+          const model = ` for model ${modelId}`
           const subject = last.kind === 'waf_block'
             ? 'every WorkBuddy account was blocked by the upstream gateway (WAF)'
             : last.kind === 'hard_credit'
               ? `every WorkBuddy account is out of credits${model}`
               : last.kind === 'session_dead'
                 ? `every WorkBuddy sign-in is no longer accepted${model}`
-                : `every account is rate-limited${model}`
+                : last.kind === 'transport'
+                  ? `the upstream host could not be reached on any account${model}`
+                  : `every account is rate-limited${model}`
           const advice = last.kind === 'soft_rate'
             ? 'resets at the upstream window'
-            : 'sign in again in the desktop app'
+            : last.kind === 'transport'
+              ? 'check the connection to the upstream host'
+              : 'sign in again in the desktop app'
           writeOpenAIError(
             res,
             KIND_STATUS[last.kind],
@@ -299,6 +307,10 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
 
       let result = await client.chatStream(account.credential, prepared, controller.signal)
       if (!result.ok && result.kind === 'session_dead' && await pool.refreshAccount(account.id)) {
+        // A caller that hung up while the refresh was in flight has already
+        // stopped waiting: the retry would spend one more upstream call on a
+        // turn nobody reads, and come back classed as `aborted` anyway.
+        if (controller.signal.aborted) return
         result = await client.chatStream(account.credential, prepared, controller.signal)
       }
 
@@ -310,7 +322,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           writeOpenAIError(res, 502, 'upstream_error', 'workbuddy returned no stream')
           return
         }
-        logger?.info?.(`dsh-wtq-pool: served by ${account.label}`)
+        logger?.info?.(`${LOG_PREFIX}: served by ${account.label}`)
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
@@ -321,28 +333,61 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         const decoder = new TextDecoder()
         const sse = new SseDecoder()
         const body = Readable.fromWeb(result.response.body as Parameters<typeof Readable.fromWeb>[0])
+        /**
+         * End the relayed stream in a shape the client can finish on.
+         *
+         * Destroying the socket instead left a 200 with a truncated body and no
+         * terminator, which is a turn the caller can only end by timing out and
+         * cannot tell from a cancel. The two sibling gateways already end theirs
+         * with an in-band error frame, a finish chunk and `[DONE]`; this is that
+         * same contract, and the error text is redacted because this frame is the
+         * one place a stream failure reaches the client without passing through
+         * `writeOpenAIError`.
+         */
+        const failInBand = (error: unknown): void => {
+          if (controller.signal.aborted || !res.writable) return
+          logger?.warn?.(LOG_PREFIX + ': upstream stream failed mid-flight', safeMessage(error))
+          try {
+            res.write(`data: ${JSON.stringify({
+              error: { message: safeMessage(error), type: 'upstream_error' },
+            })}\n\n`)
+            res.end('data: [DONE]\n\n')
+          } catch {
+            /* the client is already gone; nothing left to answer */
+          }
+        }
         body.on('error', (error: unknown) => {
           // The client hanging up aborts this read through `controller` — the
           // abort is this shim working as designed, and it arrives here shaped
           // like an upstream failure. Recorded, the thousands of them buried the
           // failures that matter; the signal is what tells the two apart.
-          if (!controller.signal.aborted) {
-            logger?.warn('dsh-wtq-pool: upstream stream failed mid-flight', error)
-          }
-          res.destroy(error instanceof Error ? error : new Error(String(error)))
+          failInBand(error)
         })
         // The upstream can also just stop, without erroring and without having
         // sent `[DONE]`. The error branch above covers the crash; this covers the
         // quiet hang-up, which otherwise leaves the host waiting for a turn that
         // will never be marked finished.
         body.on('end', () => {
+          try {
+            // The tail is flushed, not assumed: a final event without its
+            // terminating newline, and a multi-byte character split across the
+            // last two chunks, both surface only here. Without the flush a
+            // `[DONE]` that did arrive reads as a stream that ended without
+            // one, and the answer gains a second terminator.
+            const rest = decoder.decode()
+            const events = rest === '' ? sse.finish() : [...sse.push(rest), ...sse.finish()]
+            if (events.some(event => event.data === '[DONE]')) sawDone = true
+          } catch {
+            // A malformed tail is the upstream's problem: the frames already
+            // piped stand, and the close below still ends the stream.
+          }
           closeWithoutDone()
         })
 
         /** End the response with `[DONE]` unless the upstream already sent it. */
         function closeWithoutDone(): void {
           if (sawDone || !res.writable) return
-          logger?.warn?.('dsh-wtq-pool: upstream stream ended without [DONE]')
+          logger?.warn?.(LOG_PREFIX + ': upstream stream ended without [DONE]')
           res.end('data: [DONE]\n\n')
         }
         // Pipe first so the terminal frame reaches the client before we end it.
@@ -367,29 +412,63 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
        * Rotate past every failure that is a property of the ACCOUNT rather than
        * of the request.
        *
-       * A 429 cools one model, because the upstream itself allows switching
-       * models on the same account. A WAF page, a spent billing account and a
-       * dead session all speak for the whole account. Any of them left uncooled
-       * stays at the head of the queue in the default `priority` mode — the
-       * account is still `available()`, nothing else moved it — so every later
-       * request walks straight back into the same failure while the healthy
-       * accounts behind it sit idle. That was a permanent lock, not a slow
-       * failure: a 402 never clears on its own, and the session-dead retry above
-       * has already spent the one refresh that could fix it.
+       * Any of them left uncooled stays at the head of the queue in the default
+       * `priority` mode — the account is still `available()`, nothing else moved
+       * it — so every later request walks straight back into the same failure
+       * while the healthy accounts behind it sit idle.
+       *
+       * What each one is cooled with differs, because what clears it differs. A
+       * 429 cools one model on the upstream's own window, since the upstream
+       * itself allows switching models on the same account. A spent account and
+       * a dead session do not come back on their own — the balance has to change
+       * or the user has to sign in again — so they take the hold below; the
+       * configured window is sized for a limit that expires, and using it put a
+       * 402 back at the head of the queue every minute. A WAF page is the
+       * gateway's own and clears on its own within minutes, so it takes the
+       * configured window rather than a hold that would park a healthy account
+       * for hours over a transient block.
+       *
+       * A `transport` failure is the network path's, not the account's, so the
+       * next sign-in is tried as well. An `aborted` turn is the client's own
+       * doing and stops the loop immediately.
        */
+      if (result.kind === 'aborted') break
+
       if (result.kind !== 'soft_rate' && result.kind !== 'waf_block'
-        && result.kind !== 'hard_credit' && result.kind !== 'session_dead') break
+        && result.kind !== 'hard_credit' && result.kind !== 'session_dead'
+        && result.kind !== 'transport') break
 
       exhaustedByRateLimit = true
       if (result.kind === 'soft_rate') {
         // Cool only this model on this account; the account's other models stay
         // usable (the upstream explicitly allows switching to another model).
-        pool.penalize(account.id, parseRateLimitReset(result.message), modelId)
+        // The upstream's own `Retry-After` outranks the body parse, and both
+        // outrank the configured window: guessing short meant the account came
+        // back into rotation while the limit was still standing.
+        //
+        // A body reset that has already passed is not an answer, though — it is
+        // a stale or clock-skewed timestamp, and taking it over a live header
+        // dropped the account onto the 60 s default while the upstream had
+        // named a window of minutes.
+        const bodyReset = parseRateLimitReset(result.message)
+        const resetAtMs = bodyReset !== undefined && bodyReset > Date.now()
+          ? bodyReset
+          : resetFromRetryAfter(result.retryAfter)
+        pool.penalize(account.id, resetAtMs, modelId)
+      } else if (result.kind === 'hard_credit' || result.kind === 'session_dead') {
+        // A spent account and a dead session do not come back on their own: the
+        // credit balance has to change, or the user has to sign in again. The
+        // default cooldown window is sized for a limit that expires, and the
+        // two-hour cap above it exists to bound a mis-parsed reset, so this
+        // hold names itself as one and is held until the next balance read or a
+        // manual cooldown reset rather than returning to the head of the queue
+        // every minute.
+        pool.penalize(account.id, spentAccountHoldUntil(), undefined, true)
       } else {
         pool.penalize(account.id)
       }
       logger?.warn(
-        `dsh-wtq-pool: ${account.label} ${result.kind} on ${modelId} ` +
+        `${LOG_PREFIX}: ${account.label} ${result.kind} on ${modelId} ` +
           `(attempt ${attempt + 1}/${maxAttempts}); rotating`,
       )
     }
@@ -403,9 +482,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     // silently truncate or summarise the user's conversation (that drops
     // context and can answer wrongly); the right move is telling the user.
     if (isContextTooLong(last.message)) {
-      const subject = modelId === undefined
-        ? 'the conversation exceeds this model\'s context window'
-        : `the conversation exceeds ${modelId}'s context window`
+      const subject = `the conversation exceeds ${modelId}'s context window`
       writeOpenAIError(
         res,
         400,
@@ -425,12 +502,8 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
 
   return {
     ready,
-    port,
-    baseUrl,
-    close: () =>
-      new Promise<void>((resolve) => {
-        server.close(() => resolve())
-        server.closeAllConnections()
-      }),
+    port: server.port,
+    baseUrl: server.baseUrl,
+    close: server.close,
   }
 }

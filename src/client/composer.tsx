@@ -150,6 +150,15 @@ interface ComposerDocument {
    * stored choice instead of contradicting it with a refusal.
    */
   saved?: boolean
+  /**
+   * Whether the credits chip is switched on at all.
+   *
+   * With it off the host answers `show: false, ours: false`, which is
+   * indistinguishable from another plugin's model - and would keep the poll
+   * running for the rest of the session over a feature nobody is using. The
+   * flag is what tells the two apart.
+   */
+  enabled?: boolean
 }
 
 /** The selected route, out of the host's `modelSelection` projection. */
@@ -354,6 +363,16 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
   const panelRef = React.useRef<HTMLDivElement | null>(null)
   const restartPollRef = React.useRef<() => void>(() => {})
 
+  // The composer slot is the host's, and a host line that hands no projection
+  // down leaves this readout with nothing to gate on: it would sit in the row
+  // rendering nothing, for the whole session, with nothing said. One warning per
+  // mount names the cause instead.
+  React.useEffect(() => {
+    if (props.useProjection === undefined) {
+      console.warn('[dsh-wtq-pool] the composer slot passed no useProjection; the credits readout stays hidden')
+    }
+  }, [])
+
   React.useEffect(() => {
     if (provider === '' || model === '') {
       setPoints(null)
@@ -378,6 +397,16 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
       invoke('xd.composerPoints', { provider, model })
         .then((next) => {
           if (stopped) return
+          // The chip is switched off in the panel: `show: false` alone cannot
+          // say that, and without this the poll would keep asking every few
+          // minutes for the rest of the session about a feature nobody is
+          // using. The timer stops here; a route change remounts this effect
+          // and starts it again.
+          if (next.enabled === false) {
+            setPoints(null)
+            window.clearTimeout(timer)
+            return
+          }
           const shown = next.show === true ? next : null
           setPoints(shown)
           schedule(next)
@@ -411,11 +440,22 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
     const onKey = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') setOpen(false)
     }
+    // The popup's position is read from the trigger's box once, when it opens,
+    // and nothing re-reads it: a scroll or a resize moves the trigger out from
+    // under a box that then hangs over whatever is there now. Closing is the
+    // least code that keeps the popup anchored to something true.
+    const onViewport = (): void => { setOpen(false) }
     document.addEventListener('pointerdown', onPointer, true)
     document.addEventListener('keydown', onKey)
+    // Captured, so a scroll inside any scrolling container counts: the trigger
+    // moves with whichever one holds it.
+    window.addEventListener('scroll', onViewport, true)
+    window.addEventListener('resize', onViewport)
     return () => {
       document.removeEventListener('pointerdown', onPointer, true)
       document.removeEventListener('keydown', onKey)
+      window.removeEventListener('scroll', onViewport, true)
+      window.removeEventListener('resize', onViewport)
     }
   }, [open])
 

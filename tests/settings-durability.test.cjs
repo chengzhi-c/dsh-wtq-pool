@@ -79,9 +79,10 @@ function loadHost(options = {}) {
   context.exports = context.module.exports
   // The internals under test are module-scope bindings, so they are published
   // alongside the module's own exports rather than reached by name.
-  const internals = ['loadSettings', 'adoptHostSettings', 'saveSettings', 'normalizeSelection', 'parseSelection',
+  const internals = ['loadSettings', 'adoptHostSettings', 'saveSettings', 'mutateSettings', 'normalizeSelection', 'parseSelection',
     'orderSourceCredentials', 'traeClaimFor', 'gatewaySelectionFor', 'sourceDistribution',
-    'sourceRosterFor', 'traeNativeOf', 'traeDeclarationModels', 'traeGateways']
+    'sourceRosterFor', 'traeNativeOf', 'traeDeclarationModels', 'traeGateways',
+    'creditReserves', 'isSelectableSourceModel', 'gatewayEnabledIds', 'sourceModelView']
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8'))
     + `\nmodule.exports.__internals = { ${internals.join(', ')} }\n`
     + '\nmodule.exports.__settings = (next) => { settings = next }\n'
@@ -365,4 +366,152 @@ test('a Trae model that states a credit rate carries it to the panel', () => {
   } finally {
     host.cleanup()
   }
+})
+
+/**
+ * Two dictionary writes in flight at once both survive.
+ *
+ * A dictionary-shaped setting is read as a whole, edited and written back as a
+ * whole. The panel's channels used to do that read before they wrote, so two
+ * overlapping calls had the second overwrite the first with the stale copy it
+ * had read, and the panel answered success for a change that was already gone.
+ * The write queue makes the read part of the same serialised step.
+ */
+test('two overlapping dictionary writes both survive', async () => {
+  const host = loadHost({ settings: { creditReserves: {}, modelSelection: {} } })
+  try {
+    await host.internals.adoptHostSettings()
+    // Both start before either finishes: the second must see what the first
+    // stored rather than the document it read at the same moment.
+    const [first, second] = await Promise.all([
+      host.internals.mutateSettings('creditReserves', (current) => ({ ...(current ?? {}), 'account-a': 10 })),
+      host.internals.mutateSettings('creditReserves', (current) => ({ ...(current ?? {}), 'account-b': 20 })),
+    ])
+    assert.equal(first, true)
+    assert.equal(second, true)
+    assert.deepEqual(host.getSettingsDocument().creditReserves, { 'account-a': 10, 'account-b': 20 },
+      'both edits must be present; the second must not have overwritten the first')
+  } finally { host.cleanup() }
+})
+
+/**
+ * A write picks up what the host stored while it was waiting in the queue.
+ *
+ * The host's own settings dialog writes the same document the panel does. A
+ * queued write that re-reads before it edits keeps that edit; one that trusted
+ * the copy it read when the click happened would write it back out.
+ */
+test('a queued write sees the edit the host made while it waited', async () => {
+  const host = loadHost({ settings: { creditReserves: { 'account-a': 5 } } })
+  try {
+    await host.internals.adoptHostSettings()
+    const release = host.holdRead()
+    const queued = host.internals.mutateSettings('creditReserves', (current) => ({ ...(current ?? {}), 'account-b': 20 }))
+    // The host lands its own edit while the queued write is still waiting.
+    host.setDocument({ creditReserves: { 'account-a': 99 } })
+    release()
+    assert.equal(await queued, true)
+    assert.deepEqual(host.getSettingsDocument().creditReserves, { 'account-a': 99, 'account-b': 20 },
+      'the host edit must survive alongside the queued one')
+  } finally { host.cleanup() }
+})
+
+/**
+ * A counter-less task is claimable, so its reward is actually collected.
+ *
+ * A task with no counter (target 0) has nothing to meet, and requiring
+ * `target > 0` made it permanently unclaimable. The pass then skipped it in
+ * silence and the reward was simply never collected.
+ */
+test('a task with no counter is claimable rather than skipped forever', async () => {
+  // Driven through `listTasks`, which is what the pass actually calls, so the
+  // case covers the parse and the claim decision together.
+  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
+  const client = new WorkBuddyUpstreamClient({
+    fetchImpl: async () => new Response(JSON.stringify({
+      code: 0,
+      data: { tasks: [
+        { task_code: 'profile_done', title: '完善资料', reward_credit: 100, current: 0, target: 0, accept_status: 'accepted' },
+        { task_code: 'chat_5', title: '和 AI 聊天 5 次', current: 2, target: 5, accept_status: 'accepted' },
+        { task_code: 'already', title: '已领', current: 0, target: 0, accept_status: 'claimed' },
+      ] },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+  })
+  const tasks = await client.listTasks({
+    accessToken: 't', refreshToken: 'r', expiresAtMs: 0, domain: 'www.workbuddy.cn', sourcePath: '',
+  })
+  const byCode = Object.fromEntries(tasks.map((task) => [task.taskCode, task]))
+  assert.equal(byCode['profile_done'].claimable, true,
+    'a counter-less task has nothing left to wait for, so the pass must offer it')
+  assert.equal(byCode['chat_5'].claimable, false, 'a task with a counter still has to meet it')
+  assert.equal(byCode['already'].claimable, false, 'and an already-claimed one is not offered again')
+})
+
+
+
+/**
+ * The host bounds the panel's save path already enforces are applied on the way
+ * in too.
+ *
+ * A hand-edited or legacy settings document can carry a figure no save could
+ * have produced. The read path used to fold those in verbatim: an unbounded
+ * credit floor parked an account for good, an out-of-range token budget made the
+ * host reject the whole provider declaration, and a stored model id longer than
+ * the declaration can publish named a row nothing could route to.
+ */
+test('a hand-edited settings document is held to the bounds the panel saves against', async () => {
+  const host = loadHost({
+    settings: {
+      creditReserves: { 'account-a': 1e308, 'account-b': 25 },
+      modelSelection: {
+        'trae:cn': { overrides: { 'model-a': { contextWindow: 1e20, maxOutputTokens: 1e20 } } },
+      },
+    },
+  })
+  try {
+    assert.equal(await host.internals.adoptHostSettings(), true)
+    const floors = host.internals.creditReserves()
+    assert.equal(floors['account-a'], 1e9, 'a floor past the ceiling the panel enforces is clamped')
+    assert.equal(floors['account-b'], 25, 'a floor inside the ceiling is kept')
+
+    const view = host.internals.sourceModelView('trae:cn', { id: 'model-a' },
+      { contextWindow: 128000, maxTokens: 32000, supportsImages: false })
+    assert.equal(view.contextWindow, 0xffffffff, 'the stored context window is clamped to the host ceiling')
+    assert.equal(view.maxOutputTokens, 0xffffffff, 'the stored output limit is clamped to the host ceiling')
+
+    assert.equal(host.internals.parseSelection({ enabledModelIds: ['x'.repeat(300)] }), undefined,
+      'an id longer than the declaration can publish is refused rather than stored')
+    const ids = Array.from({ length: 600 }, (_, index) => `model-${index}`)
+    assert.equal(host.internals.parseSelection({ enabledModelIds: ids }).enabledModelIds.length, 512,
+      'an untrusted id list is capped to what a gateway can publish')
+    const overrides = Object.fromEntries(ids.map((id) => [id, { alias: 'alias' }]))
+    assert.equal(host.internals.parseSelection({ overrides }), undefined,
+      'an untrusted override map is capped on the same term as the id list')
+  } finally { host.cleanup() }
+})
+
+/**
+ * An empty model list disables every model for a vendor gateway too, and an
+ * alias the user chose is never read as a placeholder catalog name.
+ *
+ * `enabledModelIds: []` means "disable everything" for the WorkBuddy catalog,
+ * and the panel refuses to save it; for Trae and Qoder the same stored list used
+ * to be read as unset, so the two settings with one meaning behaved oppositely.
+ * Separately, the placeholder test was fed the display name, so an alias made
+ * only of punctuation deleted the model from the roster, the picker and the
+ * declaration.
+ */
+test('an empty model list disables every model, and a punctuation alias keeps its model', async () => {
+  const host = loadHost({ settings: { modelSelection: { 'trae:cn': { enabledModelIds: [] } } } })
+  try {
+    assert.equal(await host.internals.adoptHostSettings(), true)
+    assert.equal(host.internals.gatewayEnabledIds('trae:cn', ['model-a']).size, 0,
+      'an empty list disables every model rather than publishing all of them')
+    assert.equal(host.internals.gatewayEnabledIds('trae:us', ['model-a']), null,
+      'an absent list still publishes everything')
+    assert.equal(host.internals.isSelectableSourceModel('qoder', { id: 'm-1', name: '★', nativeName: 'qmodel' }), true,
+      'an alias made only of punctuation must not delete the model')
+    assert.equal(host.internals.isSelectableSourceModel('qoder', { id: 'm-1', name: '—', nativeName: '—' }), false,
+      'a catalog name with nothing to show is still dropped')
+  } finally { host.cleanup() }
 })

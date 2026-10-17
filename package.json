@@ -2,7 +2,7 @@
   "name": "dsh-wtq-pool",
   "displayName": "WTQ Pool",
   "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 DeepSeek Harness。WorkBuddy 被限流时自动换号。三家各有开关，国内与国际各自成组。",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "license": "MIT",
   "author": "chengzhi-c",
   "homepage": "https://github.com/chengzhi-c/dsh-wtq-pool#readme",
@@ -26,7 +26,7 @@
   "type": "module",
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
-    "dsh": ">=0.1.7-rc.1 <0.3.0"
+    "dsh": ">=0.2.0-rc.1 <0.2.1"
   },
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -50,6 +50,7 @@
   ],
   "scripts": {
     "build": "tsdown",
+    "prepare": "pnpm run build",
     "prepack": "tsdown",
     "prepublishOnly": "tsdown",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -73,11 +74,6 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
-    "@deepseek-ai/dsh-client-locale": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-ui-primitives": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-ui-settings": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-ui-settings-plugins": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-ui-slots": "0.2.0-rc.2",
     "@deepseek-ai/dsh-host-webserver": "0.2.0-rc.2",
     "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
     "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2",
@@ -92,29 +88,14 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.4 <5.0.0",
-    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.1 <0.3.0",
-    "@deepseek-ai/dsh-llm-pi-ai": ">=0.2.0-rc.1 <0.3.0",
-    "@deepseek-ai/dsh-settings": ">=0.2.0-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.1 <0.2.1",
+    "@deepseek-ai/dsh-llm-pi-ai": ">=0.2.0-rc.1 <0.2.1",
+    "@deepseek-ai/dsh-settings": ">=0.2.0-rc.1 <0.2.1",
     "@deepseek-ai/schemastery": "^3.18.4",
-    "@earendil-works/pi-ai": ">=0.87.1 <0.88.0"
+    "@earendil-works/pi-ai": ">=0.82.1 <0.88.0"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": {
-      "optional": true
-    },
-    "@deepseek-ai/dsh-llm": {
-      "optional": true
-    },
-    "@deepseek-ai/dsh-llm-pi-ai": {
-      "optional": true
-    },
     "@deepseek-ai/dsh-settings": {
-      "optional": true
-    },
-    "@deepseek-ai/schemastery": {
-      "optional": true
-    },
-    "@earendil-works/pi-ai": {
       "optional": true
     }
   }

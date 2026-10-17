@@ -19,6 +19,7 @@
 import { randomUUID } from 'node:crypto'
 import type { QoderRegion } from './qoder-discovery'
 import { buildCosyAuthHeaders, encodeBody, QODER_GATEWAYS } from './qoder-upstream'
+import { headersDeadline, readErrorBody, withIdleWatchdog } from './upstream'
 
 /** One callable Qoder model, as the `chat` group lists it. */
 export interface QoderChatModel {
@@ -58,10 +59,11 @@ export type QoderUpstreamErrorKind =
   | 'not_found'
   | 'server'
   | 'client'
+  | 'aborted'
 
 export type QoderChatResult =
   | { ok: true; response: Response }
-  | { ok: false; status: number; kind: QoderUpstreamErrorKind; message: string }
+  | { ok: false; status: number; kind: QoderUpstreamErrorKind; message: string; retryAfter?: string | null }
 
 export interface QoderClientCredential {
   userID: string
@@ -79,33 +81,33 @@ export interface QoderClientOptions {
 }
 
 /** Model directory path; `Encode=1` names the permuted-base64 wire form. */
-export const QODER_MODELS_PATH = '/algo/api/v2/model/list?Encode=1'
+const QODER_MODELS_PATH = '/algo/api/v2/model/list?Encode=1'
 
 /** Streaming chat path; `FetchKeys` selects the OpenAI-shaped result field. */
-export const QODER_CHAT_PATH =
+const QODER_CHAT_PATH =
   '/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1'
 
 /** Join a gateway base and an API path without doubling slashes. */
-export function qoderEndpoint(baseUrl: string, path: string): string {
+function qoderEndpoint(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/$/, '')}/${path.replace(/^\//, '')}`
 }
 /** OpenAPI base per region: the quota surface, not the COSY gateway. */
-export const QODER_OPENAPI: Readonly<Record<QoderRegion, string>> = {
+const QODER_OPENAPI: Readonly<Record<QoderRegion, string>> = {
   cn: 'https://openapi.qoder.com.cn',
   global: 'https://openapi.qoder.sh',
 }
 /** Quota usage path (narrow shape); the presentation route is tried first. */
-export const QODER_USAGE_PATH = '/api/v2/quota/usage'
+const QODER_USAGE_PATH = '/api/v2/quota/usage'
 /** Presentation usage path (carries dedicated packages); preferred. */
-export const QODER_USAGE_PRESENTATION_PATH = '/sash/api/v2/me/usage'
+const QODER_USAGE_PRESENTATION_PATH = '/sash/api/v2/me/usage'
 /** Campaign list path; the same payload answers promo rows and the daily check-in round. */
-export const QODER_CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns'
+const QODER_CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns'
 /**
  * Headers the Qoder IDE itself sends to the OpenAPI host. `Cosy-ClientType: 10`
  * identifies the desktop app. The umid machine-identity block (international
  * daily round only) is deliberately absent: usage needs no block, CN or global.
  */
-export function qoderOpenApiHeaders(credential: QoderClientCredential): Record<string, string> {
+function qoderOpenApiHeaders(credential: QoderClientCredential): Record<string, string> {
   return {
     Accept: 'application/json',
     Authorization: `Bearer ${credential.token}`,
@@ -210,7 +212,7 @@ function qoderRawEpochMs(value: unknown): number | undefined {
  * Coerce one upstream timestamp (seconds, ms, RFC 3339) into epoch
  * milliseconds, dropping the far-future value that means "never expires".
  */
-export function qoderEpochMs(value: unknown): number | undefined {
+function qoderEpochMs(value: unknown): number | undefined {
   const ms = qoderRawEpochMs(value)
   return ms !== undefined && ms <= QODER_EPOCH_CEILING_MS ? ms : undefined
 }
@@ -237,13 +239,14 @@ const QODER_CLAIM_BENEFIT_ACTION = 'CLAIM_BENEFIT'
 const QODER_CLAIMED_STATUS = 'CLAIMED'
 
 /**
- * Ceiling on one chat stream, for a caller that did not pass its own signal.
+ * Deadline for the chat POST to reach its response headers, for a caller that
+ * did not pass its own signal.
  *
- * The same bound the Trae gateway applies: a stream can legitimately run for
- * minutes, but a black-holed host must not leave the response - and the
- * upstream connection behind it - pending for the rest of the process.
+ * Headers only: the body runs on the idle watchdog, because a signal handed to
+ * fetch stays attached to the body and a whole-stream deadline cut every turn
+ * longer than two minutes in half.
  */
-const CHAT_STREAM_TIMEOUT_MS = 120_000
+const CHAT_HEADERS_TIMEOUT_MS = 60_000
 /**
  * Bound on one read against the COSY gateway or the OpenAPI surface (directory,
  * usage, campaigns, a claim), for a caller that did not pass its own signal.
@@ -418,7 +421,7 @@ function qoderNextOpenAt(payload: unknown, nowMs: number): number | undefined {
  * before claiming: the daily round is re-issued with a new id each day, so an
  * id remembered from an earlier read is a stale one.
  */
-export function qoderClaimCampaignPath(campaignId: string): string {
+function qoderClaimCampaignPath(campaignId: string): string {
   return `${QODER_CAMPAIGNS_PATH}/${encodeURIComponent(campaignId)}/claim`
 }
 /** What one claim answered, after `normalizeClaimResult`. */
@@ -427,6 +430,13 @@ export interface QoderClaimResult {
   replayed: boolean
   amount?: number
   expiresAt?: number
+  /**
+   * The upstream's own refusal, when it answered 200 with a business error.
+   * `claimed: false` on its own cannot tell "the round was already collected"
+   * from "the upstream refused the claim", and the caller reported both as
+   * "skipped" - a refusal the user never saw.
+   */
+  reason?: string
 }
 /**
  * Read back what a claim answered. A repeat answers `replayed: true` and
@@ -436,18 +446,36 @@ export interface QoderClaimResult {
 export function qoderNormalizeClaimResult(payload: unknown, campaign?: unknown): QoderClaimResult {
   const payloadRecord = payload as { data?: unknown } | null | undefined
   const body = (payloadRecord?.data !== null && typeof payloadRecord?.data === 'object' ? payloadRecord.data : payload) as {
-    status?: unknown; replayed?: unknown; success?: unknown; benefit?: { amount?: unknown } | null | undefined; expiresAt?: unknown
+    status?: unknown; replayed?: unknown; success?: unknown; grantId?: unknown
+    reward?: { amount?: unknown } | null | undefined
+    benefit?: { amount?: unknown } | null | undefined
+    expiresAt?: unknown; code?: unknown; errcode?: unknown; message?: unknown; msg?: unknown
   } | null | undefined
   const status = typeof body?.status === 'string' ? body.status as string : ''
   const replayed = body?.replayed === true
-  const granted = status === QODER_CLAIMED_STATUS || replayed || body?.success === true
-  const amountValue = Number(body?.benefit?.amount ?? (typeof campaign !== 'undefined' ? qoderBenefitOf(campaign)?.amount : undefined))
+  // The receipt is proof on its own: a granted claim answers with a `grantId`
+  // (and the amount it paid) whether or not it names a status. Reading only the
+  // status whitelist reported a claim the upstream had granted as "skipped",
+  // which is the same misreport the truncated-body fix was about.
+  const grantId = typeof body?.grantId === 'string' ? body.grantId.trim() : ''
+  const granted = status === QODER_CLAIMED_STATUS || replayed || body?.success === true || grantId !== ''
+  const amountValue = Number(body?.reward?.amount ?? body?.benefit?.amount ?? (typeof campaign !== 'undefined' ? qoderBenefitOf(campaign)?.amount : undefined))
   const expiresAt = qoderEpochMs(body?.expiresAt)
+  // A 200 with a business error code is a refusal, not a "nothing to claim":
+  // it has to reach the caller as a failure, with the upstream's own words.
+  const code = Number(body?.code ?? body?.errcode)
+  const refusal = Number.isFinite(code) && code !== 0
+    ? String(body?.message ?? body?.msg ?? ('upstream code ' + code)).slice(0, 200)
+    : ''
   return {
     claimed: granted,
     replayed,
-    ...(!replayed && Number.isFinite(amountValue) && amountValue > 0 ? { amount: amountValue } : {}),
+    // A payout is what `amount` reports, so a replay that granted nothing and a
+    // status that never reached CLAIMED must not carry one: the campaign's
+    // advertised amount used to ride along and name credits that never landed.
+    ...(granted && !replayed && Number.isFinite(amountValue) && amountValue > 0 ? { amount: amountValue } : {}),
     ...(expiresAt === undefined ? {} : { expiresAt }),
+    ...(!granted && refusal !== '' ? { reason: refusal } : {}),
   }
 }
 
@@ -481,7 +509,7 @@ function textOf(content: unknown): string {
  * the reason — the gateway would refuse it anyway, and an early throw names
  * the missing link instead of a bare upstream 400.
  */
-export function toQoderMessages(messages: unknown): Array<Record<string, unknown>> {
+function toQoderMessages(messages: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(messages)) return []
   const out: Array<Record<string, unknown>> = []
   for (const raw of messages as Array<Record<string, unknown>>) {
@@ -549,7 +577,7 @@ export function toQoderMessages(messages: unknown): Array<Record<string, unknown
  * Tool definitions → the endpoint's function schema. The OpenAI shape passes
  * through; a bare `{ name, description, parameters }` descriptor is wrapped.
  */
-export function toQoderTools(tools: unknown): Array<Record<string, unknown>> {
+function toQoderTools(tools: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(tools)) return []
   return (tools as Array<Record<string, unknown>>).map((tool, index) => {
     if (tool !== null && typeof tool === 'object') {
@@ -595,7 +623,7 @@ export function toQoderTools(tools: unknown): Array<Record<string, unknown>> {
  * fabricated `false` answers `provider_error` 1210 ("该模型始终思考，
  * 不支持关闭思考") on models that always think.
  */
-export function buildQoderChatBody(source: string, model: string, options: {
+function buildQoderChatBody(source: string, model: string, options: {
   enableThinking?: boolean
   reasoningEffort?: string
   sessionId?: string
@@ -677,7 +705,7 @@ export function buildQoderChatBody(source: string, model: string, options: {
  * moved. Naming the groups that DID arrive keeps the next upstream rename
  * instantly readable instead of a bare "no chat group".
  */
-export function readQoderCatalogShape(data: unknown): unknown[] {
+function readQoderCatalogShape(data: unknown): unknown[] {
   if (data === null || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error(`Qoder model list shape changed: top level is ${Array.isArray(data) ? 'an array' : typeof data}, not a group envelope`)
   }
@@ -695,9 +723,13 @@ export function readQoderCatalogShape(data: unknown): unknown[] {
 /**
  * The window a Qoder model runs at, from `context_config`.
  *
- * The catalog offers several sizes per model (`1M`, `200K`, `400K`) and marks
- * the one in force with `is_default`. A row that names no default keeps its
- * largest, which is the reading that cannot promise less than the model has.
+ * The catalog offers several sizes per model (`1M`, `400K`, `200K`) and marks
+ * the one Qoder's own client currently has selected. That selected size is
+ * routinely the smallest on offer: `gfmodel` ships a 200K default beside a 1M
+ * entry, so publishing the default capped a model that accepts a million tokens
+ * at a fifth of it. The largest entry is what gets published, which is the
+ * reading that cannot promise less than the model has; the panel's per-model
+ * override is how a user narrows it again.
  */
 function qoderContextWindowOf(record: Record<string, unknown>): number | undefined {
   const config = record['context_config']
@@ -707,12 +739,9 @@ function qoderContextWindowOf(record: Record<string, unknown>): number | undefin
     const value = (entry as Record<string, unknown>)['token_count']
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
   }
-  const entries = Object.values(config as Record<string, unknown>)
-  const preferred = entries.find((entry) => entry !== null && typeof entry === 'object'
-    && (entry as Record<string, unknown>)['is_default'] === true)
-  const chosen = tokenCountOf(preferred)
-  if (chosen !== undefined) return chosen
-  const sizes = entries.map(tokenCountOf).filter((value): value is number => value !== undefined)
+  const sizes = Object.values(config as Record<string, unknown>)
+    .map(tokenCountOf)
+    .filter((value): value is number => value !== undefined)
   return sizes.length === 0 ? undefined : Math.max(...sizes)
 }
 
@@ -741,7 +770,13 @@ export function qoderModelOf(entry: unknown): QoderChatModel | undefined {
     ? record['max_input_tokens']
     : undefined
   // The window and input budget are independent; the directory states no output limit.
-  const contextWindow = qoderContextWindowOf(record) ?? maxInputTokens
+  // `max_input_tokens` can exceed every size `context_config` offers (gfmodel
+  // ships 1M there beside a 200K default), so the larger of the two is what the
+  // model can actually be handed.
+  const contextConfig = qoderContextWindowOf(record)
+  const contextWindow = contextConfig === undefined
+    ? maxInputTokens
+    : Math.max(contextConfig, maxInputTokens ?? 0)
   return {
     id: record['key'] as string,
     name: record['display_name'] as string,
@@ -782,7 +817,7 @@ export class QoderUpstreamClient {
       signal: signal ?? AbortSignal.timeout(DIRECTORY_TIMEOUT_MS),
     })
     if (!response.ok) {
-      throw new Error(`Qoder model list failed: HTTP ${response.status} ${(await response.text()).slice(0, 300)}`)
+      throw new Error(`Qoder model list failed: HTTP ${response.status} ${await readErrorBody(response, 300, signal)}`)
     }
     const chat = readQoderCatalogShape(await response.json() as unknown)
     const models: QoderChatModel[] = []
@@ -812,7 +847,7 @@ export class QoderUpstreamClient {
         redirect: 'error',
         signal: signal ?? AbortSignal.timeout(DIRECTORY_TIMEOUT_MS),
       })
-      if (!response.ok) throw new Error(`Qoder usage failed: HTTP ${response.status} ${(await response.text()).slice(0, 300)}`)
+      if (!response.ok) throw new Error(`Qoder usage failed: HTTP ${response.status} ${await readErrorBody(response, 300, signal)}`)
       return await response.json() as unknown
     }
     let payload: unknown
@@ -874,7 +909,7 @@ export class QoderUpstreamClient {
       redirect: 'error',
       signal: signal ?? AbortSignal.timeout(DIRECTORY_TIMEOUT_MS),
     })
-    if (!response.ok) throw new Error(`Qoder campaigns failed: HTTP ${response.status} ${(await response.text()).slice(0, 300)}`)
+    if (!response.ok) throw new Error(`Qoder campaigns failed: HTTP ${response.status} ${await readErrorBody(response, 300, signal)}`)
     return await response.json() as unknown
   }
   /**
@@ -893,10 +928,17 @@ export class QoderUpstreamClient {
       redirect: 'error',
       signal: signal ?? AbortSignal.timeout(DIRECTORY_TIMEOUT_MS),
     })
-    const text = await response.text()
+    // The failure path reads a bounded slice, because it only feeds a message.
+    // The success path has to read the whole document: routing it through the
+    // same 300-byte helper truncated every claim answer longer than that, and
+    // the truncated text then parsed as "not valid JSON". A check-in that the
+    // upstream had already granted (its own `grantId` is in the body) was
+    // reported as failed, and the panel said so.
     if (!response.ok) {
-      throw new Error(`Qoder check-in failed: HTTP ${response.status} ${text.slice(0, 200)}`)
+      const detail = await readErrorBody(response, 300, signal)
+      throw new Error(`Qoder check-in failed: HTTP ${response.status} ${detail.slice(0, 200)}`)
     }
+    const text = await response.text()
     try {
       return JSON.parse(text) as unknown
     } catch {
@@ -918,6 +960,8 @@ export class QoderUpstreamClient {
     signal?: AbortSignal
     /** Endpoint routing headers (model key + source); sent alongside the COSY set. */
     extraHeaders?: Record<string, string>
+    /** Deadlines for a test that cannot wait out the real ones. */
+    timeouts?: { headersMs?: number; idleMs?: number }
   } = {}): Promise<QoderChatResult> {
     let plain: string
     try {
@@ -925,26 +969,62 @@ export class QoderUpstreamClient {
     } catch {
       return { ok: false, status: 400, kind: 'client', message: 'invalid JSON request' }
     }
-    const credential = await this.options.credential()
+    let credential: QoderClientCredential
+    try {
+      credential = await this.options.credential()
+    } catch (error: unknown) {
+      // A sign-in file that vanished between the gateway's read and this call
+      // is a 503, not a 500: the gateway guards its own read, and this is the
+      // same failure one layer down.
+      return { ok: false, status: 503, kind: 'server', message: `credential read failed: ${String(error instanceof Error ? error.message : error)}` }
+    }
     const url = qoderEndpoint(this.baseUrl(), QODER_CHAT_PATH)
     const bodyBytes = encodeBody(plain)
     const headers = buildCosyAuthHeaders(bodyBytes, url, credential)
     let response: Response
+    // Headers on a clock of their own, the body on the idle watchdog: a signal
+    // handed to fetch stays attached to the body, so the whole-stream deadline
+    // that used to sit here cut every long turn in half.
+    const deadline = headersDeadline(options.signal, options.timeouts?.headersMs ?? CHAT_HEADERS_TIMEOUT_MS)
     try {
       response = await this.fetchImpl(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...headers, ...options.extraHeaders },
         body: bodyBytes,
         redirect: 'error',
-        signal: options.signal === undefined ? AbortSignal.timeout(CHAT_STREAM_TIMEOUT_MS) : AbortSignal.any([options.signal, AbortSignal.timeout(CHAT_STREAM_TIMEOUT_MS)]),
+        signal: deadline.signal,
       })
     } catch (error) {
+      // The caller hanging up is not an upstream failure. Answering it as one
+      // made every cancelled turn read as a network fault, and spent a rotation
+      // on a request the client had already dropped.
+      if (options.signal?.aborted === true) {
+        return { ok: false, status: 0, kind: 'aborted', message: 'cancelled by the caller' }
+      }
       return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
+    } finally {
+      deadline.arrived()
     }
     if (!response.ok) {
-      const text = await response.text().catch(() => '')
-      return { ok: false, status: response.status, kind: classifyQoderUpstreamError(response.status), message: text.slice(0, 300) || `Qoder returned HTTP ${response.status}` }
+      const text = await readErrorBody(response, 300, options.signal)
+      return {
+        ok: false,
+        status: response.status,
+        kind: classifyQoderUpstreamError(response.status),
+        message: text.slice(0, 300) || `Qoder returned HTTP ${response.status}`,
+        // The rate limit's own wait time, carried out so the gateway can answer
+        // with it: the in-stream path already relays one.
+        retryAfter: response.headers.get('retry-after'),
+      }
     }
-    return { ok: true, response }
+    return {
+      ok: true,
+      response: response.body === null
+        ? response
+        : new Response(withIdleWatchdog(response.body, options.timeouts?.idleMs, options.signal), {
+          status: response.status,
+          headers: response.headers,
+        }),
+    }
   }
 }

@@ -1,20 +1,20 @@
  /**
-  * Qoder read-only credential discovery (doctor-only wiring).
+  * Qoder read-only credential discovery.
   *
-  * Covers the first step of the Qoder merge: find every Qoder desktop sign-in
-  * slot on this machine without touching behaviour. `main.js` imports this
-  * module only for the doctor counting path, so WorkBuddy discovery, Trae
-  * discovery, gateways and the panel are unchanged. Nothing here writes to
-  * the Qoder apps' files; nothing here spawns PowerShell, opens SQLite, or
-  * unwraps DPAPI — those stay in the full `dsh-connect-qoder` credential
-  * chain for a later round. Failures carry paths and error text, never token
-  * material; env PAT hits report the variable NAME only, never its value.
+  * Finds every Qoder desktop sign-in slot on this machine: the app
+  * directories, the `Local State` key wrapper and the `auth.v1.dat` session
+  * blob. The reader (`qoder-credentials.ts`) unwraps the OSCrypt key with
+  * DPAPI and opens the blob; discovery itself only names files. Nothing here
+  * writes to the Qoder apps' files. Failures carry paths and error text,
+  * never token material.
   *
- * Shapes follow `dsh-connect-qoder` (MIT): new layout
- * `<appDir>/auth.v1.dat` (a Chromium OSCrypt blob whose plaintext is the
- * session JSON), legacy layout `<appDir>/User/globalStorage/state.vscdb`
- * (VS Code style SQLite store whose secret rows are OSCrypt blobs), key
- * wrapper in `<appDir>/Local State` under `os_crypt.encrypted_key`.
+  * Shapes follow `dsh-connect-qoder` (MIT): the current layout is
+  * `<appDir>/auth.v1.dat` (a Chromium OSCrypt blob whose plaintext is the
+  * session JSON), with the key wrapper in `<appDir>/Local State` under
+  * `os_crypt.encrypted_key`. The legacy `state.vscdb` layout is deliberately
+  * not probed: reading it needs a SQLite reader this plugin does not carry,
+  * and advertising a slot nothing can open reported legacy installs as signed
+  * out with no explanation.
  *
  * @module dsh-wtq-pool/qoder-discovery
  */
@@ -30,9 +30,6 @@ export type QoderRegion = 'cn' | 'global'
 export type QoderCandidateKind =
   | 'local-state'
   | 'auth-v1'
-  | 'state-vscdb'
-  | 'state-vscdb-backup'
-  | 'machine-id'
 
 /** One file to probe, in probe order. */
 export interface QoderStorageCandidate {
@@ -50,9 +47,6 @@ const QODER_CN_APP_NAMES: readonly string[] = ['com.qodercn.app.stable', 'QoderC
 /** International desktop app directory names. The 0.3.x layout is probed first. */
 const QODER_GLOBAL_APP_NAMES: readonly string[] = ['com.qoder.app.stable', 'Qoder', 'QoderWork']
 
-/** Machine-id file names the gateway session is bound to (any one counts). */
-const QODER_MACHINE_ID_NAMES: readonly string[] = ['auth.machine-id', 'machineid', 'machineId']
-
 /**
  * The per-user application-data root Qoder's Electron apps live under.
  *
@@ -61,7 +55,7 @@ const QODER_MACHINE_ID_NAMES: readonly string[] = ['auth.machine-id', 'machineid
  * home directory, macOS `~/Library/Application Support`, Linux/other
  * `$XDG_CONFIG_HOME` else `~/.config`.
  */
-export function qoderAppDataRootFor(
+function qoderAppDataRootFor(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
   home: string = homedir(),
@@ -92,14 +86,12 @@ export function qoderStorageCandidates(
   env: NodeJS.ProcessEnv = process.env,
 ): QoderStorageCandidate[] {
   const root = qoderAppDataRootFor(platform, env, home)
-  if (root === '') return []
   // win32 probes APPDATA plus the home-derived roaming fallback (deduped);
   // every other platform has exactly one documented root.
   let roots: string[]
   if (platform === 'win32') {
     const fallback = join(home, 'AppData', 'Roaming')
-    roots = [root, fallback].filter((value, index, all): value is string =>
-      typeof value === 'string' && value !== '' && all.indexOf(value) === index)
+    roots = [root, fallback].filter((value, index, all) => all.indexOf(value) === index)
   } else {
     roots = [root]
   }
@@ -113,11 +105,6 @@ export function qoderStorageCandidates(
       const appDir = join(rootDir, appName)
       result.push({ region, appName, appDir, path: join(appDir, 'Local State'), kind: 'local-state' })
       result.push({ region, appName, appDir, path: join(appDir, 'auth.v1.dat'), kind: 'auth-v1' })
-      result.push({ region, appName, appDir, path: join(appDir, 'User', 'globalStorage', 'state.vscdb'), kind: 'state-vscdb' })
-      result.push({ region, appName, appDir, path: join(appDir, 'User', 'globalStorage', 'state.vscdb.backup'), kind: 'state-vscdb-backup' })
-      for (const machineName of QODER_MACHINE_ID_NAMES) {
-        result.push({ region, appName, appDir, path: join(appDir, machineName), kind: 'machine-id' })
-      }
     }
   }
   return result

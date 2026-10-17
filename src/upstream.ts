@@ -1,4 +1,4 @@
-﻿/**
+/**
  * WorkBuddy (CodeBuddy / copilot.tencent.com) upstream client.
  *
  * 参考：corrinehu/dsh-workbuddy-connect（MIT, Copyright (c) 2026 Corrine Hu）
@@ -12,10 +12,10 @@
  * @module dsh-wtq-pool/upstream
  */
 
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 
 import type { WorkBuddyCredential } from './accounts'
-import { redactSecrets } from './loopback'
+import { boundedRetryAfterSeconds, redactSecrets } from './loopback'
 
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
 export type UpstreamErrorKind =
@@ -26,6 +26,10 @@ export type UpstreamErrorKind =
   | 'not_found'
   | 'server'
   | 'client'
+  /** The network path failed before any upstream answer existed. */
+  | 'transport'
+  /** The caller hung up before the answer arrived; not an upstream failure. */
+  | 'aborted'
 
 /** Token-refresh answer; fields the upstream omits stay absent. */
 export interface WorkBuddyRefreshOutcome {
@@ -165,7 +169,14 @@ export function isBuddyThresholdIncomplete(message: unknown): boolean {
 /** Result of one upstream chat attempt. */
 export type ChatStreamResult =
   | { ok: true; response: Response }
-  | { ok: false; kind: UpstreamErrorKind; status: number; message: string }
+  | {
+      ok: false
+      kind: UpstreamErrorKind
+      status: number
+      message: string
+      /** Upstream-stated wait in seconds, when it gave one in `Retry-After`. */
+      retryAfter?: number
+    }
 
 export interface UpstreamClientOptions {
   /** Injectable fetch, primarily for tests. */
@@ -183,6 +194,14 @@ const GLOBAL_BASE = 'https://www.workbuddy.ai'
 const CLIENT_UA = 'WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1'
 
 /**
+ * The international desktop client's own chat UA, from the 5.8.4 capture.
+ *
+ * The CN gateway has no capture of its own and reads its roster with the
+ * desktop spelling it has always been sent, so CN keeps `CLIENT_UA`.
+ */
+const GLOBAL_CHAT_UA = 'WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0'
+
+/**
  * Desktop app UA. The global gateway serves its product config only to this
  * client channel: the CLI UA gets a truncated roster (or an HTTP 500), which
  * is why the international catalog must be read with the desktop spelling.
@@ -195,6 +214,164 @@ const MODELS_CATALOG_PATH = '/v2/enterprises/personal/models'
 const GLOBAL_CONFIG_PATH = '/v3/config'
 const JSON_TIMEOUT_MS = 30_000
 const ERROR_BODY_LIMIT = 4096
+/** Deadline for a failed response's error body, which no other phase covers. */
+const ERROR_BODY_TIMEOUT_MS = 10_000
+/** Deadline for the chat POST to reach its response headers. */
+const STREAM_HEADERS_TIMEOUT_MS = 60_000
+/** Longest a relayed chat stream may go without a single byte. */
+const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000
+
+/**
+ * A response's `Retry-After`, in whole seconds, bounded.
+ *
+ * The header is the upstream's own answer to "how long", and it is the only
+ * place a 429 window can be stated that the body parser does not cover.
+ */
+export function retryAfterSeconds(headers: Headers): number | undefined {
+  const raw = headers.get('retry-after')
+  if (raw === null || raw.trim() === '') return undefined
+  return boundedRetryAfterSeconds(Number(raw.trim()))
+}
+
+/**
+ * Wrap a relayed body so a stream that goes quiet mid-turn fails instead of
+ * hanging. The upstream socket is cancelled on the first idle gap, and the
+ * failure is surfaced through the stream: `reader.cancel` resolves the pending
+ * read as a clean end, which the relay would otherwise report as a finished
+ * turn with a truncated reply.
+ */
+export function withIdleWatchdog(
+  body: ReadableStream<Uint8Array>,
+  idleMs: number = STREAM_IDLE_TIMEOUT_MS,
+  signal?: AbortSignal,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let idle: Error | undefined
+  const disarm = (): void => {
+    if (timer !== undefined) clearTimeout(timer)
+    timer = undefined
+  }
+  /**
+   * Give up on the body and make the pending read report this failure.
+   *
+   * `reader.cancel` resolves the read the watchdog is waiting on as an end
+   * rather than rejecting it, so the reason is recorded for `pull` to turn into
+   * an error instead of a clean close. Shared by the idle timer and a caller
+   * hang-up: a client that stopped waiting must tear the upstream down, and the
+   * header deadline deliberately detaches its own listener once the headers
+   * land, so this is where that abort has to be caught.
+   */
+  const stop = (reason: Error): void => {
+    if (idle !== undefined) return
+    idle = reason
+    void reader.cancel(reason).catch(() => {})
+    disarm()
+    // Detached as well as on the terminal paths: once the read is cancelled
+    // this listener has no work left, and a body the consumer never reads or
+    // cancels again would keep it on the caller's signal for the whole rotation.
+    detach()
+  }
+  const onAbort = (): void => {
+    stop(signal?.reason instanceof Error ? signal.reason : new Error('upstream stream cancelled by the caller'))
+  }
+  // The listener is added once per attempt and removed on every terminal path:
+  // a rotation that exhausts its attempts wraps eight bodies on the same caller
+  // signal, and leaving one listener each is how the listener warning fired.
+  const detach = (): void => { signal?.removeEventListener('abort', onAbort) }
+  if (signal?.aborted === true) onAbort()
+  else signal?.addEventListener('abort', onAbort)
+  const finish = (): void => {
+    disarm()
+    detach()
+  }
+  const arm = (): void => {
+    disarm()
+    timer = setTimeout(() => { stop(new Error('upstream stream went idle')) }, idleMs)
+    timer.unref?.()
+  }
+  return new ReadableStream<Uint8Array>({
+    start() { arm() },
+    async pull(controller) {
+      try {
+        const next = await reader.read()
+        // Checked before `done`: the watchdog cancels the reader, which
+        // resolves the read as an end of stream rather than rejecting it.
+        // And checked before `arm`: re-arming for a stream the watchdog has
+        // already given up on leaves a timer counting down into a reader that
+        // has been released, which is the same leak one branch down.
+        if (idle !== undefined) {
+          finish()
+          controller.error(idle)
+          return
+        }
+        arm()
+        if (next.done) {
+          // The stream is over, and so is the timer: without this every turn
+          // left one armed for the full idle window, holding the reader and
+          // the upstream response alive with it.
+          finish()
+          controller.close()
+          return
+        }
+        controller.enqueue(next.value)
+      } catch (error: unknown) {
+        finish()
+        controller.error(error)
+      }
+    },
+    cancel(reason) {
+      finish()
+      return reader.cancel(reason)
+    },
+  })
+}
+
+/**
+ * A fetch signal that covers the response headers and nothing else.
+ *
+ * A signal handed to `fetch` stays attached to the response body afterwards:
+ * undici errors the body when it fires, so a deadline meant for the headers
+ * phase cuts the stream dead the moment it expires. Measured on this machine,
+ * every WorkBuddy turn longer than a minute and every Trae or Qoder turn
+ * longer than two was aborted mid-body, the client meeting a reset connection
+ * instead of the rest of the reply.
+ *
+ * The returned signal is aborted by a hang-up straight away, and by the
+ * deadline only while the request is still waiting for headers. `arrived()`
+ * disarms the deadline and detaches the hang-up listener, because a rotation
+ * that exhausts its attempts would otherwise add one listener per account on
+ * the same caller signal. The body's own teardown on a hang-up is the idle
+ * watchdog's: `withIdleWatchdog` is handed the same signal and cancels the
+ * upstream read when it fires.
+ */
+export function headersDeadline(
+  caller: AbortSignal | undefined,
+  ms: number,
+): { signal: AbortSignal; arrived: () => void } {
+  const controller = new AbortController()
+  const onCallerAbort = (): void => controller.abort(caller?.reason)
+  // A caller that hung up before this was built has already said everything:
+  // forwarding only future aborts sent the request anyway, and the turn it
+  // belonged to was being paid for by nobody.
+  if (caller?.aborted === true) controller.abort(caller.reason)
+  else caller?.addEventListener('abort', onCallerAbort)
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`upstream did not send response headers within ${ms}ms`))
+  }, ms)
+  timer.unref?.()
+  return {
+    signal: controller.signal,
+    arrived: () => {
+      clearTimeout(timer)
+      // Detached as well as disarmed: one listener is added per call, and a
+      // rotation that exhausts its attempts adds one per account on the same
+      // caller signal, which is how Node's listener warning used to fire on
+      // every exhausted turn.
+      caller?.removeEventListener('abort', onCallerAbort)
+    },
+  }
+}
 
 /** Insufficient-credit markers, ASCII lowercase plus the original Chinese. */
 const HARD_CREDIT_MARKERS = [
@@ -273,10 +450,57 @@ function commonHeaders(credential: WorkBuddyCredential): Record<string, string> 
   }
 }
 
+/**
+ * The conversation header family the desktop client puts on every chat request.
+ *
+ * The international gateway runs a channel check that refuses a request
+ * carrying no conversation id at all: business code 11128,
+ * `conversation id missing`, answered as a 400 whose tip says the call failed
+ * channel verification. The CN gateway does not ask for it and accepts the
+ * family too, so it is sent on both rather than branched on region.
+ *
+ * The shapes and the pairings follow the 5.8.4 client capture: the conversation
+ * id is a dashed UUID, the four request and message ids are 32 hex characters,
+ * `X-Root-Request-ID` carries the same value as `X-Conversation-Request-ID`,
+ * and `X-Request-ID` the same value as `X-Conversation-Message-ID`. The trace
+ * family is the W3C/B3 pair the client sends; `X-B3-ParentSpanId` is left out
+ * because a real parent span needs a caller this plugin does not have.
+ *
+ * Every id is fresh per request. The upstream keeps no history by the
+ * conversation id - the same id sent twice answers the second turn as a fresh
+ * one - so there is nothing to gain from deriving it, and a stable value would
+ * be one more thing for the channel check to notice.
+ */
+function conversationHeaders(): Record<string, string> {
+  const turn = randomUUID().replace(/-/g, '')
+  const message = randomUUID().replace(/-/g, '')
+  const traceId = randomUUID().replace(/-/g, '')
+  const spanId = randomBytes(8).toString('hex')
+  return {
+    'X-Conversation-ID': randomUUID(),
+    'X-Conversation-Request-ID': turn,
+    'X-Root-Request-ID': turn,
+    'X-Conversation-Message-ID': message,
+    'X-Request-ID': message,
+    'X-Agent-Intent': 'craft',
+    'X-Agent-Purpose': 'conversation',
+    'X-Agent-Type': 'main',
+    'X-IDE-Version': '5.8.4',
+    'X-Private-Data': 'true',
+    'X-Trace-ID': traceId,
+    'traceparent': `00-${traceId}-${spanId}-01`,
+    'b3': `${traceId}-${spanId}-1`,
+    'X-B3-TraceId': traceId,
+    'X-B3-SpanId': spanId,
+    'X-B3-Sampled': '1',
+  }
+}
+
 /** Chat request headers, including the X-No-* conventions the official CLI uses. */
 function chatHeaders(credential: WorkBuddyCredential): Record<string, string> {
   return {
     ...commonHeaders(credential),
+    ...conversationHeaders(),
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${credential.accessToken}`,
     ...credential.uid === '' || credential.uid === undefined
@@ -287,6 +511,9 @@ function chatHeaders(credential: WorkBuddyCredential): Record<string, string> {
       : { 'X-Enterprise-Id': credential.enterpriseId },
     ...credential.domain === '' ? { 'X-No-Department-Info': '1' } : { 'X-Domain': credential.domain },
     'X-Product': 'SaaS',
+    // The international gateway answers the CN spelling of the UA with the
+    // roster it gives the CLI, so the captured desktop one is used there.
+    ...regionOf(credential.domain) === 'global' ? { 'User-Agent': GLOBAL_CHAT_UA } : {},
   }
 }
 
@@ -343,18 +570,88 @@ function isGatewayHtmlRejection(status: number, text: string): boolean {
   return head.includes('<html') || head.includes('openresty') || head.includes('apisix')
 }
 
+/**
+ * The sentence a gateway-level rejection is answered with.
+ *
+ * openresty / APISIX reject a request before it reaches the product when the
+ * credential is one the gateway no longer honours. The status alone is not
+ * actionable and the HTML body leaks nothing useful, so the raw page would
+ * otherwise reach the client as the error text.
+ */
+function gatewayRejectionText(status: number): string {
+  return (
+    `the WorkBuddy gateway rejected this credential (http ${status}). This usually means the ` +
+    'account is using a stale sign-in the upstream no longer accepts: sign in again in ' +
+    'the WorkBuddy desktop app, then pick the account on the plugin card. ' +
+    "Run the WTQ Pool connection check (the command palette entry, or the panel's connection tab) to list every credential found."
+  )
+}
+
+/**
+ * Read a failed response's body, bounded in both time and size.
+ *
+ * An upstream that answers 429 and then trickles its error page would otherwise
+ * hold the attempt until undici's own body timeout, and a rotation pays that
+ * once per account before it can answer at all. Cancelling the reader is what
+ * releases the socket, so the bound is real rather than a race that leaves the
+ * connection behind. The caller's own hang-up reaches the body through
+ * `signal`: the headers deadline has detached itself by the time a non-2xx
+ * answer is read, so a cancelled turn would otherwise wait out the deadline
+ * below with the socket still open.
+ *
+ * Never rejects: a read that fails keeps whatever arrived, which is usually the
+ * sentence the client needs. Callers on the error path used to let a body that
+ * died mid-read replace the upstream's status with a bare abort error.
+ */
+export async function readErrorBody(response: Response, limitBytes: number, signal?: AbortSignal): Promise<string> {
+  const body = response.body
+  if (body === null) return ''
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  const abandon = (reason: string): void => {
+    void reader.cancel(new Error(reason)).catch(() => {})
+  }
+  const deadline = setTimeout(() => { abandon('upstream error body read timed out') }, ERROR_BODY_TIMEOUT_MS)
+  deadline.unref?.()
+  const onAbort = (): void => { abandon('upstream error body read cancelled by the caller') }
+  if (signal?.aborted === true) onAbort()
+  else signal?.addEventListener('abort', onAbort)
+  let done = false
+  try {
+    for (;;) {
+      const next = await reader.read()
+      if (next.done) {
+        done = true
+        break
+      }
+      text += decoder.decode(next.value, { stream: true })
+      // Past the limit the rest is discarded: the caller slices it anyway, and
+      // an unbounded error page is the one body size nobody bounds. The slice
+      // below is what makes the bound exact when one chunk overshoots it.
+      if (text.length >= limitBytes) break
+    }
+  } catch {
+    /* keep what arrived */
+  } finally {
+    clearTimeout(deadline)
+    signal?.removeEventListener('abort', onAbort)
+    // A read abandoned at the size limit leaves the upstream response
+    // unconsumed, and nothing else closes it: the socket is held until undici
+    // or the peer gives up. Cancelling is what releases it.
+    if (!done) abandon('upstream error body size limit reached')
+    reader.releaseLock()
+  }
+  return text.length > limitBytes ? text.slice(0, limitBytes) : text
+}
+
 async function readEnvelope(response: Response): Promise<Envelope> {
   const text = await response.text()
   if (isGatewayHtmlRejection(response.status, text)) {
     // The status is interpolated rather than written: this branch accepts 401
     // and 403, and naming 401 for a 403 sends the reader looking for a
     // credential problem the gateway never reported.
-    throw new Error(
-      `the WorkBuddy gateway rejected this credential (http ${response.status}). This usually means the ` +
-      'account is using a stale sign-in the upstream no longer accepts: sign in again in ' +
-      'the WorkBuddy desktop app, then pick the account on the plugin card. ' +
-      'Run the WTQ Pool connection check (the command palette entry, or the panel\'s connection tab) to list every credential found.',
-    )
+    throw new Error(gatewayRejectionText(response.status))
   }
   let parsed: unknown
   try {
@@ -383,26 +680,52 @@ function envelopeError(status: number, envelope: Envelope): Error {
  * Classify an upstream failure from its HTTP status and body excerpt.
  *
  * A body marker only refines a status that has not already said something
- * more specific. When the status is about the sign-in, the only thing that may
- * reclassify it is a session marker - otherwise a 401 quoting "quota exceeded"
- * reads as a billing failure, which answers 402 and skips the token refresh.
- * And a session marker never fires on any other status, or a rate limit whose
- * text happens to carry the code would rotate without cooling the account.
+ * more specific. A 429 has: the throttling answer routinely quotes quota
+ * text, and reading that as billing exhaustion answered 402 for a limit that
+ * clears on its own. When the status is about the sign-in, the only thing
+ * that may reclassify it is a session marker, and a session marker never
+ * fires on any other status, or a rate limit whose text happens to carry
+ * the code would rotate without cooling the account.
+ *
+ * The credit markers are read only on statuses the upstream itself uses for
+ * "this account cannot pay": 402 and 403. A 400 or 422 is a verdict on the
+ * REQUEST, and its body routinely quotes the quota it measured against, so
+ * matching there turned a malformed body into a whole-pool rotation and a
+ * 402 that named the wrong problem.
  */
 export function classifyUpstreamError(status: number, body: string): UpstreamErrorKind {
   if (status === 402) return 'hard_credit'
+  if (status === 429) return 'soft_rate'
   const aboutSignIn = status === 401 || status === 403
   if (aboutSignIn && SESSION_DEAD_PATTERN.test(body)) return 'session_dead'
-  if (!aboutSignIn) {
+  // A 401 carries no other meaning here: the loopback endpoint authenticates
+  // nothing, so the upstream is the only party that could have refused the
+  // bearer, and it refused this account's. Reading the unrecognised ones as
+  // `client` answered 400 and broke the rotation on the first account, which
+  // left a stale sign-in serving every turn as a hard failure while the
+  // refresh-and-retry path below it — written for exactly this — never ran.
+  // The gateway's own HTML page is the other shape a 401 takes, and it means
+  // the same thing about the credential.
+  if (status === 401) return 'session_dead'
+  // A 403 the upstream answers with a credit marker is a spent account, not a
+  // sign-in problem: the marker names the reason and the session pattern above
+  // has already had its chance. A 400 or 422 never gets here — it is a verdict
+  // on the request, and its body routinely quotes the quota it measured
+  // against, so matching there turned a malformed body into a whole-pool
+  // rotation and a 402 that named the wrong problem.
+  if (status === 403) {
     const lower = body.toLowerCase()
     for (const marker of HARD_CREDIT_MARKERS) {
       if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
     }
-    if (SESSION_DEAD_PATTERN.test(body)) return 'session_dead'
   }
-  // The 429 the user hits ("频率限制 / soft_rate / code 6004") routes here.
-  if (status === 429) return 'soft_rate'
-  if (body.includes('soft_rate') || body.includes('"code":6004') || body.includes('频率限制')) {
+  // The three markers refine a status that is itself undecided about rate
+  // limiting, and only that. A 400/404/422 is a verdict on the request, and its
+  // body routinely quotes the quota it measured against; a 5xx is an upstream
+  // fault that stays one. Both matched here once, and either turned a bad
+  // request or an outage into a whole-pool rotation answered as 429.
+  if (status === 503
+    && (body.includes('soft_rate') || body.includes('"code":6004') || body.includes('频率限制'))) {
     return 'soft_rate'
   }
   // A 403 with no business envelope is the gateway's WAF page (HTML, empty or
@@ -446,8 +769,14 @@ function capRateReset(value: number): number {
 }
 
 export function parseRateLimitReset(body: string): number | undefined {
-  const epochMs = /"(?:resetAt|reset_at|resetTime|reset_time)"\s*:\s*(\d{13})/.exec(body)
-  if (epochMs !== null) return capRateReset(Number(epochMs[1]))
+  // The value may be quoted and may count seconds instead of milliseconds; both
+  // spellings occur, and a quoted or seconds-level value fell through to the
+  // default cooldown while the upstream had named the exact window.
+  const epochMs = /"(?:resetAt|reset_at|resetTime|reset_time)"\s*:\s*["']?(\d{10,13})["']?/.exec(body)
+  if (epochMs !== null) {
+    const raw = Number(epochMs[1])
+    return capRateReset(raw < 1e12 ? raw * 1000 : raw)
+  }
 
   const localized = /将在\s*([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2})/.exec(body)
   if (localized !== null) {
@@ -458,7 +787,7 @@ export function parseRateLimitReset(body: string): number | undefined {
 }
 
 /** Parse the upstream's `credits` string into a multiplier. */
-export function parseCreditMultiplier(value: unknown): number | undefined {
+function parseCreditMultiplier(value: unknown): number | undefined {
   if (typeof value !== 'string') return undefined
   const match = /x\s*([0-9]*\.?[0-9]+)/iu.exec(value)
   if (match === null) return undefined
@@ -509,7 +838,7 @@ function singularEffortLadder(raw: Record<string, unknown>): string[] | undefine
  * declared, and the singular `effort` form folds via
  * {@link singularEffortLadder}.
  */
-export function parseReasoning(value: unknown): WorkBuddyUpstreamModel['reasoning'] {
+function parseReasoning(value: unknown): WorkBuddyUpstreamModel['reasoning'] {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
   const raw = value as Record<string, unknown>
   const singularForm = isSingularEffortForm(raw)
@@ -585,14 +914,19 @@ function parseTask(value: unknown): WorkBuddyTask | undefined {
     target,
     current,
     acceptStatus,
-    claimable: !claimed && target > 0 && current >= target,
+    // A task with a counter is claimable once the counter is met. A task with
+    // none (target 0, "complete your profile" and its kin) has nothing to meet,
+    // so requiring `target > 0` made it permanently unclaimable and the pass
+    // skipped it in silence: the reward was simply never collected. For those
+    // the accept state is the whole answer.
+    claimable: !claimed && (target <= 0 || current >= target),
     claimed,
     locked: raw['locked'] === true,
   }
 }
 
 /** Parse one catalog entry; entries without usable token limits are dropped. */
-export function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | undefined {
+function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | undefined {
   if (typeof value !== 'object' || value === null) return undefined
   const raw = value as Record<string, unknown>
   const id = typeof raw['id'] === 'string' ? raw['id'] : ''
@@ -613,6 +947,37 @@ export function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | und
     ...reasoning === undefined ? {} : { reasoning },
     ...supportsImages === undefined ? {} : { supportsImages },
   }
+}
+
+/**
+ * Put an empty system prompt in front of the conversation when the host opened
+ * with a user turn.
+ *
+ * The international gateway refuses a request whose first message is not a
+ * system prompt (code 11128, "first message is not system prompt"), and a host
+ * that starts with the user's turn sends none. The content is empty on purpose:
+ * it satisfies the check without adding an instruction the model would follow,
+ * so the model still sees exactly what the host sent. The CN gateway asks for
+ * neither, so this is the one part of the shape that is region-specific.
+ */
+function withLeadingSystemPrompt(prepared: string): string {
+  let body: unknown
+  try {
+    body = JSON.parse(prepared)
+  } catch {
+    return prepared
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return prepared
+  const obj = body as Record<string, unknown>
+  const messages = obj['messages']
+  if (!Array.isArray(messages) || messages.length === 0) return prepared
+  const first = messages[0]
+  if (typeof first === 'object' && first !== null
+    && (first as Record<string, unknown>)['role'] === 'system') {
+    return prepared
+  }
+  obj['messages'] = [{ role: 'system', content: '' }, ...messages]
+  return JSON.stringify(obj)
 }
 
 export class WorkBuddyUpstreamClient {
@@ -669,38 +1034,88 @@ export class WorkBuddyUpstreamClient {
         let name = typeof fn?.['name'] === 'string' ? fn['name'] : ''
         if (name === '' && typeof wrapped['name'] === 'string') name = wrapped['name']
         obj['tool_choice'] = name.trim() !== '' ? name.trim() : 'auto'
-      } else {
-        delete obj['tool_choice']
       }
+      // An unrecognised form is passed through rather than dropped: the upstream
+      // is the one that knows whether it can honour it, and deleting it here
+      // silently removed a restriction the client set.
     }
     return JSON.stringify(obj)
   }
 
-  /** Forward one chat completion. Never throws for upstream failures. */
+
+/** Forward one chat completion. Never throws for upstream failures. */
   async chatStream(
     credential: WorkBuddyCredential,
     prepared: string,
     signal?: AbortSignal,
+    timeouts?: { headersMs?: number; idleMs?: number },
   ): Promise<ChatStreamResult> {
     let response: Response
+    // The caller's signal only covers a hang-up; an upstream that accepts the
+    // POST and then goes quiet held the turn until the host's own fetch
+    // timeout. The headers phase gets a deadline of its own, and the stream an
+    // idle watchdog: a healthy stream sends something every few seconds.
+    const deadline = headersDeadline(signal, timeouts?.headersMs ?? STREAM_HEADERS_TIMEOUT_MS)
+    // The international gateway also insists the first message be a system
+    // prompt. This is the one place the credential is known, so it is the one
+    // place the region can be decided; CN pays nothing for it.
+    const body = regionOf(credential.domain) === 'global'
+      ? withLeadingSystemPrompt(prepared)
+      : prepared
     try {
       response = await this.fetchImpl(`${chatBase(credential)}/v2/chat/completions`, {
         redirect: 'error',
         method: 'POST',
         headers: chatHeaders(credential),
-        body: prepared,
-        ...signal === undefined ? {} : { signal },
+        body,
+        signal: deadline.signal,
       })
     } catch (error: unknown) {
-      return { ok: false, kind: 'server', status: 0, message: `transport error: ${String(error)}` }
+      // The caller hanging up is not an upstream failure. Answering it as one
+      // made every cancelled turn look like a network fault in the log, and
+      // spent a rotation on a request the client had already dropped.
+      if (signal?.aborted === true) {
+        return { ok: false, kind: 'aborted', status: 0, message: 'cancelled by the caller' }
+      }
+      // A transport failure (DNS, reset, TLS, a 30x under `redirect: 'error'`)
+      // is a property of the network path, not of this account: the next
+      // sign-in may well reach the host. Classing it as `server` had the shim
+      // break out of the rotation and answer 502 with the healthy accounts
+      // behind it still untried.
+      return { ok: false, kind: 'transport', status: 0, message: `transport error: ${String(error)}` }
+    } finally {
+      // Only the headers phase was on the clock: the body is the watchdog's.
+      deadline.arrived()
     }
-    if (response.ok) return { ok: true, response }
-    const text = (await response.text().catch(() => '')).slice(0, ERROR_BODY_LIMIT)
+    if (response.ok) {
+      return {
+        ok: true,
+        response: response.body === null
+          ? response
+          : new Response(withIdleWatchdog(response.body, timeouts?.idleMs, signal), {
+            status: response.status,
+            headers: response.headers,
+          }),
+      }
+    }
+    const text = (await readErrorBody(response, ERROR_BODY_LIMIT, signal))
+    const retryAfter = retryAfterSeconds(response.headers)
     return {
       ok: false,
       kind: classifyUpstreamError(response.status, text),
       status: response.status,
-      message: text,
+      // A gateway page is answered with the sentence that says what to do
+      // about it. The page itself is the other half of the same refusal, and
+      // relaying it put a screenful of openresty HTML in front of the user
+      // where one instruction belonged.
+      message: isGatewayHtmlRejection(response.status, text)
+        ? gatewayRejectionText(response.status)
+        : text,
+      // The upstream states the wait in the standard header as well as in the
+      // body, and the body parse only covers the spellings it knows. Handing
+      // the header through lets the shim honour the upstream's own window
+      // instead of guessing `cooldownSeconds` for every 429.
+      ...retryAfter === undefined ? {} : { retryAfter },
     }
   }
 
@@ -1050,9 +1465,14 @@ export class WorkBuddyUpstreamClient {
    * upstream lights growth streak and unlocks the first-buddy task on this,
    * and a trimmed event risks a future tightening. `userId` is the account
    * uid — without it the upstream answers 200 yet silently drops the report.
+   *
+   * The uid is not optional and is not substituted: the `uin` is a different
+   * identifier, and sending it produced exactly the silent drop the comment
+   * above warns about, with a 200 to show for it. An account that carries no
+   * uid fails loudly instead.
    */
   async reportChatActivity(credential: WorkBuddyCredential, conversationId: string): Promise<void> {
-    const uid = credential.uid ?? credential.uin ?? ''
+    const uid = credential.uid ?? ''
     if (uid === '') throw new Error('workbuddy report needs a uid-bearing credential')
     const now = Date.now()
     const event = {
@@ -1213,18 +1633,46 @@ export class WorkBuddyUpstreamClient {
    * Accepting is the "sign up" half: it produces no progress by itself, and the
    * upstream answers success for an already-accepted task, so replaying this is
    * safe. Progress is lit by real activity (a chat, an activity report).
+   *
+   * Returns the codes the upstream refused. One retired or renamed code makes
+   * the whole batch fail, which used to cost the account every reward of the
+   * pass, because the caller's second list read never ran. The batch is
+   * therefore retried code by code when it fails as a whole: a code the
+   * upstream will not take is reported instead of thrown, and the rest still
+   * lands.
    */
-  async acceptTasks(credential: WorkBuddyCredential, taskCodes: readonly string[]): Promise<void> {
-    if (taskCodes.length === 0) return
-    const response = await this.fetchImpl(`${chatBase(credential)}/v2/activity/growth/tasks/accept`, {
-      redirect: 'error',
-      method: 'POST',
-      headers: chatHeaders(credential),
-      body: JSON.stringify({ task_codes: [...taskCodes] }),
-      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
-    })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+  async acceptTasks(credential: WorkBuddyCredential, taskCodes: readonly string[]): Promise<readonly string[]> {
+    if (taskCodes.length === 0) return []
+    const post = async (codes: readonly string[]): Promise<void> => {
+      const response = await this.fetchImpl(`${chatBase(credential)}/v2/activity/growth/tasks/accept`, {
+        redirect: 'error',
+        method: 'POST',
+        headers: chatHeaders(credential),
+        body: JSON.stringify({ task_codes: [...codes] }),
+        signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+      })
+      const envelope = await readEnvelope(response)
+      if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    }
+    try {
+      await post(taskCodes)
+      return []
+    } catch (error: unknown) {
+      if (taskCodes.length === 1) throw error
+      const refused: string[] = []
+      for (const code of taskCodes) {
+        try {
+          await post([code])
+        } catch {
+          refused.push(code)
+        }
+      }
+      // Every code refused on its own is the batch's own failure, not one bad
+      // code: it is rethrown so the caller's accounting still sees a failed
+      // account rather than a pass that silently collected nothing.
+      if (refused.length === taskCodes.length) throw error
+      return refused
+    }
   }
 
   /**

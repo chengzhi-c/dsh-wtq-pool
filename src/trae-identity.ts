@@ -95,7 +95,21 @@ export async function readTraeIdentity(
     home: options.home ?? homedir(),
     env: options.env ?? process.env,
   }
-  const storage = JSON.parse(await readFile(candidate.path, 'utf8')) as Record<string, unknown>
+  let storage: Record<string, unknown>
+  try {
+    const parsed = JSON.parse(await readFile(candidate.path, 'utf8')) as unknown
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('not an object')
+    }
+    storage = parsed as Record<string, unknown>
+  } catch (error: unknown) {
+    // A truncated or emptied file reads as `null` or a bare value, which used to
+    // surface as a TypeError about reading a property of null. A missing file
+    // must still pass through as one: the caller tells a machine with no Trae
+    // install from a machine whose install will not parse.
+    if (isFileMissing(error)) throw error
+    throw new Error(`Trae ${candidate.edition} storage is not a JSON object`)
+  }
   // storage.json lives at <appRoot>/User/globalStorage/, and `machineid` sits
   // three levels up in the install's own app root.
   const machineFile = nonEmpty(await readFile(join(dirname(dirname(dirname(candidate.path))), 'machineid'), 'utf8').catch(() => ''))
@@ -104,7 +118,8 @@ export async function readTraeIdentity(
   if (machineId === undefined) throw new Error(`Trae ${candidate.edition} has no stable machine identity`)
   // The numeric suffix of iCubeAuthInfo://icube-dc:<id> exactly matches the
   // x-device-id the official clients send; telemetry remains the fallback.
-  const deviceId = traeDeviceCenterId(storage)
+  const centerId = traeDeviceCenterId(storage)
+  const deviceId = centerId
     ?? nonEmpty(storage['telemetry.devDeviceId'])
     ?? createHash('sha256').update(machineId).digest('hex').slice(0, 32)
   const buildVersion = nonEmpty(storage['iCubeLastVersion'])
@@ -119,6 +134,7 @@ export async function readTraeIdentity(
   return {
     machineId,
     deviceId,
+    ...centerId === undefined ? { deviceIdIsFallback: true } : {},
     ...appVersion === undefined ? {} : { appVersion },
     ...buildVersion === undefined ? {} : { buildVersion },
     ...deviceBrand === undefined ? {} : { deviceBrand },

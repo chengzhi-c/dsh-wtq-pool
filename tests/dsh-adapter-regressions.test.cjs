@@ -21,7 +21,16 @@ function loadSource(file, overrides = {}, globals = {}) {
   const ownRequire = createRequire(path.join(root, file))
   const module = { exports: {} }
   const context = vm.createContext({ module, exports: module.exports, URL, Buffer, console, ...globals,
-    require: name => Object.hasOwn(overrides, name) ? overrides[name] : ownRequire(name) })
+    // A relative specifier resolves against the source tree, whose modules are
+    // still TypeScript: the extension is added here rather than at every call
+    // site, so a module that is new to the tree loads without an override.
+    require: name => {
+      if (Object.hasOwn(overrides, name)) return overrides[name]
+      if (name.startsWith('.')) {
+        try { return ownRequire(name) } catch { return ownRequire(name + '.ts') }
+      }
+      return ownRequire(name)
+    } })
   vm.runInContext(transpile(sourceOf(file)), context, { filename: file })
   return module.exports
 }
@@ -30,12 +39,18 @@ function indexFixture() {
   // Run the actual activation and its helpers without starting desktop discovery or gateways.
   const file = ts.createSourceFile('index.ts', sourceOf('src/index.ts'), ts.ScriptTarget.Latest, true)
   const functions = new Set(['unwrapVolatile', 'unwrapVolatileDeep', 'settingsNamespaceOf', 'registrationFingerprint', 'apply'])
+  const variables = new Set(['lastRows', 'activationToken'])
   const selected = file.statements.filter(node =>
     ts.isFunctionDeclaration(node) && functions.has(node.name?.text)
-    || ts.isVariableStatement(node) && node.declarationList.declarations.some(row => row.name.getText(file) === 'lastRows'))
+    || ts.isVariableStatement(node) && node.declarationList.declarations.some(row => variables.has(row.name.getText(file))))
   let installing
   const module = { exports: {} }
   const context = vm.createContext({ module, exports: module.exports, console, FALLBACK_SETTINGS_NS: 'fixture',
+    // The Node builtin and the core's own redaction helper, both named as bare
+    // globals here for the same reason the imports below are: the fixture runs
+    // `apply` without this module's import statements.
+    AsyncLocalStorage: require('node:async_hooks').AsyncLocalStorage,
+    safeMessage: (error) => String(error && error.message ? error.message : error),
     installPi: bridge => { installing.bridge = bridge },
     buildAdapter: rows => ({ adapter: {}, providerIds: rows.map(row => row.id) }),
     onLoad: async () => {}, onUnload: async () => {},
@@ -47,9 +62,16 @@ function indexFixture() {
     const effects = []
     const volatileListeners = []
     const state = { fail: null, adapters: 0, providers: 0, bridge: null, discovery: null, volatileListeners }
+    // The command registry the core registers into, so a test can run the
+    // handlers it installed and read what each run collected.
+    const commands = new Map()
+    state.commands = commands
     installing = state
     module.exports.apply({
-      settings, logger: { info() {}, warn() {}, error() {} }, get: () => undefined,
+      settings, logger: { info() {}, warn() {}, error() {} },
+      get: (name) => name === 'commands'
+        ? { register: (spec) => { commands.set(spec.name, spec); return () => commands.delete(spec.name) } }
+        : undefined,
       fiber,
       // `loader/volatile-update` is captured because DSH answers a plugin's own
       // volatile write by emitting it straight back at that plugin's fiber, and
@@ -77,6 +99,9 @@ function indexFixture() {
         registerModelDiscovery(_ns, callback) { state.discovery = callback; return () => {} },
       },
     }, config)
+    // The document peel is module-internal, so the case that pins it is handed
+    // the function the module actually runs.
+    state.unwrapVolatileDeep = context.unwrapVolatileDeep
     state.dispose = async () => { for (const dispose of effects.splice(0).reverse()) await dispose() }
     return state
   }
@@ -221,9 +246,12 @@ test('composer limits hidden-roster warmup to its startup window', async () => {
 })
 
 function panelFixture() {
-  const loopback = loadSource('src/loopback.ts')
+  // The drain-grace timers the shared body reader arms are Node's, so the
+  // sandbox that loads it has to carry them.
+  const timers = { setTimeout, clearTimeout }
+  const loopback = loadSource('src/loopback.ts', {}, timers)
   const { registerPanelRoutes, PANEL_BASE } = loadSource('src/web-panel.ts', { './loopback.ts': loopback,
-    './panel-route.ts': loadSource('src/panel-route.ts') })
+    './panel-route.ts': loadSource('src/panel-route.ts') }, timers)
   const ledger = { exact: new Map(), prefixes: new Map() }, calls = []
   let dispose
   let enabled = true
@@ -241,7 +269,10 @@ function panelFixture() {
       const req = new EventEmitter()
       Object.assign(req, { method: body === undefined ? 'GET' : 'POST', url: PANEL_BASE + suffix,
         headers: { host: 'localhost:3000', 'content-type': 'application/json', ...headers },
-        socket: { remoteAddress: address === null ? undefined : address } })
+        socket: { remoteAddress: address === null ? undefined : address },
+        // A refused body is drained through the socket's own `destroy`, which a
+        // real IncomingMessage always carries.
+        destroy() {} })
       const res = { status: undefined, body: '', writeHead(status) { this.status = status },
         end(chunk) { this.body = chunk === undefined ? '' : String(chunk) } }
       const pending = this.route(PANEL_BASE + suffix).handler(req, res)
@@ -330,6 +361,33 @@ test('a local host iframe keeps working when the HTTP server binds all IPv4 inte
   }
 })
 
+/**
+ * The panel's own body cap, driven through a real panel route.
+ *
+ * `readJsonBody` honouring 65 536 bytes is already proved against a fake
+ * request. What nothing proved is that the panel PASSES one: the cap is an
+ * argument at the `/invoke` call site, and a dropped argument reads as a
+ * gateway-sized limit on a route that serves the whole UI. A body one byte past
+ * the cap is answered as the 413 the reader raises, so a panel POST that
+ * outgrows it is the client's problem to fix rather than a 500 that reads as a
+ * bug in this plugin - or worse, a body that is buffered in full.
+ */
+test('a panel body one byte past its cap is refused as a 413', async () => {
+  const fixture = panelFixture()
+  try {
+    // The fixture encodes the body, so the padding is sized to leave the
+    // encoded form at exactly one byte past the panel's 64 KiB cap.
+    const res = await fixture.send('/invoke', { body: 'a'.repeat(65_535) })
+    assert.equal(res.status, 413, 'a panel body past the cap must be refused, not buffered')
+    assert.deepEqual(JSON.parse(res.body), { error: 'request body too large' })
+    assert.deepEqual(fixture.calls, [], 'a refused body must never reach the pool')
+    // Control: the same route with a body inside the cap still answers, so the
+    // 413 above is the cap and not the route refusing every POST.
+    const small = await fixture.send('/invoke', { body: { channel: 'xd.state' } })
+    assert.equal(small.status, 200)
+  } finally { fixture.dispose() }
+})
+
 const provider = model => ({ id: 'fixture-p', name: 'Fixture', baseUrl: 'http://127.0.0.1:1/v1', models: [{ id: model }] })
 
 test('discovery clears failed adapter or directory replacements and recovers on the next registration', async () => {
@@ -407,4 +465,147 @@ test('a settings write this plugin made is not read as an edit from the host', a
     echo()
     assert.equal(applied, 1, 'an edit made in the host settings UI must still reach the plugin')
   } finally { await state.dispose() }
+})
+
+test('a host settings edit that races a write is re-delivered, not dropped', async () => {
+  // The echo of this plugin's own write and an edit from the host's settings UI
+  // arrive through the same event, and the writer's window drops both. Every
+  // write expects exactly one echo, so a push count above the write count is a
+  // real edit: it is re-delivered once the writes settle. Dropping it left the
+  // plugin running on the old configuration until something else re-read the
+  // document, with nothing in the log saying so.
+  const activate = indexFixture()
+  let echo = () => {}
+  let duringMutate = () => {}
+  const settings = {
+    update: SettingsForms.prototype.update,
+    async mutate(_ns, ops) { duringMutate() },
+    async write() {},
+  }
+  const state = activate(settings)
+  try {
+    echo = () => { for (const listener of state.volatileListeners) listener() }
+    let applied = 0
+    state.bridge.onSettingsChanged(() => { applied += 1 })
+    // Two pushes land inside the one write: this plugin's own echo, and the
+    // host's own edit arriving beside it.
+    duringMutate = () => { echo(); echo() }
+    await state.bridge.setSettings({ showComposerPoints: true })
+    assert.equal(applied, 1,
+      'the extra push is a real edit and must reach the plugin once the write settles')
+    duringMutate = () => {}
+    echo()
+    assert.equal(applied, 2, 'and later edits keep landing')
+  } finally { await state.dispose() }
+})
+
+/**
+ * Every panel route guards the socket it answers on.
+ *
+ * The panel routes write the response themselves rather than going through a
+ * gateway, so they owe the guard `answerRequest` gives the gateways. A socket
+ * with no `error` listener turns a client that hung up mid-answer into an
+ * uncaught exception, and in a plugin subprocess that is a dead plugin:
+ * `/invoke` can run for the best part of twenty seconds before it answers
+ * anything at all, which is exactly the window a user closes the panel in.
+ *
+ * The assertion is on the listener itself, because the observable it stands
+ * for is a process that stays up.
+ */
+test('every panel route guards the response socket it writes to', () => {
+  const loopback = loadSource('src/loopback.ts')
+  const { registerPanelRoutes, PANEL_BASE } = loadSource('src/web-panel.ts', { './loopback.ts': loopback,
+    './panel-route.ts': loadSource('src/panel-route.ts') })
+  const ledger = { exact: new Map(), prefixes: new Map() }
+  let dispose
+  registerPanelRoutes({ webServer: { register: route => WebServer.prototype.register.call(ledger, route) } }, {
+    pluginRoot: root, logger: { warn() {} }, effect: callback => { dispose = callback() },
+    invoke: async () => ({}),
+  })
+  try {
+    for (const suffix of ['/panel', '/panel.css', '/panel.js', '/invoke']) {
+      const route = WebServer.prototype.match.call(ledger, PANEL_BASE + suffix)
+      assert.notEqual(route, undefined, `${suffix} must be mounted`)
+      const listened = []
+      const res = { status: undefined,
+        writeHead(status) { this.status = status },
+        end() {},
+        on(type, listener) { listened.push(type) } }
+      // The asset routes answer before any await, so a bare call reaches the
+      // guard; `/invoke` reads its body first and is driven the same way.
+      const req = new EventEmitter()
+      Object.assign(req, { method: suffix === '/invoke' ? 'POST' : 'GET', url: PANEL_BASE + suffix,
+        headers: { host: '127.0.0.1:3000', origin: 'http://127.0.0.1:3000' },
+        socket: { remoteAddress: '127.0.0.1' } })
+      void route.handler(req, res)
+      if (suffix === '/invoke') {
+        req.emit('data', Buffer.from(JSON.stringify({ channel: 'xd.state' })))
+        req.emit('end')
+      }
+      assert.ok(listened.includes('error'),
+        `${suffix} must install an error sink on the response it writes to`)
+    }
+  } finally { dispose() }
+})
+
+/**
+ * Two commands running at once each collect their own notes.
+ *
+ * The command service turns what a run notifies into that run's toast. A single
+ * shared buffer let the second run clear the first's lines, and the first then
+ * read the null the second's `finally` left behind - reported to the user as a
+ * command failure that named nothing they had done.
+ */
+test('two commands running at once each collect their own notes', async () => {
+  const activate = indexFixture()
+  const state = activate({}, {})
+  const gate = {}
+  gate.promise = new Promise((resolve) => { gate.open = resolve })
+  try {
+    await state.bridge.registerCommand({
+      id: 'fixture-slow', title: 'Slow',
+      run: async () => {
+        state.bridge.notify('slow-1', 'info')
+        await gate.promise
+        state.bridge.notify('slow-2', 'info')
+      },
+    })
+    await state.bridge.registerCommand({
+      id: 'fixture-fast', title: 'Fast',
+      run: async () => { state.bridge.notify('fast-1', 'info') },
+    })
+    const slow = state.commands.get('fixture-slow').handler()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const fast = await state.commands.get('fixture-fast').handler()
+    gate.open()
+    const slowResult = await slow
+    assert.equal(fast.kind, 'success')
+    assert.equal(fast.text, 'fast-1', 'the second run reports only its own line')
+    assert.equal(slowResult.kind, 'success', 'the first run must not be reported as a failure')
+    assert.equal(slowResult.text, 'slow-1\nslow-2', 'the first run keeps the lines it notified across its await')
+  } finally {
+    await state.dispose()
+  }
+})
+
+/**
+ * A settings document cannot plant the config's prototype.
+ *
+ * `__proto__` is an own key of a JSON-parsed document but assigns the prototype
+ * on a plain object, so a hand-edited settings file could shadow every field of
+ * the config this plugin reads: a planted `{enabled: false}` turned the master
+ * switch off without the document ever naming that field.
+ */
+test('a settings key named __proto__ cannot shadow the config', async () => {
+  const activate = indexFixture()
+  const state = activate({}, {})
+  try {
+    const planted = JSON.parse('{"__proto__":{"enabled":false},"sourceTrae":true}')
+    const config = state.unwrapVolatileDeep(planted)
+    assert.equal(config.enabled, undefined, 'the planted field must not shadow a real one')
+    assert.equal(config.sourceTrae, true, 'the rest of the document still reads')
+    assert.equal(Object.hasOwn(config, '__proto__'), false, 'the planted key is not carried either')
+  } finally {
+    await state.dispose()
+  }
 })

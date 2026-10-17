@@ -12,7 +12,7 @@
   const state = {
     sources: { workbuddy: true, trae: true, qoder: true },
     disabledRegions: [],
-    pluginVersion: '1.0.2',
+    pluginVersion: '1.0.3',
     unpublishedDeclarations: [],
     modelCap: 64,
     distribution: 'priority',

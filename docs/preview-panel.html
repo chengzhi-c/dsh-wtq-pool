@@ -40,10 +40,12 @@
           if (channel === "xd.checkinAll") {
             return Promise.resolve({ state: copy(data.state), claimed: 0 });
           }
-          if (channel === "xd.copyReport") return Promise.resolve({ ok: true });
-          if (channel === "shell.openExternal") {
-            window.open(payload.url, "_blank", "noopener,noreferrer");
-            return Promise.resolve();
+          if (channel === "xd.sourceCheckin") {
+            // One Trae/Qoder account's own claim. The panel announces from
+            // `result.outcome`, so the answer has to carry a real outcome: the
+            // shared state fallback below left it undefined, and every row read
+            // that as "already collected today".
+            return Promise.resolve({ state: copy(data.state), result: { outcome: "claimed" } });
           }
           // Every other channel is a write, and a write answers with the whole
           // status document - which is what the panel redraws from.

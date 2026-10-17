@@ -1,4 +1,4 @@
-﻿/**
+/**
  * dsh-wtq-pool — the DeepSeek Harness entry.
  *
  * This file owns everything host-specific: the Cordis activation, the settings
@@ -13,6 +13,7 @@ import * as path from 'node:path'
 import * as os from 'node:os'
 import * as fs from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
+import { AsyncLocalStorage } from 'node:async_hooks'
 
 import * as piAi from '@earendil-works/pi-ai'
 import { createProvider } from '@earendil-works/pi-ai'
@@ -25,9 +26,10 @@ import z from '@deepseek-ai/schemastery'
 import type { SettingsPathOp } from '@deepseek-ai/dsh-settings'
 
 import { installPi, startRegisteredService, stopRegisteredService, type CommandSpec, type ProviderDescriptor } from './pi-compat'
-import { registerPanelRoutes } from './web-panel.ts'
+import { registerPanelRoutes, type WebServerSeam } from './web-panel.ts'
 import { ROW_ID } from './ids.ts'
-import { onLoad, onUnload, onPanelInvoke } from './host.ts'
+import { safeMessage } from './loopback'
+import { onLoad, onUnload, onPanelInvoke, CONSERVATIVE_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from './host.ts'
 
 export { onLoad, onUnload, onPanelInvoke }
 
@@ -135,6 +137,28 @@ export interface Config {
 }
 
 /**
+ * Whether the installed schemastery can mark a field volatile.
+ *
+ * `Config` is built at module evaluation, before any `ctx` exists to log
+ * through, so the finding is recorded here and reported by the activation's
+ * first logger-reaching call rather than dropped.
+ */
+let volatileSupported = true
+
+/** Whether the finding above has already been named, so it is named once. */
+let degradationReported = false
+
+/**
+ * Which activation currently owns the module-global state the core keeps.
+ *
+ * A re-provided service re-runs `apply()`, and the core's state (runtimes,
+ * gateways, settings) is module-global by design. The newest activation owns
+ * it, so an older activation's teardown must stand down rather than close the
+ * gateways the newer one just brought up.
+ */
+let activationToken = 0
+
+/**
  * Wrap one schema in `volatile()` when the installed schemastery has it.
  *
  * `volatile()` landed in schemastery 3.18.3. Hand-writing `meta.volatile` on an
@@ -143,7 +167,18 @@ export interface Config {
  */
 function asVolatile<S>(schema: S): S {
   const candidate = schema as unknown as { volatile?: () => S }
-  return typeof candidate.volatile === 'function' ? candidate.volatile() : schema
+  if (typeof candidate.volatile !== 'function') {
+    volatileSupported = false
+    return schema
+  }
+  return candidate.volatile()
+}
+
+/** Report the schema degradation once, when a logger is finally in reach. */
+function reportSchemaDegradation(logger: { warn(...args: unknown[]): void }): void {
+  if (volatileSupported || degradationReported) return
+  degradationReported = true
+  logger.warn('dsh-wtq-pool: the installed schemastery has no volatile(), so no settings field can be marked volatile: the settings card cannot render its section and every settings write this plugin makes is refused')
 }
 
 export const Config: z<Config> = z.object({
@@ -189,7 +224,13 @@ function unwrapVolatileDeep<T>(value: T): T {
   if (Array.isArray(peeled)) return peeled.map((entry) => unwrapVolatileDeep(entry)) as T
   if (peeled !== null && typeof peeled === 'object') {
     const out: Record<string, unknown> = {}
-    for (const [key, entry] of Object.entries(peeled)) out[key] = unwrapVolatileDeep(entry)
+    for (const [key, entry] of Object.entries(peeled)) {
+      // `__proto__` is an own key of a JSON-parsed document but assigns the
+      // prototype on a plain object, so a hand-edited settings file could plant
+      // one and shadow every field of the config this returns.
+      if (key === '__proto__') continue
+      out[key] = unwrapVolatileDeep(entry)
+    }
     return out as T
   }
   return peeled
@@ -253,11 +294,12 @@ interface ClientContext {
   logger: { info?(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void }
   effect(callback: () => unknown, label?: string): unknown
   inject(names: string[], callback: (scoped: ClientContext) => unknown): unknown
-  on(name: string, listener: (...args: unknown[]) => void): (() => void) | undefined
-  off?(name: string, listener: (...args: unknown[]) => void): void
+  on(name: string, listener: (...args: unknown[]) => void): () => void
   get(name: string): unknown
   emit(name: string, ...args: unknown[]): void
   fiber?: { entry?: { id?: unknown, options?: { id?: string } } }
+  /** Present once `webServer` is injected; the panel routes mount into it. */
+  webServer?: WebServerSeam
 }
 
 /** The namespace the host actually serves this plugin's settings under. */
@@ -311,8 +353,8 @@ function toPiModel(
     baseUrl,
     input: row.supportsImages === true ? ['text', 'image'] : ['text'],
     cost: NO_COST,
-    contextWindow: typeof row.contextWindow === 'number' ? row.contextWindow : 128_000,
-    maxTokens: typeof row.maxTokens === 'number' ? row.maxTokens : 32_000,
+    contextWindow: typeof row.contextWindow === 'number' ? row.contextWindow : CONSERVATIVE_CONTEXT_WINDOW,
+    maxTokens: typeof row.maxTokens === 'number' ? row.maxTokens : DEFAULT_MAX_TOKENS,
     reasoning: map !== undefined,
     ...map === undefined ? {} : { thinkingLevelMap: map },
     compat: { supportsReasoningEffort: map !== undefined },
@@ -355,7 +397,7 @@ function promptText(message: { content?: unknown; sections?: Record<string, unkn
  * which is exactly what the fold undoes. On a generation that does fold, the
  * host's transcript is already the expected shape and passes through untouched.
  */
-function contextForDelegate(context: unknown): unknown {
+function contextForDelegate(context: unknown, log?: { warn(...args: unknown[]): void }): unknown {
   // A generation that folds reads its own transcript: the host's request is
   // already the shape it expects, and re-shaping it would drop the prompt.
   if (PI_AI_FOLDS_TRANSCRIPT) return context
@@ -366,22 +408,31 @@ function contextForDelegate(context: unknown): unknown {
     | undefined
   if (leading?.role !== 'system') return context
   const prompt = promptText(leading)
-  const tools = Array.isArray(leading.toolsAdded) ? leading.toolsAdded : undefined
+  // `toolsAdded` is the fold's own field, so a transcript without it carried no
+  // tools at all: an empty array says that, while `undefined` would leave the
+  // delegate guessing whether it was handed any.
+  const tools = Array.isArray(leading.toolsAdded) ? leading.toolsAdded : []
+  if (prompt.length === 0) {
+    // The folded message carried no text, so unfolding it removes the system
+    // prompt outright: the request then runs with none, which is worth a word
+    // rather than a silent difference from the host's own folded form.
+    log?.warn('dsh-wtq-pool: the folded system message carried no prompt text, so this request is sent without one')
+  }
   return {
     ...(prompt.length > 0 ? { systemPrompt: prompt } : {}),
-    ...(tools === undefined ? {} : { tools }),
+    tools,
     messages: messages.slice(1),
   }
 }
 
 /** Wrap one API implementation so every request arrives in the shape it reads. */
-function withDelegateShape(api: ProviderStreams): ProviderStreams {
+function withDelegateShape(api: ProviderStreams, log?: { warn(...args: unknown[]): void }): ProviderStreams {
   return {
     ...api,
     stream: (model, context, options) =>
-      api.stream(model, contextForDelegate(context) as TranscriptContext, options),
+      api.stream(model, contextForDelegate(context, log) as TranscriptContext, options),
     streamSimple: (model, context, options) =>
-      api.streamSimple(model, contextForDelegate(context) as TranscriptContext, options),
+      api.streamSimple(model, contextForDelegate(context, log) as TranscriptContext, options),
   }
 }
 
@@ -397,6 +448,21 @@ function buildAdapter(descriptors: ProviderDescriptor[], ctx: ClientContext): {
   profiles: Map<string, ResolvedPiAiProviderProfile>
   providerIds: string[]
 } {
+  // The generation this plugin is written against, asserted rather than assumed.
+  // `normalizeContext` (see {@link PI_AI_FOLDS_TRANSCRIPT}) is the first export
+  // that says which one the host resolved; the adapter is the second, and the
+  // same hoisted linker picks both. A `dsh-llm-pi-ai` built against another
+  // pi-ai hands these profiles a transcript that copy never learned to read, and
+  // the reshaping below would then drop the prompt and every tool without a
+  // word - so the mismatch is named here, on the pass that would serve it,
+  // instead of being absorbed request by request.
+  const adapterPrototype = PiAiAdapter.prototype
+  if (typeof PiAiAdapter !== 'function'
+    || typeof adapterPrototype.resolveModel !== 'function'
+    || typeof adapterPrototype.prepareCall !== 'function'
+    || typeof adapterPrototype.stream !== 'function') {
+    ctx.logger.error('dsh-wtq-pool: the resolved @deepseek-ai/dsh-llm-pi-ai is not the generation this plugin is written against (its adapter is missing members this plugin binds), so every request would be reshaped for a transcript that copy never learned to read')
+  }
   const profiles = new Map<string, ResolvedPiAiProviderProfile>()
   const providerIds: string[] = []
   for (const row of descriptors) {
@@ -417,7 +483,7 @@ function buildAdapter(descriptors: ProviderDescriptor[], ctx: ClientContext): {
         },
       },
       models,
-      api: withDelegateShape(openAICompletionsApi()),
+      api: withDelegateShape(openAICompletionsApi(), ctx.logger),
     })
     const provider: Provider = { ...base, getModels: () => models }
     profiles.set(row.id, {
@@ -431,7 +497,6 @@ function buildAdapter(descriptors: ProviderDescriptor[], ctx: ClientContext): {
       piProvider: provider,
     })
   }
-  const attachments = ctx.get('attachments') as AttachmentStore | undefined
   const adapter = new PiAiAdapter({
     profiles: () => profiles,
     auth: INERT_AUTH,
@@ -439,7 +504,10 @@ function buildAdapter(descriptors: ProviderDescriptor[], ctx: ClientContext): {
     // the loopback bind plus the Host/Origin check, and the upstream token is
     // resolved per request from the account pool.
     resolveApiKey: async () => LOOPBACK_BEARER,
-    resolveAttachments: () => attachments,
+    // Read per call, not captured here: the contract resolves the store at
+    // request time, and the harness can re-provide `attachments` between the
+    // build and the first request that needs it.
+    resolveAttachments: () => ctx.get('attachments') as AttachmentStore | undefined,
     resolveImageAccess: (store, ref) =>
       resolveImageAttachmentAccess(store, (hostPath) => {
         const fsService = ctx.get('fs') as { processPathFromHostPath?(p: string): string } | undefined
@@ -500,73 +568,123 @@ function registrationFingerprint(descriptors: ProviderDescriptor[]): string {
 export function apply(ctx: ClientContext, config: Config = {}): void {
   const current = (): Config => unwrapVolatileDeep(config)
   const settingsNamespace = settingsNamespaceOf(ctx)
-  const notes: string[] = []
-  const released: Array<() => void> = []
+  // Per invocation: the notes a command's own toasts carry. A single shared
+  // buffer let two commands running at once clear each other's output, and the
+  // store follows the command's own async context, so a notification the core
+  // raises from a background pass is logged without joining a toast.
+  const commandNotes = new AsyncLocalStorage<string[]>()
   const commands = new Map<string, () => void>()
-  const unsubscribes: Array<() => void> = []
+  const settingsListeners = new Map<(next: Record<string, unknown>) => void, () => void>()
+  // The handlers currently subscribed, so a push dropped while a write was in
+  // flight can be re-delivered to all of them once the writes settle.
+  const settingsHandlers = new Set<(next: Record<string, unknown>) => void>()
+  // This activation's place in the module-global state the core keeps. The
+  // newest activation owns it; an older one's teardown must not run.
+  const token = (activationToken += 1)
 
   let lastRows: ProviderDescriptor[] = []
   let fingerprint = ''
   let disposeRegistration: (() => void) | undefined
+  let disposeDiscovery: (() => void) | undefined
   let stopped = false
 
   const settingsService = ctx.settings as SettingsService
 
-  /**
-   * How many of this plugin's own settings writes are in flight.
-   *
-   * DSH answers a plugin's volatile write by emitting `loader/volatile-update`
-   * back at the writer's own fiber, and the loader delivers it synchronously
-   * inside `mutate`. So a save this plugin made arrives here looking exactly
-   * like an edit from the host's settings UI, and treating it as one cleared the
-   * whole credit cache: every account switch blanked the readout to `—` until a
-   * warm-up poll refilled it. PI's host never echoes a plugin's own write, which
-   * is why only this build showed it. The writer is the one place that can tell
-   * the two apart, so the echo is dropped here instead of guessed at downstream.
-   */
-  let writesInFlight = 0
+/**
+ * How many of this plugin's own settings writes are in flight, and how many
+ * pushes arrived while they were.
+ *
+ * DSH answers a plugin's volatile write by emitting `loader/volatile-update`
+ * back at the writer's own fiber, and the loader delivers it synchronously
+ * inside `mutate`. So a save this plugin made arrives here looking exactly
+ * like an edit from the host's settings UI, and treating it as one cleared the
+ * whole credit cache: every account switch blanked the readout to `—` until a
+ * warm-up poll refilled it. PI's host never echoes a plugin's own write, which
+ * is why only this build showed it. The writer is the one place that can tell
+ * the two apart, so the echo is dropped here instead of guessed at downstream.
+ *
+ * The drop has a cost the plain counter did not pay back: an edit the host's
+ * own settings UI made while a write was in flight was dropped with the echo
+ * and never re-delivered, so the plugin ran on the old configuration until
+ * something else re-read the document. Every write expects exactly one echo,
+ * so a push count above the write count means a real edit raced the write.
+ * Those are re-delivered once the writes have settled, and the echo is not.
+ */
+let writesInFlight = 0
+let writesStarted = 0
+let droppedPushes = 0
 
-  /** Replace patched top-level fields without merging their dictionaries. */
-  const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
-    const mutate = settingsService?.mutate
-    if (mutate === undefined) throw new Error('this host exposes no settings mutate()')
-    writesInFlight += 1
-    try {
-      await mutate.call(settingsService, settingsNamespace,
-        Object.entries(patch).map(([key, value]) => ({ op: 'set', path: [key], value })))
-    } finally {
-      writesInFlight -= 1
+/** Replace patched top-level fields without merging their dictionaries. */
+const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
+  const mutate = settingsService?.mutate
+  if (mutate === undefined) throw new Error('this host exposes no settings mutate()')
+  writesStarted += 1
+  writesInFlight += 1
+  try {
+    await mutate.call(settingsService, settingsNamespace,
+      Object.entries(patch).map(([key, value]) => ({ op: 'set', path: [key], value })))
+  } finally {
+    writesInFlight -= 1
+    if (writesInFlight === 0) {
+      if (droppedPushes > writesStarted) {
+        // More pushes than this plugin's own echoes: at least one was a real
+        // edit from the host's settings UI, and the live document already
+        // carries it. Delivered to every subscriber, once.
+        const handlers = Array.from(settingsHandlers)
+        droppedPushes = 0
+        writesStarted = 0
+        for (const handler of handlers) handler(current() as Record<string, unknown>)
+      } else {
+        droppedPushes = 0
+        writesStarted = 0
+      }
     }
   }
+}
 
   installPi({
     getSettings: () => current() as Record<string, unknown>,
     setSettings: writeSettings,
     getDataPath: async () => {
+      // Reported here rather than where it is found: `Config` is built at module
+      // evaluation, before any `ctx` exists, and this is the first bridge call
+      // `onLoad` makes that can carry a logger.
+      reportSchemaDegradation(ctx.logger)
       const dir = path.join(dshHome(), 'dsh-wtq-pool')
       await fs.mkdir(dir, { recursive: true })
       return dir
     },
     onSettingsChanged: (handler) => {
+      settingsHandlers.add(handler)
       const listener = (): void => {
-        if (writesInFlight > 0) return
+        // The echo of this plugin's own write, or an edit that raced it: the
+        // writer's accounting tells the two apart once the writes settle.
+        if (writesInFlight > 0) {
+          droppedPushes += 1
+          return
+        }
         handler(current() as Record<string, unknown>)
       }
-      const dispose = ctx.on('loader/volatile-update', listener)
-      if (typeof dispose === 'function') unsubscribes.push(dispose)
-      else unsubscribes.push(() => ctx.off?.('loader/volatile-update', listener))
+      settingsListeners.set(handler, ctx.on('loader/volatile-update', listener))
     },
-    offSettingsChanged: () => {
-      for (const dispose of unsubscribes.splice(0)) dispose()
+    offSettingsChanged: (handler) => {
+      settingsHandlers.delete(handler)
+      settingsListeners.get(handler)?.()
+      settingsListeners.delete(handler)
     },
-    notify: (text) => {
-      notes.push(text)
-      ctx.logger.info?.(`dsh-wtq-pool: ${text}`)
+    notify: (text, kind) => {
+      commandNotes.getStore()?.push(text)
+      const line = `dsh-wtq-pool: ${text}`
+      // The severity is forwarded, not flattened: the core sends a `warn` toast
+      // for a failed pass, and logging that at info buried the one line that
+      // says something went wrong.
+      if (kind === 'warn') ctx.logger.warn?.(line)
+      else ctx.logger.info?.(line)
     },
     // The card lives on the Plugins page; say where instead of pretending to
     // focus a window this host does not give the plugin.
     openPanel: () => {
-      notes.push('面板在 插件页 → WTQ Pool 卡片')
+      commandNotes.getStore()?.push('面板在 插件页 → 「账号池」卡片')
     },
     registerCommand: async (spec: CommandSpec) => {
       // Through `get`, not the property: `commands` is not one of this plugin's
@@ -574,18 +692,23 @@ export function apply(ctx: ClientContext, config: Config = {}): void {
       const service = ctx.get('commands') as CommandsService | undefined
       if (service === undefined) return
       const commandName = spec.id.replace(/[^a-z0-9_-]+/gi, '-').toLowerCase()
-      notes.length = 0
       const dispose = service.register({
         name: commandName,
         description: spec.title,
         handler: async (): Promise<RegisterCommandResult> => {
-          notes.length = 0
-          try {
-            await spec.run()
-            return { kind: 'success', text: notes.join('\n') || spec.title }
-          } catch (error: unknown) {
-            return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
-          }
+          // A buffer of this run's own, scoped to this run's async context: two
+          // commands at once used to share one and clear each other's lines, so
+          // the toast named the wrong pass.
+          const notes: string[] = []
+          return commandNotes.run(notes, async () => {
+            try {
+              await spec.run()
+              return { kind: 'success', text: notes.join('\n') || spec.title }
+            } catch (error: unknown) {
+              // Redacted like every other message this plugin hands out.
+              return { kind: 'error', text: safeMessage(error) }
+            }
+          })
         },
       })
       if (typeof dispose === 'function') commands.set(spec.id, dispose)
@@ -674,25 +797,48 @@ export function apply(ctx: ClientContext, config: Config = {}): void {
   // Registration is answered from the last declaration, so the discovery hook
   // can afford to be a plain closure. It is bound to the activation effect: an
   // unloaded plugin must not keep answering a namespace it no longer serves.
-  ctx.effect(() => ctx.llm.registerModelDiscovery(settingsNamespace, async (request: { provider?: string }) => {
-    const wanted = request?.provider
-    const rows: Array<{ id: string; name: string; contextWindow?: number; maxTokens?: number; inputModalities?: string[] }> = []
-    for (const row of lastRows) {
-      if (wanted !== undefined && row.id !== wanted) continue
-      for (const model of row.models) {
-        rows.push({
-          id: model.id,
-          name: typeof model.name === 'string' ? model.name : model.id,
-          ...typeof model.contextWindow === 'number' ? { contextWindow: model.contextWindow } : {},
-          ...typeof model.maxTokens === 'number' ? { maxTokens: model.maxTokens } : {},
-          inputModalities: model.supportsImages === true ? ['text', 'image'] : ['text'],
-        })
-      }
+  ctx.effect(() => {
+    // A namespace that is still held is refused rather than replaced, and a
+    // re-provided `llm` re-runs this effect while this activation's first
+    // registration is live: release it before asking for the next one.
+    disposeDiscovery?.()
+    disposeDiscovery = undefined
+    try {
+      disposeDiscovery = ctx.llm.registerModelDiscovery(settingsNamespace, async (request: { provider?: string }) => {
+        const wanted = request?.provider
+        const rows: Array<{ id: string; name: string; contextWindow?: number; maxTokens?: number; inputModalities?: string[] }> = []
+        for (const row of lastRows) {
+          if (wanted !== undefined && row.id !== wanted) continue
+          for (const model of row.models) {
+            rows.push({
+              id: model.id,
+              name: typeof model.name === 'string' ? model.name : model.id,
+              ...typeof model.contextWindow === 'number' ? { contextWindow: model.contextWindow } : {},
+              ...typeof model.maxTokens === 'number' ? { maxTokens: model.maxTokens } : {},
+              inputModalities: model.supportsImages === true ? ['text', 'image'] : ['text'],
+            })
+          }
+        }
+        return rows
+      })
+    } catch (error: unknown) {
+      // The host refuses a namespace a previous activation still holds - its
+      // disposer has not run yet - and that throw would otherwise escape
+      // `apply()` and take the fiber with it. The rows keep being served by the
+      // directory registration above, so what is lost is the picker's live
+      // discovery, not the providers.
+      ctx.logger.error('dsh-wtq-pool: model discovery was refused', error)
     }
-    return rows
-  }), 'dsh-wtq-pool: model discovery')
+    return () => {
+      disposeDiscovery?.()
+      disposeDiscovery = undefined
+    }
+  }, 'dsh-wtq-pool: model discovery')
   ctx.inject(['webServer'], (webCtx) => {
-    registerPanelRoutes(webCtx as never, {
+    // The seam is checked rather than cast: a host without the web server has
+    // no panel to mount, and `as never` used to hide that from the compiler.
+    if (webCtx.webServer === undefined) return
+    registerPanelRoutes({ webServer: webCtx.webServer }, {
       pluginRoot: PLUGIN_ROOT,
       invoke: (channel, payload) => onPanelInvoke(channel, payload),
       // On the child fiber, not the plugin's own: a re-provided `webServer`
@@ -706,16 +852,24 @@ export function apply(ctx: ClientContext, config: Config = {}): void {
   ctx.effect(() => async () => {
     stopped = true
     lastRows = []
+    // This activation's own state is its to release, whichever activation is
+    // newest: its rows, its commands, its listeners and its registrations.
+    for (const dispose of commands.values()) dispose()
+    commands.clear()
+    for (const dispose of settingsListeners.values()) dispose()
+    settingsListeners.clear()
+    disposeRegistration?.()
+    disposeRegistration = undefined
+    // The core keeps its state (gateways, settings, the background service)
+    // module-global, so it belongs to the newest activation. An older
+    // teardown that stopped the service would close the gateways that one
+    // just brought up; the newest activation's own teardown still runs.
+    if (token !== activationToken) return
     // Awaited, not fired and forgotten: the engine keeps its gateways in
     // module-global maps, so a reload that repopulates them while this teardown
     // is still closing the old ones would have the old continuation clear the
     // new activation's entries.
     await stopRegisteredService()
-    for (const dispose of commands.values()) dispose()
-    commands.clear()
-    for (const dispose of unsubscribes.splice(0)) dispose()
-    disposeRegistration?.()
-    disposeRegistration = undefined
     await onUnload()
   })
 

@@ -26,7 +26,7 @@ export const QODER_GATEWAYS: Readonly<Record<QoderRegion, string>> = {
 }
 
 /** Public key the gateway expects the per-request AES key to be wrapped with. */
-export const QODER_RSA_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+const QODER_RSA_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
 4k6Pz1EaDicBMpdpxKduSZu5OANqUq8er4GM95omAGIOPOh+Nx0spthYA2BqGz+l
 6HRkPJ7S236FZz73In/KVuLnwI8JJ2CbuJap8kvheCCZpmAWpb/cPx/3Vr/J6I17
@@ -34,25 +34,26 @@ XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----`
 
 /** COSY protocol revision the gateway is currently serving. */
-export const COSY_VERSION = '1.1.38'
+const COSY_VERSION = '1.1.38'
 /** Client type magic the gateway expects from a CLI client. */
-export const CLIENT_TYPE = '5'
+const CLIENT_TYPE = '5'
 /** Machine type magic the gateway expects. */
-export const MACHINE_TYPE = '5'
+const MACHINE_TYPE = '5'
 /** Data-policy value a non-consenting client sends. */
-export const DATA_POLICY = 'disagree'
+const DATA_POLICY = 'disagree'
 /** Login protocol revision. */
-export const LOGIN_VERSION = 'v2'
+const LOGIN_VERSION = 'v2'
 
 /** Permuted base64 alphabet used when `Encode=1` is in effect. */
-export const CUSTOM_ALPHABET = '_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!'
+const CUSTOM_ALPHABET = '_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!'
 /** Standard base64 alphabet, positionally mapped onto the custom one. */
-export const STD_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+const STD_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 
 /**
- * Positional translation table from standard to custom alphabet, exactly 256
- * entries so a lookup can never read out of bounds. `=` becomes `$`, which is
- * why the encoded body is not valid base64 and must not be decoded as such.
+ * Positional translation table from standard to custom alphabet. Every one of
+ * the 256 byte values is present, defaulting to itself, so a lookup can never
+ * read out of bounds or need a fallback. `=` becomes `$`, which is why the
+ * encoded body is not valid base64 and must not be decoded as such.
  */
 const ENCODE_TABLE = (() => {
   const table = new Uint8Array(256)
@@ -64,7 +65,14 @@ const ENCODE_TABLE = (() => {
   return table
 })()
 
-/** The translation for one byte; identity for a byte the table does not name. */
+/**
+ * The translation for one byte.
+ *
+ * The `?? byte` is a type-level requirement, not a runtime one:
+ * `noUncheckedIndexedAccess` types every indexed read as possibly `undefined`,
+ * and every one of the 256 values is present - so the fallback is unreachable
+ * and exists only to satisfy the compiler.
+ */
 function encodeByteAt(byte: number): number {
   return ENCODE_TABLE[byte] ?? byte
 }
@@ -91,7 +99,7 @@ export function encodeBody(plaintext: Buffer | string): Buffer {
  * The path the signature covers: the request path with a leading `/algo`
  * stripped, because the gateway routes that prefix away before verifying.
  */
-export function signaturePath(url: string): string {
+function signaturePath(url: string): string {
   let path = new URL(url).pathname
   if (path.startsWith('/algo')) path = path.slice('/algo'.length)
   return path
@@ -102,7 +110,7 @@ export function signaturePath(url: string): string {
  * both regions (the gateway does not gate on it), so it names the real host
  * instead of announcing every machine as `x86_64_linux`.
  */
-export function qoderMachineOs(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
+function qoderMachineOs(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
   if (platform === 'win32') return arch === 'arm64' ? 'aarch64_windows' : 'x86_64_windows'
   if (platform === 'darwin') return arch === 'arm64' ? 'aarch64_darwin' : 'x86_64_darwin'
   return arch === 'arm64' ? 'aarch64_linux' : 'x86_64_linux'

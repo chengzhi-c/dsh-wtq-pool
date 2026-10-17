@@ -6,7 +6,7 @@
  * Nothing writes to the Qoder apps' files.
  */
 import { spawn } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { QoderRegion, QoderStorageCandidate } from './qoder-discovery'
 import { decryptQoderOscrypt, qoderStorageCandidates } from './qoder-discovery'
@@ -18,9 +18,7 @@ export interface QoderCredential {
   name: string
   email: string
   token: string
-  refreshToken: string
   expiresAtMs: number
-  refreshTokenExpiresAtMs: number
   /** Only present when the app persists one; never fabricated. */
   machineID?: string
 }
@@ -34,6 +32,15 @@ export interface QoderCredentialFailure {
 
 /** Machine-id file names, newest first (0.3.x renamed `machineid`). */
 const MACHINE_ID_NAMES: readonly string[] = ['auth.machine-id', 'machineid', 'machineId']
+
+/**
+ * Unwrapped OSCrypt keys, keyed on the `Local State` path they came from.
+ *
+ * Unwrapping costs a PowerShell spawn, so the result is kept for the life of
+ * the process and invalidated by the file's mtime: a desktop re-login that
+ * rotates the key changes the file, an ordinary chat request changes nothing.
+ */
+const oscryptKeyCache = new Map<string, { mtimeMs: number; key: Buffer }>()
 
 /** The OSCrypt blob length prefix Chromium writes before the DPAPI payload. */
 const DPAPI_PREFIX = 'DPAPI'
@@ -132,6 +139,18 @@ export async function unwrapQoderOscryptKey(
     }
     const payload = blob.subarray(DPAPI_PREFIX.length)
     if (payload.length === 0) throw new QoderKeyError('invalid', 'Qoder encrypted_key is empty')
+    // The unwrapped key is process-stable, and unwrapping it costs a PowerShell
+    // spawn (a C# compile plus DPAPI) on every call. Cached per Local State
+    // file, keyed on its mtime, so a desktop re-login that rotates the key is
+    // still picked up while an ordinary chat request pays nothing. Every hand
+    // out is a copy: the reader zeroes the buffer it was given, and zeroing the
+    // cached one left every later read decrypting with an empty key.
+    let mtimeMs = 0
+    try {
+      mtimeMs = (await stat(localStatePath)).mtimeMs
+    } catch { /* an unstatable file is treated as stale */ }
+    const cached = oscryptKeyCache.get(localStatePath)
+    if (cached !== undefined && cached.mtimeMs === mtimeMs) return Buffer.from(cached.key)
     const exe = powershellPath(env)
     if (exe === undefined) throw new QoderKeyError('unavailable', 'SystemRoot is not set, cannot locate PowerShell')
     // `spawn` rather than `execFile`, because the blob has to go in on stdin and
@@ -159,6 +178,7 @@ export async function unwrapQoderOscryptKey(
     })
     const key = Buffer.from(stdout.trim(), 'base64')
     if (key.length !== 32) throw new QoderKeyError('invalid', 'DPAPI unwrap did not yield a 32-byte key')
+    oscryptKeyCache.set(localStatePath, { mtimeMs, key: Buffer.from(key) })
     return key
   } finally {
     blob.fill(0)
@@ -177,9 +197,7 @@ export function parseQoderAuthSession(plaintext: string): {
   name: string
   email: string
   token: string
-  refreshToken: string
   expiresAtMs: number
-  refreshTokenExpiresAtMs: number
 } | undefined {
   let session: unknown
   try { session = JSON.parse(plaintext) as unknown } catch { return undefined }
@@ -193,18 +211,30 @@ export function parseQoderAuthSession(plaintext: string): {
     : {}
   const userID = typeof user['id'] === 'string' ? user['id'] : ''
   if (userID === '') return undefined
+  // Seconds and milliseconds are both in the wild, and a numeric expiry that
+  // fails to parse used to read as 0, which every caller treats as "never
+  // expires": a dead token then stayed in rotation until the upstream 401'd.
   const parsedExpiry = (value: unknown): number => {
-    const parsed = Date.parse(String(value))
-    return Number.isFinite(parsed) ? parsed : 0
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return value > 1e12 ? value : value * 1000
+    }
+    if (typeof value === 'string' && value.trim() !== '') {
+      const numeric = Number(value)
+      // A numeric spelling that is not positive is "no expiry recorded", not a
+      // date: `Date.parse("0")` reads as the year 2000, which dropped a live
+      // sign-in out of rotation for looking long dead.
+      if (Number.isFinite(numeric)) return numeric > 0 ? (numeric > 1e12 ? numeric : numeric * 1000) : 0
+      const parsed = Date.parse(value)
+      if (Number.isFinite(parsed) && parsed > 0) return parsed
+    }
+    return 0
   }
   return {
     userID,
     name: typeof user['name'] === 'string' ? user['name'] : '',
     email: typeof user['email'] === 'string' ? user['email'] : '',
     token,
-    refreshToken: typeof record['refreshToken'] === 'string' ? record['refreshToken'] : '',
     expiresAtMs: parsedExpiry(record['expiresAt']),
-    refreshTokenExpiresAtMs: parsedExpiry(record['refreshTokenExpiresAt']),
   }
 }
 
@@ -275,11 +305,47 @@ export async function readQoderCredential(
 }
 
 /**
+ * How long a discovery answer is reused.
+ *
+ * The gateways read credentials per request so a desktop re-login is picked up
+ * without a rescan, but the read itself walks the app directories and, per
+ * directory, used to spawn PowerShell to unwrap the OSCrypt key. The key is
+ * now cached on the file's mtime; this TTL keeps the file walk itself off the
+ * chat path. `resetQoderCredentialCache()` clears it for a rescan.
+ */
+const DISCOVERY_TTL_MS = 30_000
+let discoveryCache: { at: number; value: { credentials: QoderCredential[]; failures: QoderCredentialFailure[] } } | undefined
+
+/** Drop the cached discovery answer, e.g. when the user asks for a rescan. */
+export function resetQoderCredentialCache(): void {
+  discoveryCache = undefined
+}
+
+/**
  * Every Qoder sign-in on this machine. One app directory that is missing or
  * unreadable never hides the others; failures carry reasons, never tokens.
  */
 export async function discoverQoderCredentials(
-  candidates: readonly QoderStorageCandidate[] = qoderStorageCandidates(),
+  candidates?: readonly QoderStorageCandidate[],
+): Promise<{ credentials: QoderCredential[]; failures: QoderCredentialFailure[] }> {
+  // Only the default candidate set is cached: a caller that names its own
+  // files is asking about those files, not about the machine.
+  const cacheable = candidates === undefined
+  if (cacheable && discoveryCache !== undefined && Date.now() - discoveryCache.at < DISCOVERY_TTL_MS) {
+    const cached = discoveryCache.value
+    return { credentials: [...cached.credentials], failures: [...cached.failures] }
+  }
+  const value = await readQoderCredentials(candidates ?? qoderStorageCandidates())
+  // An empty answer is not cached: the expensive half of this read only runs
+  // when the app's own files are there, so a machine with no sign-in retries
+  // for free, while a read that failed under load retries on the next request
+  // instead of sticking for the whole TTL.
+  if (cacheable && value.credentials.length > 0) discoveryCache = { at: Date.now(), value }
+  return { credentials: [...value.credentials], failures: [...value.failures] }
+}
+
+async function readQoderCredentials(
+  candidates: readonly QoderStorageCandidate[],
 ): Promise<{ credentials: QoderCredential[]; failures: QoderCredentialFailure[] }> {
   const byAppDir = new Map<string, QoderStorageCandidate[]>()
   for (const candidate of candidates) {

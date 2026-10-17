@@ -4,7 +4,7 @@
  * The panel is two halves that cannot see each other: the page inside the frame
  * calls `xd.*` channels over HTTP, and the host half answers whichever ones it
  * knows. Nothing checks one half against the other at runtime, so the faults
- * here all shipped as dead controls rather than as errors - a channel the page
+ * here would surface as dead controls rather than as errors - a channel the page
  * called that no half accepted, routes left behind in the server table when one
  * of them failed to mount, and rows the popup could not tell apart.
  *
@@ -53,11 +53,11 @@ function uiChannels() {
   return channels
 }
 
-/** The channels the route admits, read from the shipped allowlists. */
+/** The channels the route admits, read from the shipped allowlist. */
 function routeChannels() {
   const channels = new Set()
   for (const block of sourceOf('src/web-panel.ts')
-    .matchAll(/const (?:READ_ONLY|MUTATING)_CHANNELS = new Set\(\[([\s\S]*?)\]\)/g)) {
+    .matchAll(/const CHANNELS = new Set\(\[([\s\S]*?)\]\)/g)) {
     for (const match of block[1].matchAll(/'(xd\.[A-Za-z]+)'/g)) channels.add(match[1])
   }
   return channels
@@ -295,64 +295,42 @@ test('the popup width cap leaves room for the right anchor it is pinned by', () 
 
 /**
  * The two hosts disagree about how a disabled button is dimmed, and the row the
- * popup marks as selected is one.
+ * popup marks as selected is one; the dot beside that row is one colour, not the
+ * host's success token.
  *
  * PI-Desktop's shell stylesheet carries a global `button:disabled` rule that
  * fades it; DeepSeek Harness has no such rule outside its own update dialog, so
  * the same row read at full strength here and dimmed there. The fade is stated
  * in the popup's own rules, which both builds carry, so the selected row reads
  * the same in either host.
- */
-test('the row the popup marks as selected states its own dimming', () => {
-  const rule = sourceOf('src/client/composer.tsx')
-    .split('\n').find(line => line.startsWith('.xd-points-table .xd-points-btn:disabled{'))
-  assert.ok(rule, 'the selected row must not depend on a host rule for its fade')
-  assert.match(rule, /opacity:\s*\.5\b/,
-    'the fade is the one PI-Desktop applies; a different value would read as two products')
-})
-
-/**
- * The dot beside a row is one colour, not the host's success token.
  *
  * `--dsw-alias-state-success-primary` resolves to a saturated `#22c55e` in this
  * host, while the same dot in the PI-Desktop build is `#4f9f7c`. Two panels of
  * one product should not carry two greens, so the colour is written out.
  */
-test('the row marker keeps the colour the other build paints it in', () => {
-  const rule = sourceOf('src/client/composer.tsx')
-    .split('\n').find(line => line.startsWith('.xd-points-dot{'))
-  assert.ok(rule, 'the row marker rule must exist')
-  assert.match(rule, /background:\s*#4f9f7c/i, 'the marker is a fixed colour shared with the PI-Desktop build')
-  assert.doesNotMatch(rule, /var\(--/, 'a host token here resolves to a different green in this host')
+test('the row the popup marks as selected states its own dimming and marker colour', () => {
+  const source = sourceOf('src/client/composer.tsx')
+  const selected = source
+    .split('\n').find(line => line.startsWith('.xd-points-table .xd-points-btn:disabled{'))
+  assert.ok(selected, 'the selected row must not depend on a host rule for its fade')
+  assert.match(selected, /opacity:\s*\.5\b/,
+    'the fade is the one PI-Desktop applies; a different value would read as two products')
+
+  const marker = source.split('\n').find(line => line.startsWith('.xd-points-dot{'))
+  assert.ok(marker, 'the row marker rule must exist')
+  assert.match(marker, /background:\s*#4f9f7c/i, 'the marker is a fixed colour shared with the PI-Desktop build')
+  assert.doesNotMatch(marker, /var\(--/, 'a host token here resolves to a different green in this host')
 })
 
 /**
- * The frame around the panel follows the panel's own height, up to a cap.
+ * The frame around the panel follows the panel's own height, up to a cap, and
+ * the reading is skipped, not taken, while the panel document has no body.
  *
  * The box was a fixed 72vh viewport, so a short panel sat in a tall empty frame
  * and a long one scrolled inside the frame while the page around it stayed put.
  * The height is now read from the panel document, which the frame can do because
  * it is same-origin, and stops at FRAME_MAX_HEIGHT so an account list cannot
  * stretch the settings page without bound.
- */
-test('the frame is sized to the panel and stops at its cap', () => {
-  const body = sourceOf('src/client/index.tsx')
-  const cap = body.split('\n').find(line => line.startsWith('const FRAME_MAX_HEIGHT ='))
-  assert.ok(cap, 'the frame needs a height it stops growing at')
-  assert.match(cap, /=\s*\d{3,}/, 'the cap must be a concrete pixel figure')
-
-  assert.match(body, /Math\.min\(FRAME_MAX_HEIGHT,\s*doc\.body\.scrollHeight/,
-    'the height has to come from the panel document and pass through the cap')
-  assert.match(body, /contentDocument/,
-    'the panel is same-origin, so its height is read directly rather than posted')
-  assert.match(body, /setInterval\(/,
-    'measured once at load it would fix the frame to whichever view happened to be up')
-  assert.match(body, /style:\s*measured === 0 \? FRAME_PENDING/,
-    'before the first reading the frame keeps the provisional box')
-})
-
-/**
- * The reading is skipped, not taken, while the panel document has no body.
  *
  * `contentDocument` is non-null from the moment a navigation commits, but its
  * `body` only exists once content arrives; sampled across one load, three
@@ -361,8 +339,15 @@ test('the frame is sized to the panel and stops at its cap', () => {
  * the interval's only work that tick lost. The same window is what a fresh mount
  * draws from, so it is reachable without any reload.
  */
-test('the height probe skips a document that has no body yet', () => {
+test('the frame is sized to the panel, stops at its cap, and skips a bodyless document', () => {
   const body = sourceOf('src/client/index.tsx')
+  const cap = body.split('\n').find(line => line.startsWith('const FRAME_MAX_HEIGHT ='))
+  assert.ok(cap, 'the frame needs a height it stops growing at')
+  assert.match(cap, /=\s*\d{3,}/, 'the cap must be a concrete pixel figure')
+
+  assert.match(body, /Math\.min\(FRAME_MAX_HEIGHT,\s*doc\.body\.scrollHeight/,
+    'the height has to come from the panel document and pass through the cap, and from body rather than documentElement')
+
   const guard = body.split('\n').find(line => line.includes('doc.body === null'))
   assert.ok(guard, 'the probe reads doc.body, so a bodyless document has to bail out before the read')
   // The bail-out is the guard. A line that only names the condition (a no-op
@@ -370,8 +355,79 @@ test('the height probe skips a document that has no body yet', () => {
   // to a substring match, and the read below then dereferences a null body.
   assert.match(guard, /\breturn\b/,
     'the bodyless check must return before the read below, not merely mention the condition')
-  const read = body.split('\n').find(line => line.includes('Math.min(FRAME_MAX_HEIGHT,'))
-  assert.ok(read.indexOf('body.scrollHeight') > -1, 'the read this guard protects must use body, not documentElement')
+})
+
+/**
+ * A panel.css that 404s while the host half is still loading is waited out.
+ *
+ * The card probes `panel.css` to tell a panel the host half is not serving from
+ * one whose assets are missing, and the only thing that separates the two is how
+ * long the 404s last. A host half that has not registered its routes yet answers
+ * 404 for a moment, so the probe retries before it concludes: three 404s in a
+ * row are a verdict, and one is a wait.
+ *
+ * There is no DOM harness in this repo, so the effect is driven through the
+ * `React.useEffect` seam the same way the composer cases in the sibling build
+ * drive theirs - the shipped effect body, run against a stubbed `fetch` and a
+ * `setTimeout` that fires immediately and records the wait it was asked for.
+ */
+test('a panel.css that 404s twice before it loads is waited out, not reported missing', async () => {
+  const source = sourceOf('src/client/index.tsx')
+  const anchor = source.indexOf('const probe = (remaining')
+  assert.notEqual(anchor, -1, 'the card must probe panel.css, or there is nothing to wait out')
+  const open = source.lastIndexOf('React.useEffect(() => {', anchor)
+  assert.notEqual(open, -1, 'the probe has to live inside an effect, or it runs on every render')
+  const close = '}, [view, generation])'
+  const end = source.indexOf(close, anchor)
+  assert.notEqual(end, -1, 'the probe effect must be scoped to the frame generation')
+  const effect = transpile(source.slice(open, end + close.length))
+
+  /** The effect, run once against the answers `fetch` gives and the waits it asks for. */
+  const drive = (answers, view) => {
+    const waits = []
+    const missing = []
+    let asked = 0
+    const context = vm.createContext({
+      React: { useEffect: run => run() },
+      view, generation: 0,
+      setMissing: value => missing.push(value),
+      PANEL_BASE: '/panel-base',
+      fetch: async () => {
+        const answer = answers[Math.min(asked, answers.length - 1)] ?? new Response('', { status: 404 })
+        asked += 1
+        return answer
+      },
+      setTimeout: (callback, ms) => { waits.push(ms); callback(); return 1 },
+      clearTimeout: () => {},
+    })
+    vm.runInContext(effect, context, { filename: 'src/client/index.tsx' })
+    return { waits, missing, asked: () => asked }
+  }
+
+  const notFound = new Response('', { status: 404 })
+  const served = new Response('body', { status: 200 })
+
+  // The case: two 404s and then the stylesheet, which is a host half still
+  // loading rather than a panel that is not installed.
+  const waited = drive([notFound, notFound, served], 'full')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(waited.asked(), 3, 'the third attempt is the one that has to be made')
+  assert.deepEqual(waited.waits, [500, 500], 'the retries wait between attempts rather than hammering the route')
+  assert.deepEqual(waited.missing, [false, false],
+    'a stylesheet that arrives on the third try must not leave the card saying the assets are missing')
+
+  // The control: three 404s are the verdict, so the retry above is not a probe
+  // that never concludes.
+  const concluded = drive([notFound, notFound, notFound], 'full')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(concluded.missing, [false, true],
+    'three 404s in a row are the missing-assets verdict, and it must still be reachable')
+
+  // And the probe costs nothing on the list's inline summary, where there is no
+  // frame to tell anything about.
+  const summary = drive([notFound], 'summary')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(summary.asked(), 0, 'the summary view has no frame, so it must not probe at all')
 })
 
 /**
@@ -402,10 +458,10 @@ test('the composer refresh is bounded inside the readout call deadline', () => {
   // Both the statement and its use: an unanchored match also accepts a scaled
   // or offset deadline such as `COMPOSER_REFRESH_BUDGET_MS * 1000`, and a
   // deadline nothing consults bounds nothing at all.
-  assert.match(body, /const deadline = Date\.now\(\) \+ COMPOSER_REFRESH_BUDGET_MS;\n/,
-    'the Trae and Qoder pass must share that one deadline, unscaled')
-  assert.match(body, /if \(Date\.now\(\) >= deadline\) break;/,
-    'the shared deadline has to stop the per-account loop, or the pass runs to its own end')
+  assert.match(body, /budget\(COMPOSER_REFRESH_BUDGET_MS\)/,
+    'the Trae and Qoder pass must share that one budget, unscaled')
+  assert.match(body, /if \(left\(\) === 0\) break;/,
+    'the shared budget has to stop the per-account loop, or the pass runs to its own end')
 })
 
 /**

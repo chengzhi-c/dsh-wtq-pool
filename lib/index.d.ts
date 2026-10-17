@@ -1,27 +1,23 @@
 import z from "@deepseek-ai/schemastery";
+import { IncomingMessage, ServerResponse } from "node:http";
 import { SettingsPathOp } from "@deepseek-ai/dsh-settings";
-//#region src/host.d.ts
+//#region src/web-panel.d.ts
 /**
- * dsh-wtq-pool - the plugin's engine.
+ * The slice of the host's web server this plugin mounts into.
  *
- * Merges every WorkBuddy, Trae and Qoder desktop sign-in on this machine into
- * one model pool that fails over on its own:
- *
- *   1. discover every sign-in on this machine (read-only),
- *   2. serve each vendor edition from its own loopback OpenAI-compatible
- *      endpoint,
- *   3. publish those endpoints as six providers,
- *   4. rotate to the next account whenever the upstream answers 429.
- *
- * This file is the engine, not the entry: `index.ts` owns the Cordis
- * activation and the provider registrations, and `pi-compat.ts` is the bridge
- * between the two. Everything below is written against that bridge.
- *
- * Upstream traffic uses the platform `fetch` rather than a host network bridge:
- * a bridged response is buffered into text, and a provider contract needs the
- * upstream SSE body relayed as it arrives. Nothing leaves this machine except
- * to the three vendors' own endpoints.
+ * Hand-written rather than imported from the host package for the same reason
+ * the entry's other seams are: the plugin compiles against the capability it
+ * uses, and a host that grows a field does not become a compile error here.
  */
+interface WebServerSeam {
+  register(route: {
+    kind: 'exact' | 'prefix';
+    path: string;
+    handler: (req: IncomingMessage, res: ServerResponse) => unknown;
+  }): () => void;
+}
+//#endregion
+//#region src/host.d.ts
 declare function onPanelInvoke(channel: any, payload: any): Promise<any>;
 declare function onLoad(): Promise<void>;
 declare function onUnload(): Promise<void>;
@@ -138,8 +134,7 @@ interface ClientContext {
   };
   effect(callback: () => unknown, label?: string): unknown;
   inject(names: string[], callback: (scoped: ClientContext) => unknown): unknown;
-  on(name: string, listener: (...args: unknown[]) => void): (() => void) | undefined;
-  off?(name: string, listener: (...args: unknown[]) => void): void;
+  on(name: string, listener: (...args: unknown[]) => void): () => void;
   get(name: string): unknown;
   emit(name: string, ...args: unknown[]): void;
   fiber?: {
@@ -150,6 +145,8 @@ interface ClientContext {
       };
     };
   };
+  /** Present once `webServer` is injected; the panel routes mount into it. */
+  webServer?: WebServerSeam;
 }
 /**
  * Activate the plugin.

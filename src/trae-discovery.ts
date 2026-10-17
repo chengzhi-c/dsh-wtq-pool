@@ -71,7 +71,7 @@ function encryptionType(header: Buffer): EncryptionType {
 }
 
 /** Open one encrypted desktop auth value (reference: dsh-connect-trae decrypt.ts). */
-export function decryptTraeStorageValue(encoded: string): string {
+function decryptTraeStorageValue(encoded: string): string {
   const buffer = Buffer.from(encoded, 'base64')
   if (buffer.length <= 102) throw new Error('Trae auth ciphertext is too short')
   const type = encryptionType(buffer.subarray(0, 6))
@@ -119,7 +119,7 @@ function decodeBase64UrlJson(segment: string): Record<string, unknown> | undefin
 }
 
 /** Parse a CLI token file (bare JWT or a JSON envelope holding one). */
-export function parseTraeCliToken(text: string): { accessToken: string; userId: string; expiresAtMs?: number } {
+function parseTraeCliToken(text: string): { accessToken: string; userId: string; expiresAtMs?: number } {
   const trimmed = text.trim()
   if (trimmed === '') throw new Error('Trae CLI token file is empty')
   let token = trimmed
@@ -148,12 +148,12 @@ export function parseTraeCliToken(text: string): { accessToken: string; userId: 
 }
 
 /** Region for an edition label: the international installs belong to `ai`. */
-export function traeRegionOfEdition(edition: TraeEdition): TraeRegion {
+function traeRegionOfEdition(edition: TraeEdition): TraeRegion {
   return edition === 'sg' || edition === 'solo-sg' ? 'ai' : 'cn'
 }
 
 /** Region from the credential's `userRegion` claim (object or bare string, case-blind). */
-export function traeRegionOfUserRegion(value: unknown): TraeRegion | undefined {
+function traeRegionOfUserRegion(value: unknown): TraeRegion | undefined {
   const raw = typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)['region']
     : value
@@ -165,7 +165,7 @@ export function traeRegionOfUserRegion(value: unknown): TraeRegion | undefined {
 }
 
 /** Region from a credential host (`.trae.ai` → ai, `.trae.cn`/`.trae.com.cn` → cn). */
-export function traeRegionOfHost(host: string | undefined): TraeRegion | undefined {
+function traeRegionOfHost(host: string | undefined): TraeRegion | undefined {
   if (host === undefined) return undefined
   const trimmed = host.trim()
   if (trimmed === '') return undefined
@@ -268,6 +268,12 @@ const WINDOWS_APP_NAMES: Readonly<Record<TraeEdition, readonly string[]>> = {
 }
 
 const LINUX_APP_NAMES: Readonly<Record<TraeEdition, readonly string[]>> = {
+  // The `cn` list carries the bare `trae` spellings because a domestic install
+  // on a case-sensitive filesystem is reachable under either of them. The `sg`
+  // list repeats them on purpose: an international install lives at exactly
+  // those paths on Linux, and dropping them would stop discovering it. What
+  // keeps one install from becoming two credentials is the path dedupe in
+  // {@link traeStorageCandidates}, which probes each file once.
   cn: ['trae-cn', 'Trae CN', 'trae', 'Trae'],
   sg: ['trae', 'Trae'],
   solo: ['trae-solo-cn', 'TRAE SOLO CN'],
@@ -321,6 +327,13 @@ function traeCliCandidates(platform: NodeJS.Platform, home: string, env: NodeJS.
 /**
  * Every Trae storage file to probe, in probe order. Missing files are normal
  * (an edition that was never installed); the discover step skips them.
+ *
+ * Each physical file is probed once, under the first edition that names it.
+ * Two editions can spell the same path on a case-sensitive filesystem, and
+ * probing it twice produced two credentials from one install; when the storage
+ * document named neither a region nor a host, the candidate's edition decided,
+ * so one install published two provider rows and one region's gateway routed a
+ * foreign token to the wrong endpoint.
  */
 export function traeStorageCandidates(
   platform: NodeJS.Platform = process.platform,
@@ -328,6 +341,7 @@ export function traeStorageCandidates(
   env: NodeJS.ProcessEnv = process.env,
 ): TraeStorageCandidate[] {
   const result: TraeStorageCandidate[] = []
+  const seen = new Set<string>()
   for (const edition of ['cn', 'sg', 'solo', 'solo-sg'] as const) {
     let roots: string[]
     let appNames: readonly string[]
@@ -347,7 +361,10 @@ export function traeStorageCandidates(
     }
     for (const root of roots) {
       for (const appName of appNames) {
-        result.push({ edition, path: join(root, appName, 'User', 'globalStorage', 'storage.json'), source: 'desktop' })
+        const path = join(root, appName, 'User', 'globalStorage', 'storage.json')
+        if (seen.has(path)) continue
+        seen.add(path)
+        result.push({ edition, path, source: 'desktop' })
       }
     }
   }
@@ -394,12 +411,46 @@ function credentialFrom(candidate: TraeStorageCandidate, text: string): TraeCred
 }
 
 /**
+ * How long a discovery answer is reused.
+ *
+ * The gateways read credentials per request so a desktop re-login is picked up
+ * without a rescan, but the read itself walks and AES-decrypts ~20 candidate
+ * files. A short TTL keeps that off the chat path;
+ * `resetTraeCredentialCache()` clears it for a rescan.
+ */
+const DISCOVERY_TTL_MS = 30_000
+let discoveryCache: { at: number; value: { credentials: TraeCredential[]; failures: TraeCandidateFailure[] } } | undefined
+
+/** Drop the cached discovery answer, e.g. when the user asks for a rescan. */
+export function resetTraeCredentialCache(): void {
+  discoveryCache = undefined
+}
+
+/**
  * Read every candidate file and return deduplicated credentials. One stale,
  * partially written or signed-out install never hides the others; failures are
  * recorded token-free so diagnostics can explain a silent "not signed in".
  */
 export async function discoverTraeCredentials(
-  candidates: TraeStorageCandidate[] = traeStorageCandidates(),
+  candidates?: TraeStorageCandidate[],
+): Promise<{ credentials: TraeCredential[]; failures: TraeCandidateFailure[] }> {
+  // Only the default candidate set is cached: a caller that names its own
+  // files is asking about those files, not about the machine.
+  const cacheable = candidates === undefined
+  if (cacheable && discoveryCache !== undefined && Date.now() - discoveryCache.at < DISCOVERY_TTL_MS) {
+    const cached = discoveryCache.value
+    return { credentials: [...cached.credentials], failures: [...cached.failures] }
+  }
+  const value = await readTraeCredentials(candidates ?? traeStorageCandidates())
+  // An empty answer is not cached: a read that failed under load retries on the
+  // next request instead of sticking for the whole TTL, and a machine with no
+  // sign-in has no files to pay for.
+  if (cacheable && value.credentials.length > 0) discoveryCache = { at: Date.now(), value }
+  return { credentials: [...value.credentials], failures: [...value.failures] }
+}
+
+async function readTraeCredentials(
+  candidates: TraeStorageCandidate[],
 ): Promise<{ credentials: TraeCredential[]; failures: TraeCandidateFailure[] }> {
   const byAccount = new Map<string, TraeCredential>()
   const failures: TraeCandidateFailure[] = []

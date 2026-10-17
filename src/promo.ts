@@ -61,7 +61,7 @@ export interface PromoRule {
  * When a promotion is extended or a new one starts, edit this table. When one
  * ends, either delete the row or let `until` lapse — both stop the badge.
  */
-export const PROMO_RULES: readonly PromoRule[] = [
+const PROMO_RULES: readonly PromoRule[] = [
   { idPrefix: 'hy4-preview', region: 'cn', hours: [23, 0, 1, 2, 3, 4, 5, 6, 7], until: '2026-10-31' },
 ]
 
@@ -134,7 +134,18 @@ export function promoStatusFor(
     // String comparison is safe for `YYYY-MM-DD` and needs no date parsing.
     if (clock.day > rule.until) continue
     if (rule.hours.includes(clock.hour)) {
-      return { kind: 'night', untilHour: windowEndHour(rule, clock.hour) }
+      const untilHour = windowEndHour(rule, clock.hour)
+      // A window that runs past midnight is only promised while the next day is
+      // still inside the rule: on the last day the hours after midnight are not
+      // free, and the badge would say they were until 08:00.
+      //
+      // The hours still inside today ARE free on that last day, so the badge
+      // names midnight as the close rather than dropping the promotion and
+      // promising the next opening at an hour the rule no longer covers.
+      if (clock.day === rule.until && untilHour <= clock.hour) {
+        return { kind: 'night', untilHour: 24 }
+      }
+      return { kind: 'night', untilHour }
     }
     const nextHour = nextWindowHour(rule, clock.hour)
     if (nextHour !== undefined) {

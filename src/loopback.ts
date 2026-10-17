@@ -5,36 +5,48 @@
  * manifest before the plugin process starts, so the loopback bind cannot be the
  * only thing bounding it: a browser page on the same machine can reach
  * 127.0.0.1 too. The Host / Origin / bearer checks below are that boundary, and
- * there is exactly one copy of them — WorkBuddy's shim and the Trae gateway
- * both import this module, because two copies of a security check are two
- * chances to drift.
+ * there is exactly one copy of them — the WorkBuddy shim and the Trae and Qoder
+ * gateways all import this module, because two copies of a security check are
+ * two chances to drift.
+ *
+ * The server shell itself lives here too, for the same reason: the boilerplate
+ * that binds 127.0.0.1 and tears the listener down was written out three times
+ * and had already drifted on the one detail that decides whether teardown
+ * finishes at all.
+ *
+ * `readJsonBody`, `answerRequest`'s `answerFailure` parameter, the optional
+ * `res.on?.()` and the exported `BodyTooLargeError` have no caller in the
+ * PI-Desktop build: they exist for the DSH web panel, which that build does not
+ * ship, and they arrived here because this module is kept byte-identical across
+ * the two. If the two ever stop being synced, those four are the first things to
+ * delete.
  *
  * @module dsh-wtq-pool/loopback
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createServer } from 'node:http'
+import { LOG_PREFIX } from './log'
 
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]'])
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1'])
 
 /** Strip the port, and unwrap an IPv6 bracket, so only the host name remains. */
-export function hostnameOfHost(host: string): string {
+function hostnameOfHost(host: string): string {
   let hostname = host.trim().toLowerCase()
   if (hostname.startsWith('[')) {
     const end = hostname.indexOf(']')
     return end === -1 ? hostname : hostname.slice(0, end + 1)
   }
+  // A bare IPv6 literal carries its own colons and no port, so the port-stripping
+  // below would otherwise eat everything after the first one and answer with a
+  // fragment nothing matches. `::1` is the spelling a hand-written client sends.
+  if (hostname.split(':').length > 2) return hostname
   const colon = hostname.lastIndexOf(':')
   if (colon !== -1 && /^\d+$/.test(hostname.slice(colon + 1))) hostname = hostname.slice(0, colon)
   return hostname
 }
 
-/**
- * Host must name loopback.
- *
- * Used by the gateway handlers. The panel routes rely on the peer and Origin
- * checks instead: a browser that could reach the panel is already same-origin
- * loopback, so a forged Host adds nothing there.
- */
+/** Host must name loopback; drops DNS-rebinding attempts before routing. */
 export function hostIsLoopback(host: string | undefined): boolean {
   if (host === undefined || host.trim() === '') return false
   return LOOPBACK_HOSTS.has(hostnameOfHost(host))
@@ -45,7 +57,7 @@ export function originIsLoopback(origin: string | undefined): boolean {
   if (origin === undefined || origin.trim() === '') return true
   try {
     const { hostname } = new URL(origin)
-    return LOOPBACK_HOSTS.has(hostname) || hostname === '::1'
+    return LOOPBACK_HOSTS.has(hostname)
   } catch {
     return false
   }
@@ -79,8 +91,31 @@ export function bearerAccepted(req: IncomingMessage): boolean {
 
 export function writeJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body)
-  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) })
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    // A client that sniffs the body instead of the header can be talked into
+    // reading JSON as markup; every other writer here says so.
+    'X-Content-Type-Options': 'nosniff',
+    // Nothing any of these routes answers is cacheable: a panel document, a
+    // model list and an error are all reads of live state.
+    'Cache-Control': 'no-store',
+    'Content-Length': Buffer.byteLength(payload),
+  })
   res.end(payload)
+}
+
+/**
+ * An error's text, redacted and bounded, for anything that leaves the process.
+ *
+ * One copy for the log path and the client path: two copies of a redaction
+ * rule are two chances to drift, and the panel's copy had already drifted from
+ * the host entry's on the plain-object case.
+ */
+export function safeMessage(error: unknown): string {
+  const text = error && typeof error === 'object' && 'message' in error && (error as { message?: unknown }).message
+    ? String((error as { message: unknown }).message)
+    : String(error)
+  return redactSecrets(text).slice(0, 500)
 }
 
 /** The error shape every OpenAI-compatible client expects. */
@@ -101,12 +136,19 @@ export function writeOpenAIError(res: ServerResponse, status: number, kind: stri
  * `X-Cloudide-Token …` and `X-Ide-Token …` for Trae, `X-Refresh-Token:` for
  * WorkBuddy), and the field form, in the camelCase spelling this plugin itself
  * sends and parses (`accessToken`, `refreshToken`) as well as the snake_case
- * one a query string carries. The three-part JWT needs no key at all: it is
- * recognisable on its own, and the opaque prefixes are Qoder's own.
+ * one a query string carries. Qoder's signed headers ride account and machine
+ * identity (`Cosy-User`, `Cosy-Machinetoken`, `X-User-Id`), so they are listed
+ * too: an echoed request that prints them identifies the account as surely as
+ * a token does. The three-part JWT needs no key at all: it is recognisable on
+ * its own, and the opaque prefixes are Qoder's own.
  *
  * Trae's tokens are opaque, not JWTs, so only the scheme rules cover them -
  * which is why every header name the plugin itself sends is listed there. A
- * space-separated echo of one the list missed printed the whole credential.
+ * space-separated echo of one the list missed printed the whole credential, and
+ * four were missing: `Cosy-Machineid` (the same value `Cosy-Machinetoken`
+ * carries) plus `x-machine-id`, `x-device-id` and `x-uid`, the Trae machine,
+ * device and account ids. Qoder's identity headers were listed and Trae's were
+ * not, which is the drift the sentence above is meant to prevent.
  */
 const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
   // A scheme that carries the credential itself, in either the `Bearer <value>`
@@ -117,7 +159,7 @@ const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
   // the line, destroying the fields after it and truncating the body mid-JSON -
   // and the eight-character floor is what keeps a prose word (`invalid Bearer
   // format`) from being taken for a credential.
-  [/\b(Bearer|Cosy-Key|Cloud-IDE-JWT|X-Cloudide-Token|X-Ide-Token|X-Refresh-Token|X-Api-Key)\b([\s:="'\\]{1,6})[A-Za-z0-9_+/.=~-]{8,}/gi, '$1$2[redacted]'],
+  [/\b(Bearer|Cosy-Key|Cosy-Machineid|Cosy-Machinetoken|Cosy-User|Cloud-IDE-JWT|X-Cloudide-Token|X-Ide-Token|X-Refresh-Token|X-Api-Key|X-User-Id|x-device-id|x-machine-id|x-uid)\b([\s:="'\\]{1,6})[A-Za-z0-9_+/.=~-]{8,}/gi, '$1$2[redacted]'],
   [/\beyJ[A-Za-z0-9_+/.=-]+(?:\.[A-Za-z0-9_+/.=-]+){0,2}/g, '[redacted token]'],
   [/\b(qoder-oauth-token-)[A-Za-z0-9_+/.=-]+/g, '$1[redacted]'],
   [/\b(rt_)[A-Za-z0-9_+/.=-]+/g, '$1[redacted]'],
@@ -141,6 +183,15 @@ const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\b[A-Za-z]:[\\/][^\r\n"'<>|]*/g, '[redacted path]'],
   [/\\\\[^\r\n"'<>|]+/g, '[redacted path]'],
   [/(['"])(\/(?!\/)[^'"\r\n]+)\1/g, '$1[redacted path]$1'],
+  // An unquoted POSIX absolute path, for the same reason the Windows rule above
+  // needs no quotes. It is deliberately narrower than "anything with a slash in
+  // it": the extension is required, and a segment may carry spaces but not start
+  // with one, so `POST /v1/chat/completions returned 4001` and `and/or` survive
+  // intact - that is the actionable half of an error and destroying it would
+  // trade a path disclosure for an undiagnosable one. A dot-directory with no
+  // extension anywhere (`/root/.trae-cn/trae-jwt-token`) is not matched; the
+  // identity readers never print those paths in the first place.
+  [/(?<![\w./])\/(?:[\w.@-]+(?: [\w.@-]+)*\/)+[\w.@-]+(?: [\w.@-]+)*\.[A-Za-z][\w]*/g, '[redacted path]'],
 ]
 
 /**
@@ -160,7 +211,11 @@ export function redactSecrets(text: string): string {
  *
  * The host rebuilds the picker from `GET /v1/models`, so these ids are the
  * ones the manifest publishes. An empty publication falls back to the
- * directory: an empty discovery answer makes the host drop the provider.
+ * directory: an empty discovery answer makes the host drop the provider. A
+ * publication that names only ids the roster no longer carries falls back the
+ * same way, because that is a roster that moved since the declaration was
+ * written; the next declaration rebuild re-applies the selection, and an empty
+ * answer in the meantime would cost the user the provider row itself.
  */
 export function listedModels<T extends { id: string }>(directory: readonly T[], listedIds: readonly string[]): readonly T[] {
   if (listedIds.length === 0) return directory
@@ -169,14 +224,87 @@ export function listedModels<T extends { id: string }>(directory: readonly T[], 
   return picked.length > 0 ? picked : directory
 }
 
+/**
+ * Lift the message out of an upstream error envelope.
+ *
+ * The Trae and Qoder gateways relay the upstream's own JSON error document as
+ * the message of their OpenAI-shaped error, which double-wraps it: the client
+ * then reads a serialized document where a sentence should be. Parsed here,
+ * once, so every gateway answers in the upstream's own words; redacted,
+ * because that document is exactly where an echoed credential would ride.
+ */
+export function liftUpstreamMessage(text: string): string {
+  const trimmed = text.trim()
+  if (trimmed === '') return ''
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    // A body that is not JSON is relayed as it came, which is what makes a
+    // plain-text refusal readable - but it is still upstream text on its way to
+    // a client, so it is redacted like every parsed branch below.
+    return redactSecrets(text)
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return redactSecrets(text)
+  const record = parsed as Record<string, unknown>
+  const error = record['error']
+  if (typeof error === 'string' && error.trim() !== '') return redactSecrets(error)
+  if (typeof error === 'object' && error !== null && !Array.isArray(error)) {
+    const message = (error as Record<string, unknown>)['message']
+    if (typeof message === 'string' && message.trim() !== '') return redactSecrets(message)
+  }
+  if (typeof record['message'] === 'string' && record['message'].trim() !== '') {
+    return redactSecrets(record['message'])
+  }
+  // A document that carried no sentence lifts to nothing, so the caller's own
+  // fallback answers instead of relaying `{}` or a page of HTML as the message.
+  return ''
+}
+
+/** Longest wait a client is told to honour, in seconds. */
+const RETRY_AFTER_CEILING_SECONDS = 2 * 60 * 60
+
+/**
+ * One wait time in whole seconds, bounded, or nothing when it is not a wait.
+ *
+ * A client that honours a `Retry-After` stops asking for that long, so one
+ * malformed value must not be able to park an account for years. Both readers
+ * of the header come through here rather than each carrying its own ceiling.
+ */
+export function boundedRetryAfterSeconds(seconds: number): number | undefined {
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined
+  return Math.min(Math.ceil(seconds), RETRY_AFTER_CEILING_SECONDS)
+}
+
+/**
+ * A `Retry-After` worth sending, or nothing.
+ *
+ * The upstream's own wait time, bounded and validated. An empty string, prose
+ * or a number of years is dropped rather than forwarded.
+ */
+export function retryAfterHeader(value: unknown): string | undefined {
+  const seconds = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && value.trim() !== '' ? Number(value) : Number.NaN
+  const bounded = boundedRetryAfterSeconds(seconds)
+  return bounded === undefined ? undefined : String(bounded)
+}
+
 /** The largest chat body a gateway will buffer before refusing the request. */
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
 
-/** Raised when a request body passes {@link REQUEST_BODY_LIMIT}. */
-class BodyTooLargeError extends Error {}
+/**
+ * How long an oversized upload may take to finish before the socket is closed
+ * anyway. Node's own request timeout still bounds a client that never ends.
+ */
+const BODY_DRAIN_GRACE_MS = 10_000
+
+/** Raised when a request body passes the `limitBytes` bound it was read with. */
+export class BodyTooLargeError extends Error {}
 
 /**
- * Buffer one request body, refusing anything past {@link REQUEST_BODY_LIMIT}.
+ * Buffer one request body, refusing anything past the `limitBytes` bound it is
+ * given, which defaults to {@link REQUEST_BODY_LIMIT}.
  *
  * A body that arrives in pieces is counted as it arrives, so an endless upload
  * is cut off by size rather than by the client finishing it. Live here for the
@@ -186,18 +314,45 @@ class BodyTooLargeError extends Error {}
  * The rejection carries the reason through to the caller so the answer is a
  * 413 the client can act on, not a 500 that reads as a bug in this plugin.
  */
-export function readRequestBody(req: IncomingMessage): Promise<Buffer> {
+export function readRequestBody(req: IncomingMessage, limitBytes: number = REQUEST_BODY_LIMIT): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
+    let refused = false
+    // A client that names a body past the limit is refused before the first
+    // byte is read. Waiting for the bytes to arrive held the request for as
+    // long as the client chose to send them - a declared 100 MiB with nothing
+    // behind it hung until Node's own request timeout.
+    const declared = Number(req.headers?.['content-length'])
+    if (Number.isFinite(declared) && declared > limitBytes) {
+      reject(new BodyTooLargeError('request body too large'))
+      // Armed before the listeners that clear it: a request that ends on its
+      // own must not leave the timer holding the closure for the full grace.
+      const grace = setTimeout(() => { if (!req.destroyed) req.destroy() }, BODY_DRAIN_GRACE_MS)
+      grace.unref()
+      const done = (): void => { clearTimeout(grace); if (!req.destroyed) req.destroy() }
+      req.on('end', done)
+      req.on('error', done)
+      return
+    }
     req.on('data', (chunk: Buffer) => {
       size += chunk.length
-      if (size > REQUEST_BODY_LIMIT) {
-        reject(new BodyTooLargeError('request body too large'))
-        // Destroyed behind the answer, not in front of it: the socket is what
-        // carries the 413 back, so killing it here would leave the client with a
-        // reset and no reason for it.
-        setImmediate(() => { if (!req.destroyed) req.destroy() })
+      if (size > limitBytes) {
+        // Once: the rest of the upload keeps arriving chunk by chunk, and
+        // re-running this branch attached a fresh pair of listeners per chunk.
+        if (!refused) {
+          refused = true
+          reject(new BodyTooLargeError('request body too large'))
+          // Drained, not destroyed: with a large upload mid-stream the OS answers
+          // a destroy with RST, and the 413 the caller is about to write is
+          // discarded with the socket. Letting the body finish (or the grace
+          // timer below fire for a client that never ends) closes cleanly.
+          const grace = setTimeout(() => { if (!req.destroyed) req.destroy() }, BODY_DRAIN_GRACE_MS)
+          grace.unref()
+          const done = (): void => { clearTimeout(grace); if (!req.destroyed) req.destroy() }
+          req.on('end', done)
+          req.on('error', done)
+        }
         return
       }
       chunks.push(chunk)
@@ -218,31 +373,120 @@ export function readRequestBody(req: IncomingMessage): Promise<Buffer> {
  */
 export async function answerRequest(
   res: ServerResponse,
-  handle: () => Promise<void>,
+  handle: () => void | Promise<void>,
   log?: { warn?(...args: unknown[]): void },
+  /** How a caught failure is answered; the default is the OpenAI error shape. */
+  answerFailure?: (res: ServerResponse, error: unknown) => void,
 ): Promise<void> {
-  res.on('error', (error: unknown) => {
-    log?.warn?.('dsh-wtq-pool: response socket closed mid-write', error)
+  // The optional call is deliberate: the panel contract test answers through a
+  // response object that implements only the write half, and a real
+  // ServerResponse always carries `on`.
+  res.on?.('error', (error: unknown) => {
+    log?.warn?.(LOG_PREFIX + ': response socket closed mid-write', error)
   })
   try {
     await handle()
   } catch (error: unknown) {
     // The reason is recorded before the answer is written: a 500 the client can
     // read but the log cannot explain is a bug report nobody can act on.
-    log?.warn?.('dsh-wtq-pool: request failed', error)
-    try {
-      if (!res.headersSent) {
-        if (error instanceof BodyTooLargeError) {
-          writeOpenAIError(res, 413, 'request_too_large', String(error.message))
-          return
-        }
-        writeOpenAIError(res, 500, 'internal', String(error))
+    log?.warn?.(LOG_PREFIX + ': request failed', error)
+    const answer = answerFailure ?? ((target: ServerResponse, caught: unknown): void => {
+      if (caught instanceof BodyTooLargeError) {
+        writeOpenAIError(target, 413, 'request_too_large', String(caught.message))
+      } else {
+        writeOpenAIError(target, 500, 'internal', String(caught))
       }
+    })
+    try {
+      if (!res.headersSent) answer(res, error)
       else res.end()
     } catch (writeError: unknown) {
-      log?.warn?.('dsh-wtq-pool: could not answer a failed request', writeError)
+      log?.warn?.(LOG_PREFIX + ': could not answer a failed request', writeError)
     }
   }
+}
+
+/**
+ * Read a bounded JSON body; an empty or malformed body reads as `{}`.
+ *
+ * The bound and the drain grace come from {@link readRequestBody}'s, because a
+ * panel POST is a request like any other and a second size policy is a second
+ * policy to keep in step. The parse is lenient on purpose: a panel call that
+ * carries no body is a read, not a malformed write.
+ *
+ * The limit is a parameter rather than a constant because the panel's requests
+ * are a channel name and a handful of settings, and it accepts a thousand times
+ * less than a chat body does.
+ */
+export async function readJsonBody(
+  req: IncomingMessage,
+  limitBytes: number = REQUEST_BODY_LIMIT,
+): Promise<Record<string, unknown>> {
+  const raw = (await readRequestBody(req, limitBytes)).toString('utf8')
+  if (raw.trim() === '') return {}
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    return parsed !== null && typeof parsed === 'object' ? parsed as Record<string, unknown> : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * How far a relay reads ahead before giving up on finding a failure.
+ *
+ * The peek has to see far enough to catch a refusal that arrives after the
+ * first content bytes, and stop soon enough that a healthy stream is not held
+ * back. Both vendors use the same bound: a peek that stops earlier answers a
+ * failure as a truncated success, and one that reads further delays every turn.
+ */
+export const PEEK_MAX_CHUNKS = 64
+
+/**
+ * The byte ceiling on the same peek, counted as the chunks arrive.
+ *
+ * The chunk count alone bounds a vendor that answers in many small pieces; this
+ * one bounds a vendor that puts a whole refusal in a single large chunk, which
+ * is the other way to hold a healthy stream back.
+ */
+export const PEEK_MAX_BYTES = 262_144
+
+/**
+ * Replay the bytes a peek consumed, then drain the rest of the upstream.
+ *
+ * The relay hands the client a stream it already read the head of, so the bytes
+ * that were buffered while looking for a failure have to be put back in front of
+ * the reader's remainder. Cancelling has to reach the upstream reader: a caller
+ * that hangs up otherwise leaves the upstream socket open until it ends on its
+ * own, which for a long turn is the whole conversation.
+ */
+export function replaySource(
+  buffered: readonly Uint8Array[],
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  ended: boolean,
+): ReadableStream<Uint8Array> {
+  let index = 0
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const bytes = buffered[index]
+      if (bytes !== undefined) {
+        index += 1
+        controller.enqueue(bytes)
+        return
+      }
+      if (ended) {
+        controller.close()
+        return
+      }
+      const next = await reader.read()
+      if (next.done) {
+        controller.close()
+        return
+      }
+      controller.enqueue(next.value)
+    },
+    async cancel(reason) { await reader.cancel(reason).catch(() => {}) },
+  })
 }
 
 /**
@@ -268,4 +512,80 @@ export function guardsPass(req: IncomingMessage, res: ServerResponse): boolean {
     return false
   }
   return true
+}
+
+/**
+ * One loopback HTTP server, bound and torn down the same way everywhere.
+ *
+ * The WorkBuddy shim and the Trae and Qoder gateways each wrote out their own
+ * `createServer` / `listen` / `close` block. One copy here is what stops the next
+ * gateway writing a fourth, and `handle` is the only hook: everything else a
+ * gateway varies — its port, the name its errors carry — is data, so there is
+ * nothing left to get subtly wrong.
+ *
+ * Teardown makes two calls, and their ORDER is the whole point:
+ *
+ * - `closeAllConnections()` first aborts the turns that are still in flight.
+ * - `server.close()` then stops listening and waits for its connections to end.
+ *   They end at once, because they were just destroyed.
+ *
+ * Reversed, `close()` waits for a chat that is mid-stream to finish on its own,
+ * and the abort that would have ended it sits behind the wait, so it never runs:
+ * teardown blocks on the upstream instead of on the user, and the plugin process
+ * stays alive with it. That is the order the shim had.
+ *
+ * The idle case hides all of this. A client that finished a turn holds an idle
+ * keep-alive socket, and `close()` drops those itself, so with nothing in flight
+ * every ordering resolves and the difference is invisible. Only a turn that is
+ * still streaming makes it show, which is the fixture the teardown test uses.
+ */
+export function createLoopbackServer(options: {
+  /** Preferred port, tried at listen time; 0 asks the OS for any free one. */
+  port?: number
+  /** Names this endpoint in its own errors and its server-error log. */
+  label: string
+  /** One request, routed; a throw is answered by {@link answerRequest}. */
+  handle: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+  /** Where a failed request is recorded, if anywhere. */
+  logger?: { warn?(...args: unknown[]): void }
+}): {
+  ready: Promise<void>
+  port(): number
+  baseUrl(): string
+  close(): Promise<void>
+} {
+  const server = createServer((req, res) => {
+    void answerRequest(res, () => options.handle(req, res), options.logger)
+  })
+  const ready = new Promise<void>((resolve, reject) => {
+    server.once('listening', () => resolve())
+    server.once('error', reject)
+  })
+  server.listen(options.port ?? 0, '127.0.0.1')
+  // Registered once, here, rather than per close: stopping a gateway twice is
+  // normal, and a listener per call would pile up on a server that is already
+  // down. An unhandled 'error' on the server would take the plugin's process
+  // with it.
+  server.on('error', (error: unknown) => {
+    options.logger?.warn?.(LOG_PREFIX + ': ' + options.label + ' server error', error)
+  })
+  return {
+    ready,
+    /** The bound port, or 0 before `listening` (or after close). */
+    port: () => {
+      const address = server.address()
+      return address === null || typeof address === 'string' ? 0 : address.port
+    },
+    baseUrl: () => {
+      const address = server.address()
+      if (address === null || typeof address === 'string') {
+        throw new Error(options.label + ' has no listening address')
+      }
+      return `http://127.0.0.1:${address.port}`
+    },
+    close: async () => {
+      server.closeAllConnections()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    },
+  }
 }

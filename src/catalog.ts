@@ -75,8 +75,22 @@ export interface ModelOverride {
 /** Live catalog with a static fallback behind it. */
 export class WorkBuddyCatalog {
   private models: readonly WorkBuddyModelInfo[] = FALLBACK_WORKBUDDY_MODELS
+  private live = false
   /** User's model selection. Empty object = follow the catalog unfiltered. */
   private selection: ModelSelection = {}
+
+  /**
+   * Whether the roster in force came from the upstream.
+   *
+   * False means the static fallback is still standing: this plugin's own guess,
+   * not a list the vendor answered with. A saved selection cannot be judged
+   * against a guess - doing it reported every model the vendor had added since
+   * the fallback was written as retired, and said so on every start for as long
+   * as the live read kept failing.
+   */
+  hasLiveRoster(): boolean {
+    return this.live
+  }
 
   /** The catalog as the upstream advertises it, before any override. */
   current(): readonly WorkBuddyModelInfo[] {
@@ -102,25 +116,21 @@ export class WorkBuddyCatalog {
   /**
    * Replace the catalog with the upstream's own list.
    *
-   * An empty list keeps what is there: a read that failed is not the upstream
-   * saying it has no models, and the fallback behind this class is what a fresh
-   * install starts from.
+   * An empty list keeps what is there: the static fallback is what a fresh
+   * install publishes before any read succeeds, and a wipe here would leave the
+   * gateway with nothing to declare. What counts as an answer is decided in
+   * `catalogFromUpstream` before this is reached.
    */
   update(models: readonly WorkBuddyModelInfo[]): void {
     if (models.length === 0) return
     this.models = models
+    this.live = true
   }
 
   /** Replace the user's selection; the model list is rebuilt from `visible()`. */
   applySelection(selection: ModelSelection): void {
     this.selection = selection
   }
-
-  /** Replace the catalog from the live upstream list; keeps the fallback if empty. */
-  updateFromUpstream(models: readonly WorkBuddyUpstreamModel[]): void {
-    this.update(catalogFromUpstream(models))
-  }
-
 }
 
 /**
@@ -173,6 +183,12 @@ export interface ModelSelection {
   enabledModelIds?: readonly string[]
   /** Per-model edits, keyed by model id. Absent = every model follows the catalog. */
   overrides?: Readonly<Record<string, ModelOverride | undefined>>
+  /**
+   * Shapes written by an earlier version. Still read, so an existing settings
+   * file keeps working; the host entry folds them into `overrides` on read.
+   */
+  imageModelIds?: readonly string[]
+  contextBudgets?: Readonly<Record<string, number | undefined>>
 }
 
 /** Convert one upstream catalog entry into the plugin's model-info shape. */
@@ -185,6 +201,11 @@ export function toModelInfo(model: WorkBuddyUpstreamModel): WorkBuddyModelInfo {
     supportsImages: model.supportsImages ?? false,
     ...model.creditMultiplier === undefined ? {} : { multiplier: model.creditMultiplier },
     ...model.reasoning?.supportedEfforts === undefined ? {} : { supportedEfforts: model.reasoning.supportedEfforts },
+    // The upstream's own default, so a model that starts at a non-minimum level
+    // publishes that one instead of the plugin's fallback. The declaration only
+    // carries it when the level is actually offered, so an upstream that names a
+    // level its own roster does not list cannot produce an unusable default.
+    ...model.reasoning?.defaultEffort === undefined ? {} : { defaultThinkingLevel: model.reasoning.defaultEffort },
     ...model.reasoning?.canDisableThinking === undefined
       ? {}
       : { canDisableThinking: model.reasoning.canDisableThinking },

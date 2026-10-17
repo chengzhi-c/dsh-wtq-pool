@@ -9,11 +9,22 @@
 import { randomUUID } from 'node:crypto'
 import type { TraeCredential, TraeRegion } from './trae-discovery'
 import { traeRegionOfCredential } from './trae-discovery'
+import { headersDeadline, readErrorBody, withIdleWatchdog } from './upstream'
 
 /** Request identity the real client persists; never fabricated per request. */
 export interface TraeIdentity {
   machineId: string
   deviceId: string
+  /**
+   * True when `deviceId` is not the persisted device number.
+   *
+   * An install holding two device-center ids - two Trae accounts signed in to
+   * the same edition - has no single number to send, and both fallbacks (a
+   * telemetry GUID, a hash of the machine id) are the shapes the check-in
+   * endpoint answers 9074. Chat does not care which one rides along; the
+   * check-in does, and without this flag the refusal arrived as a bare code.
+   */
+  deviceIdIsFallback?: boolean
   platform: NodeJS.Platform
   appVersion?: string
   buildVersion?: string
@@ -33,7 +44,7 @@ export interface TraeRegionGateways {
 }
 
 /** Verified gateway bases per region (reference: dsh-connect-trae region.ts). */
-export const REGION_GATEWAYS: Readonly<Record<TraeRegion, TraeRegionGateways>> = {
+const REGION_GATEWAYS: Readonly<Record<TraeRegion, TraeRegionGateways>> = {
   cn: {
     chat: 'https://trae-api-cn.mchost.guru',
     remote: 'https://solo.trae.cn/api/remote/v1',
@@ -47,20 +58,20 @@ export const REGION_GATEWAYS: Readonly<Record<TraeRegion, TraeRegionGateways>> =
 }
 
 /** Default chat function; the directory may stamp a more specific owner. */
-export const TRAE_SOLO_FUNCTION = 'solo_work_lite'
+const TRAE_SOLO_FUNCTION = 'solo_work_lite'
 
 /**
  * `llm_utils_chat` functions to union per region, in priority order.
  * A model is only callable through the function that lists it, so the roster
  * is the union and the first function to name a `config_name` wins.
  */
-export const TRAE_DIRECTORY_FUNCTIONS: Readonly<Record<TraeRegion, readonly string[]>> = {
+const TRAE_DIRECTORY_FUNCTIONS: Readonly<Record<TraeRegion, readonly string[]>> = {
   cn: ['solo_work_remote', TRAE_SOLO_FUNCTION, 'solo_agent_remote', 'chat_v3', 'solo_coder'],
   ai: ['solo_work_remote', TRAE_SOLO_FUNCTION, 'solo_agent_remote', 'chat_v3'],
 }
 
-export const TRAE_SOLO_CHAT_PATH = '/api/agent/v3/llm_utils_chat'
-export const TRAE_SOLO_MODELS_PATH = '/api/ide/v1/get_detail_param'
+const TRAE_SOLO_CHAT_PATH = '/api/agent/v3/llm_utils_chat'
+const TRAE_SOLO_MODELS_PATH = '/api/ide/v1/get_detail_param'
 
 /** Upstream failure classes the future shim can map onto HTTP answers. */
 export type TraeUpstreamErrorKind =
@@ -71,10 +82,11 @@ export type TraeUpstreamErrorKind =
   | 'server'
   | 'client'
   | 'unconfigured'
+  | 'aborted'
 
 export type TraeChatResult =
   | { ok: true; response: Response }
-  | { ok: false; status: number; kind: TraeUpstreamErrorKind; message: string }
+  | { ok: false; status: number; kind: TraeUpstreamErrorKind; message: string; retryAfter?: string | null }
 
 
 /** One callable SOLO model, carrying the function that listed it. */
@@ -95,7 +107,7 @@ export interface TraeSoloModel {
   function?: string
 }
 
-export const TRAE_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const
+const TRAE_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const
 export type TraeReasoningEffort = typeof TRAE_REASONING_EFFORTS[number]
 
 export interface TraeReasoningCapability {
@@ -128,7 +140,7 @@ const TRAE_WIRE_EFFORTS: Record<TraeReasoningEffort, string> = {
  * choice was made when none was. With no capability on hand the value passes
  * through untouched.
  */
-export function traeWireEffort(requested: string, capability: TraeReasoningCapability | undefined): string | undefined {
+function traeWireEffort(requested: string, capability: TraeReasoningCapability | undefined): string | undefined {
   if (capability === undefined) return requested
   const level = TRAE_REASONING_EFFORTS.find(entry => entry === requested)
   if (level === undefined || !capability.supported.includes(level)) return undefined
@@ -155,7 +167,7 @@ function asTraeEffort(value: unknown): TraeReasoningEffort | undefined {
  * `reasoning_effort_config.options` in Trae's own spelling. A host-name list
  * under `reasoning_effort_options` is still accepted.
  */
-export function parseTraeReasoningCapability(value: unknown): TraeReasoningCapability | undefined {
+function parseTraeReasoningCapability(value: unknown): TraeReasoningCapability | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
   const record = value as Record<string, unknown>
   const config = typeof record['reasoning_effort_config'] === 'object'
@@ -182,7 +194,7 @@ export function parseTraeReasoningCapability(value: unknown): TraeReasoningCapab
  * Reasoning tables from a remote `/models` payload, keyed by model `name`.
  * The first group to name an id wins; the groups agree on these facts.
  */
-export function collectTraeRemoteReasoning(groups: readonly unknown[]): Map<string, TraeReasoningCapability> {
+function collectTraeRemoteReasoning(groups: readonly unknown[]): Map<string, TraeReasoningCapability> {
   const byId = new Map<string, TraeReasoningCapability>()
   for (const group of groups) {
     if (typeof group !== 'object' || group === null) continue
@@ -206,22 +218,22 @@ export function collectTraeRemoteReasoning(groups: readonly unknown[]): Map<stri
  * build string (observed `2.3.76922` on TRAE SOLO CN) is rejected with
  * `4001 ... parameter type does not match binding data`.
  */
-export const TRAE_VERSION_CODE_FALLBACK = '20260716'
+const TRAE_VERSION_CODE_FALLBACK = '20260716'
 
 /** Keep a purely numeric build version; fall back when it cannot bind. */
-export function normalizeTraeVersionCode(buildVersion: string | undefined): string {
+function normalizeTraeVersionCode(buildVersion: string | undefined): string {
   if (buildVersion === undefined || buildVersion.trim() === '') return TRAE_VERSION_CODE_FALLBACK
   const trimmed = buildVersion.trim()
   return /^\d+$/.test(trimmed) ? trimmed : TRAE_VERSION_CODE_FALLBACK
 }
 
 /** Join a gateway base and an API path without doubling slashes. */
-export function traeEndpoint(baseUrl: string, path: string): string {
+function traeEndpoint(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/$/, '')}/${path.replace(/^\//, '')}`
 }
 
 /** Headers derived from persisted identity, never a new random identity per request. */
-export function traeIdentityHeaders(identity: TraeIdentity): Record<string, string> {
+function traeIdentityHeaders(identity: TraeIdentity): Record<string, string> {
   return {
     'x-machine-id': identity.machineId,
     'x-device-id': identity.deviceId,
@@ -239,7 +251,7 @@ export function traeIdentityHeaders(identity: TraeIdentity): Record<string, stri
  * Headers shared by every Trae edition. The same shape is accepted by both
  * gateways (identical `x-app-id`, identity headers, and `Cloud-IDE-JWT` auth).
  */
-export function buildTraeHeaders(
+function buildTraeHeaders(
   credential: TraeCredential,
   identity: TraeIdentity,
   options: { appId?: string; requestId?: string } = {},
@@ -380,7 +392,7 @@ function wireCreditMultiplier(config: Record<string, unknown>): number | undefin
  * First function to list a `config_name` owns it, so precedence follows
  * `TRAE_DIRECTORY_FUNCTIONS` order. Pure: no network, no token logging.
  */
-export function collectTraeSoloModels(
+function collectTraeSoloModels(
   list: readonly unknown[],
   directoryFunction: string,
   byId: Map<string, TraeSoloModel>,
@@ -437,11 +449,20 @@ export const TRAE_CHECKIN_STATUS_PATH = '/trae/api/v2/ug/checkin_credits/status'
 export const TRAE_CHECKIN_CLAIM_PATH = '/trae/api/v2/ug/checkin_credits/claim'
 
 /**
+ * Deadline for the chat POST to reach its response headers.
+ *
+ * Headers only: the body runs on the idle watchdog, because a signal handed to
+ * fetch stays attached to the body and a whole-stream deadline cut every long
+ * turn in half.
+ */
+const TRAE_HEADERS_TIMEOUT_MS = 60_000
+
+/**
  * Headers the check-in endpoints are proven with. `x-device-id` must be the
  * persisted 16-digit device number: a GUID answers 9074 ("too many
  * participants"), so it comes from `identity`, never from a fresh value.
  */
-export function traeCheckinHeaders(credential: TraeCredential, identity: TraeIdentity, region: TraeRegion = 'cn'): Record<string, string> {
+function traeCheckinHeaders(credential: TraeCredential, identity: TraeIdentity, region: TraeRegion = 'cn'): Record<string, string> {
   return {
     'Authorization': `Cloud-IDE-JWT ${credential.accessToken}`,
     'X-User-Region': region,
@@ -476,7 +497,7 @@ export interface TraePayStatus {
 }
 
 /** Parse the `ide_user_pay_status` answer; never throws on a thin payload. */
-export function traePayStatusOf(payload: unknown): TraePayStatus {
+function traePayStatusOf(payload: unknown): TraePayStatus {
   const record = payload !== null && typeof payload === 'object' ? payload as Record<string, unknown> : {}
   const identity = typeof record['user_pay_identity'] === 'number' && Number.isFinite(record['user_pay_identity'])
     ? record['user_pay_identity']
@@ -556,7 +577,7 @@ function traePackNameOf(pack: Record<string, unknown>, base: Record<string, unkn
  * with no credits and a pack that is used up all drop out: the card shows what
  * is spendable, and the totals above already answer the account-wide question.
  */
-export function traeCreditPacksOf(payload: unknown): TraeCreditPack[] {
+function traeCreditPacksOf(payload: unknown): TraeCreditPack[] {
   const envelope = payload !== null && typeof payload === 'object' && !Array.isArray(payload)
     ? payload as Record<string, unknown>
     : {}
@@ -588,7 +609,7 @@ export function traeCreditPacksOf(payload: unknown): TraeCreditPack[] {
 }
 
 /** Parse one usage payload; missing digits fail loudly instead of showing 0. */
-export function traeUsageSummaryOf(payload: unknown): TraeUsageSummary {
+function traeUsageSummaryOf(payload: unknown): TraeUsageSummary {
   const envelope = payload !== null && typeof payload === 'object' && !Array.isArray(payload) ? payload as Record<string, unknown> : {}
   const summary = envelope['usage_summary']
   const record = summary !== null && typeof summary === 'object' && !Array.isArray(summary) ? summary as Record<string, unknown> : {}
@@ -618,7 +639,6 @@ export interface TraeCheckinStatus {
    */
   didCheckedIn: boolean
   credits: number
-  extraCredits: number
   code: number
   message?: string
 }
@@ -631,15 +651,33 @@ function traeFlag(value: unknown): boolean {
   return value === true || value === 'true'
 }
 
+/**
+ * Read the check-in `enable` flag.
+ *
+ * Only an explicit "off" turns check-in off. The upstream omits the field for
+ * accounts that have it on, and reading it with the strict `=== true` helper
+ * above turned every such account into "this account has no check-in": the
+ * batch skipped it without ever asking, the panel hid the button and said the
+ * account had no campaign, and nothing reported a failure. (The Trae protocol
+ * reference this plugin is built against reads it as `enable !== false`.)
+ */
+function traeEnabled(value: unknown): boolean {
+  if (value === false || value === 0) return false
+  if (typeof value === 'string') {
+    const text = value.trim().toLowerCase()
+    return text !== 'false' && text !== '0'
+  }
+  return true
+}
+
 /** Read a check-in answer; numbers and booleans may arrive as strings. */
-export function traeCheckinStatusOf(payload: unknown): TraeCheckinStatus {
+function traeCheckinStatusOf(payload: unknown): TraeCheckinStatus {
   const record = payload !== null && typeof payload === 'object' && !Array.isArray(payload) ? payload as Record<string, unknown> : {}
   return {
-    enable: traeFlag(record['enable']),
+    enable: traeEnabled(record['enable']),
     checkedIn: traeFlag(record['checked_in']),
     didCheckedIn: traeFlag(record['did_checked_in']),
     credits: traeNumber(record['credits'], 0),
-    extraCredits: traeNumber(record['extra_credits'], 0),
     code: traeNumber(record['code'], -1),
     ...typeof record['message'] === 'string' ? { message: record['message'] as string } : {},
   }
@@ -822,31 +860,76 @@ export class TraeSoloUpstreamClient {
   }
 
   /** Send one chat body through the credential's regional gateway. */
-  async chatStream(bodyJson: string, signal?: AbortSignal, functionName?: string, capability?: TraeReasoningCapability): Promise<TraeChatResult> {
+  async chatStream(
+    bodyJson: string,
+    signal?: AbortSignal,
+    functionName?: string,
+    capability?: TraeReasoningCapability,
+    timeouts?: { headersMs?: number; idleMs?: number },
+  ): Promise<TraeChatResult> {
     let prepared: string
     try { prepared = prepareSoloBody(bodyJson, undefined, functionName, capability) }
     catch { return { ok: false, status: 400, kind: 'client', message: 'invalid JSON request' } }
-    const [credential, identity] = await Promise.all([this.options.credential(), this.options.identity()])
+    let credential: TraeCredential
+    let identity: TraeIdentity
+    try {
+      [credential, identity] = await Promise.all([this.options.credential(), this.options.identity()])
+    } catch (error: unknown) {
+      // The identity read is disk I/O the gateway does not guard; a storage
+      // file that vanishes between the two reads is a 503, not a 500.
+      return { ok: false, status: 503, kind: 'server', message: `identity read failed: ${String(error instanceof Error ? error.message : error)}` }
+    }
     const headers = buildTraeHeaders(credential, identity)
     const base = this.options.baseUrl ?? REGION_GATEWAYS[traeRegionOfCredential(credential)].chat
     let response: Response
+    // Headers on a clock of their own, the body on the idle watchdog: a signal
+    // handed to fetch stays attached to the body, so a whole-stream deadline
+    // here used to cut every turn longer than two minutes in half.
+    const deadline = headersDeadline(signal, timeouts?.headersMs ?? TRAE_HEADERS_TIMEOUT_MS)
     try {
       response = await this.fetchImpl(traeEndpoint(base, TRAE_SOLO_CHAT_PATH), {
         redirect: 'error',
         method: 'POST', headers, body: prepared,
-        signal: signal === undefined ? AbortSignal.timeout(120_000) : AbortSignal.any([signal, AbortSignal.timeout(120_000)]),
+        signal: deadline.signal,
       })
     } catch (error: unknown) {
+      // The caller hanging up is not an upstream failure. Answering it as one
+      // made every cancelled turn read as a network fault, and spent a rotation
+      // on a request the client had already dropped.
+      if (signal?.aborted === true) {
+        return { ok: false, status: 0, kind: 'aborted', message: 'cancelled by the caller' }
+      }
       return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
+    } finally {
+      deadline.arrived()
     }
-    if (response.ok) return { ok: true, response }
+    if (response.ok) {
+      return {
+        ok: true,
+        response: response.body === null
+          ? response
+          : new Response(withIdleWatchdog(response.body, timeouts?.idleMs, signal), {
+            status: response.status,
+            headers: response.headers,
+          }),
+      }
+    }
     // Guarded like every sibling body read: a non-2xx whose connection dies
     // mid-body (a proxy cutting a 429, a gateway reset) rejects this, and the
     // rejection escaped `chatStream` entirely - the client saw a plugin-level
     // 500 with `TypeError: terminated` instead of the upstream's own status and
     // message, which are exactly what the failover needs to choose another
     // account.
-    const text = (await response.text().catch(() => '')).slice(0, 1024)
-    return { ok: false, status: response.status, kind: classifyTraeUpstreamError(response.status), message: text || `Trae SOLO returned HTTP ${response.status}` }
+    const text = (await readErrorBody(response, 1024, signal))
+    return {
+      ok: false,
+      status: response.status,
+      kind: classifyTraeUpstreamError(response.status),
+      message: text || `Trae SOLO returned HTTP ${response.status}`,
+      // The rate limit's own wait time, carried out so the gateway can answer
+      // with it: the in-stream path already relays one, and a client told to
+      // wait retries at once without it.
+      retryAfter: response.headers.get('retry-after'),
+    }
   }
 }

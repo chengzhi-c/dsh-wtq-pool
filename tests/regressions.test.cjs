@@ -72,8 +72,11 @@ test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
     assert.ok(Array.isArray((await plugin.onPanelInvoke('xd.doctor')).findings), 'connection check must return findings')
     now += 31 * 60 * 1000
     for (const timer of timers) if (timer.at <= now) timer.callback()
-    await new Promise((resolve) => setTimeout(resolve, 30))
-    assert.equal(models.mock.callCount(), 1, 'an idle plugin must not refetch the catalog')
+    // No count assertion here on purpose. The background timers may start async
+    // work whose fetch lands at an arbitrary point, so reading the count after a
+    // fixed delay was a coin flip. The invariant it was guarding is carried by
+    // the count below instead, and deterministically: anything that fetched
+    // between startup and this panel read shows up there as one too many.
     assert.equal((await plugin.onPanelInvoke('xd.state')).refreshing, true, 'a panel read must refresh a stale catalog')
     let state
     for (let attempt = 0; attempt < 50; attempt++) {
@@ -82,7 +85,7 @@ test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
       if (!state.refreshing) break
     }
     assert.equal(state.refreshing, false, 'the on-demand refresh must settle')
-    assert.equal(models.mock.callCount(), 2, 'a stale panel read must fetch once')
+    assert.equal(models.mock.callCount(), 2, 'a stale panel read must fetch once, and nothing before it may have')
     await plugin.onPanelInvoke('xd.state', { wait: true })
     assert.equal(models.mock.callCount(), 3, 'manual refresh must bypass the cache')
     await stopRegisteredService()
@@ -255,6 +258,7 @@ test('model defaults are per model and explicit reasoning remains authoritative'
     THINKING_LEVELS: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     NO_COST: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, STREAM_IDLE_TIMEOUT_MS: 300000,
     REQUEST_IMAGE_BUDGETS: {}, INERT_AUTH: { credentials: {}, authContext: {} }, LOOPBACK_BEARER: 'test',
+    CONSERVATIVE_CONTEXT_WINDOW: 128000, DEFAULT_MAX_TOKENS: 32000,
   })
   vm.runInContext(transpile(functions + '\nmodule.exports = buildAdapter;'), context)
   t.mock.method(PiAiAdapter.prototype, 'stream', options => [{ effort: options.reasoningEffort }])
@@ -339,6 +343,63 @@ test('a live sign-in with a future expiry reaches the panel and the gateway', as
     const health = await fetch(`http://127.0.0.1:${state.trae.gateways[0].port}/healthz`, { headers: { connection: 'close' } })
     assert.equal(health.status, 200)
     assert.equal((await health.json()).credentials, 1, 'the gateway must see the live sign-in')
+  } finally {
+    await stopRegisteredService()
+    await plugin.onUnload()
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+/**
+ * Switching a source on is not answered from a read taken while it was off.
+ *
+ * The credential readers cache their answer for 30 s. A source switched off
+ * leaves that cache holding the sign-ins it had, so switching it back on and
+ * refreshing straight away was answered from the stale list: a desktop sign-in
+ * made while the source was off was invisible until the cache expired *and* a
+ * further refresh ran. The switch has to drop the cache first, which is what the
+ * sibling build does and what `onHostSettingsChanged`'s own comment claims for
+ * the panel's switches.
+ */
+test('switching a source on drops the cached sign-in read', async (t) => {
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-setsource-test-'))
+  const settings = {
+    enabled: true, sourceWorkbuddy: false, sourceTrae: false, sourceQoder: false,
+    disabledRegions: [], autoCheckin: { enabled: false, hours: [9] },
+  }
+  const trae = require('../src/trae-discovery.ts')
+  const qoder = require('../src/qoder-credentials.ts')
+  let traeResets = 0
+  let qoderResets = 0
+  const realTraeReset = trae.resetTraeCredentialCache
+  const realQoderReset = qoder.resetQoderCredentialCache
+  t.mock.method(trae, 'resetTraeCredentialCache', () => { traeResets += 1; realTraeReset() })
+  t.mock.method(qoder, 'resetQoderCredentialCache', () => { qoderResets += 1; realQoderReset() })
+  const { installPi, startRegisteredService, stopRegisteredService } = require('../src/pi-compat.ts')
+  installPi({ getSettings: () => ({ ...settings }), setSettings: patch => Object.assign(settings, patch), getDataPath: () => temporary,
+    declareProviders: () => ({ ok: true, changed: false }) })
+  const context = vm.createContext({
+    require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+  })
+  context.exports = context.module.exports
+  vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
+  const plugin = context.module.exports
+  try {
+    await plugin.onLoad()
+    await startRegisteredService()
+    const before = { trae: traeResets, qoder: qoderResets }
+    await plugin.onPanelInvoke('xd.setSource', { source: 'trae', enabled: true })
+    assert.ok(traeResets > before.trae,
+      'switching Trae on must drop its cached sign-in read, or a sign-in made while it was off stays invisible')
+    await plugin.onPanelInvoke('xd.setSource', { source: 'qoder', enabled: true })
+    assert.ok(qoderResets > before.qoder,
+      'and the same for Qoder')
+    // Switching off must drop it too: the next switch-on is answered from
+    // whatever the machine looks like then, not from the read taken before.
+    const offTrae = traeResets
+    await plugin.onPanelInvoke('xd.setSource', { source: 'trae', enabled: false })
+    assert.ok(traeResets > offTrae, 'switching a source off drops the cache as well')
   } finally {
     await stopRegisteredService()
     await plugin.onUnload()
@@ -1254,6 +1315,15 @@ test('a credential echoed by an upstream never survives into the client body', (
     `{"upstream":"{\\"accessToken\\":\\"${secret}\\"}"}`,
     `qoder-oauth-token-${secret}`,
     `rt_${secret}`,
+    // The four identity headers the plugin sends that the scheme rule missed.
+    // `Cosy-Machineid` carries the same value `Cosy-Machinetoken` does, and the
+    // three `x-` headers are the Trae machine, device and account ids: an echoed
+    // request that prints them identifies the account as surely as a token.
+    `Cosy-Machineid: ${secret}`,
+    `x-machine-id: ${secret}`,
+    `x-device-id: ${secret}`,
+    `x-uid: ${secret}`,
+    `{"x-machine-id":"${secret}"}`,
   ]
   for (const shape of shapes) {
     const out = redactSecrets(shape)
@@ -1270,6 +1340,142 @@ test('a credential echoed by an upstream never survives into the client body', (
   // The business code is the actionable half of an error and must survive.
   assert.equal(redactSecrets('{"code":6004}').includes('6004'), true)
   assert.equal(redactSecrets('{"code":"soft_rate"}').includes('soft_rate'), true)
+  // A filesystem path is redacted in either spelling, quoted or not.
+  assert.equal(redactSecrets('open /home/bob/.config/qoder/auth.v1.dat failed').includes('/home/bob'), false)
+  assert.equal(redactSecrets('open /Users/bob/Library/Application Support/WorkBuddy/login.info failed').includes('/Users/bob'), false)
+  assert.equal(redactSecrets('open C:\\Users\\bob\\AppData\\qoder\\auth.v1.dat failed').includes('C:\\Users'), false)
+  // ...but a route or a ratio is not a path, and destroying it would trade a
+  // disclosure for an undiagnosable error.
+  assert.equal(redactSecrets('POST /v1/chat/completions returned 4001'), 'POST /v1/chat/completions returned 4001')
+  assert.equal(redactSecrets('the request took 1/2 a second and/or failed'), 'the request took 1/2 a second and/or failed')
+})
+
+/**
+ * A file the registry scan names is only run when its signature is valid.
+ *
+ * The scan reads `DisplayName`, `DisplayIcon` and `InstallLocation` out of the
+ * user's own uninstall keys, so any process running as the user can add one. A
+ * key naming an arbitrary executable was therefore enough to have this plugin
+ * spawn it with the plugin's whole environment, inside a process holding every
+ * WorkBuddy token. A `Valid` status requires the chain to resolve to a trusted
+ * root, which a same-user process cannot produce for a file it wrote.
+ */
+test('a file the registry scan names is only run when its signature is valid', () => {
+  const { signatureAccepts } = require('../src/at-rest.ts')
+  assert.equal(signatureAccepts('Valid', 'CN=Tencent Technology (Shenzhen) Company Limited'), true,
+    'a signature that chains to a trusted root is the only thing accepted')
+  for (const status of ['NotSigned', 'HashMismatch', 'NotTrusted', 'UnknownError', '', undefined]) {
+    assert.equal(signatureAccepts(status, 'CN=someone'), false, `a ${String(status)} signature must be refused`)
+  }
+  // A status PowerShell reported but a signer it could not name, and the blank
+  // and missing forms of the same.
+  assert.equal(signatureAccepts('Valid', ''), false, 'a valid status with no signer is not enough')
+  assert.equal(signatureAccepts('Valid', undefined), false)
+  assert.equal(signatureAccepts('Valid', '   '), false, 'a blank signer is not a signer')
+  assert.equal(signatureAccepts(undefined, undefined), false, 'an unreadable signature must be refused, not assumed')
+})
+
+/**
+ * The doctor's "published address" row covers all three sources, and names the
+ * port a held one fell back from.
+ *
+ * That table folds WorkBuddy, Trae and Qoder into one loop because all three
+ * reserve a preferred port on the same terms, so all three can drift the same
+ * way. Reporting only WorkBuddy - which is what it did before the other two
+ * were folded in - left every Trae and Qoder provider row broken while the
+ * report said everything passed. The text is user-facing in all three cases, so
+ * a row that silently disappears is a diagnosis the user never sees.
+ *
+ * The claim under test: with all three sources running, each one has a
+ * `published address` finding; and when one source's preferred port is held by
+ * another process, that source's finding is the failed one and names the port
+ * it wanted, which is the one action that clears it.
+ */
+test('the doctor reports a published address for all three sources and names the port a held one fell back from', async (t) => {
+  const net = require('node:net')
+  const { createServer } = require('node:http')
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-doctor-addr-'))
+  const auth = path.join(temporary, 'auth')
+  fs.mkdirSync(auth)
+  fs.writeFileSync(path.join(auth, 'login.info'), JSON.stringify({
+    auth: { accessToken: 'test', expiresAt: Date.now() + 3600000 }, account: { uin: 'test-user' },
+  }))
+  const settings = {
+    enabled: true, sourceWorkbuddy: true, sourceTrae: true, sourceQoder: true,
+    disabledRegions: [], autoCheckin: { enabled: false, hours: [9] }, authFile: path.join(auth, 'login.info'),
+  }
+  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
+  const { TraeSoloUpstreamClient } = require('../src/trae-upstream.ts')
+  const { QoderUpstreamClient } = require('../src/qoder-client.ts')
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [{ id: 'wb-model', name: 'WB', contextWindow: 128000, maxTokens: 4096 }])
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
+  t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchModels', async () => [{ id: 'trae-model', name: 'Trae', function: 'chat' }])
+  t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ code: 0, enable: true, checkedIn: false }))
+  t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchUsageSummary', async () => ({ credits: [], packs: [] }))
+  t.mock.method(QoderUpstreamClient.prototype, 'fetchModels', async () => [{ id: 'qoder-model', name: 'Qoder', function: 'chat' }])
+  t.mock.method(QoderUpstreamClient.prototype, 'fetchUsage', async () => ({ userQuota: { remaining: 5, total: 10 }, dedicatedPackages: [] }))
+  t.mock.method(QoderUpstreamClient.prototype, 'fetchCampaigns', async () => ({}))
+  const trae = require('../src/trae-discovery.ts')
+  const qoder = require('../src/qoder-credentials.ts')
+  t.mock.method(trae, 'discoverTraeCredentials', async () => ({
+    credentials: [{ accessToken: 'trae-token', userId: 'trae-user', edition: 'cn', host: '', source: 'desktop', expiresAtMs: 0 }],
+    failures: [],
+  }))
+  t.mock.method(qoder, 'discoverQoderCredentials', async () => ({
+    credentials: [{ region: 'cn', userID: 'qoder-user', token: 'qoder-token', name: '', email: '', expiresAtMs: 0 }],
+    failures: [],
+  }))
+  // Trae CN's preferred slot in the port block, held by an unrelated process for
+  // the whole check. Every other gateway keeps its own, so this is the one row
+  // that has to report the fallback.
+  const held = createServer((_req, res) => res.writeHead(503).end('port held'))
+  await new Promise((resolve, reject) => { held.once('error', reject); held.listen(42851, '127.0.0.1', resolve) })
+  const { installPi, startRegisteredService, stopRegisteredService } = require('../src/pi-compat.ts')
+  installPi({ getSettings: () => ({ ...settings }), setSettings: patch => Object.assign(settings, patch), getDataPath: () => temporary,
+    declareProviders: () => ({ ok: true, changed: false }) })
+  const context = vm.createContext({
+    require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+  })
+  context.exports = context.module.exports
+  vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
+  const plugin = context.module.exports
+  const address = (findings, id) => findings.find((finding) => finding.id === id)
+  try {
+    await plugin.onLoad()
+    await startRegisteredService()
+    // The gateways start behind the load's budget, so poll the way the panel does.
+    let report
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      report = await plugin.onPanelInvoke('xd.doctor')
+      if (report.findings.filter((finding) => finding.id.endsWith(': published address')).length >= 3) break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    const byId = new Map(report.findings.map((finding) => [finding.id, finding]))
+    for (const name of ['WTQ Pool (CN)', 'WTQ Pool Trae (CN)', 'WTQ Pool Qoder (CN)']) {
+      assert.ok(byId.has(name + ': published address'), `${name} must have a published address row`)
+    }
+    const held = byId.get('WTQ Pool Trae (CN): published address')
+    assert.equal(held.ok, false, 'a source whose preferred port is held is drift, not a pass')
+    assert.ok(held.detail.includes('42851'), 'the fallback text must name the port it wanted')
+    assert.ok(held.detail.includes('is held by another process'), 'the fallback text must say why')
+    // Control: the other two sources kept their own slots, so their rows pass and
+    // name the address actually bound. Without this the Trae row could be the
+    // only row left and the test would not notice two of them disappearing.
+    for (const name of ['WTQ Pool (CN)', 'WTQ Pool Qoder (CN)']) {
+      const row = byId.get(name + ': published address')
+      assert.equal(row.ok, true, `${name} kept its preferred port and must pass`)
+      assert.ok(row.detail.includes('matches the endpoint'), `${name} must name the address it bound`)
+    }
+    assert.ok(report.report.includes('published address'), 'the report text must carry the row too')
+  } finally {
+    await stopRegisteredService()
+    await plugin.onUnload()
+    held.closeAllConnections()
+    await new Promise((resolve) => held.close(resolve))
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
 })
 
 /**

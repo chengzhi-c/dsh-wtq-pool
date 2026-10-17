@@ -57,6 +57,7 @@ var EN = {
   "pool.checkinAllBusy": "Checking in…",
   "pool.checkinAllDone": "Checked in {count} account(s)",
   "pool.checkinAllNone": "Every account is already checked in today",
+  "pool.checkinAllFailed": "Checked in {count}, {failed} failed",
   "pool.emptyRegion": "No {region} account is signed in yet.",
   "pool.emptyHint": "Sign in to that edition in the WorkBuddy desktop app, then press “Detect accounts again”.",
   "pool.sourceOff": "The WorkBuddy source is switched off in plugin settings.",
@@ -90,6 +91,7 @@ var EN = {
   "source.checkedIn": "Checked in today",
   "source.claimable": "Can claim today",
   "source.noCampaign": "no daily check-in",
+  "source.campaignUnknown": "check-in state unavailable",
   "source.claimableAt": "Can claim after {time}",
   "source.deviceCheckedIn": "This device checked in today",
   "qoder.fallback": "using a spare port; the provider row still names {port}",
@@ -237,6 +239,7 @@ var EN = {
   "foot.docs": "Docs",
   "foot.license": "License",
   "err.bridge": "The panel bridge is unavailable.",
+  "err.busy": "The panel is busy with another action; try again in a moment.",
   "tag.free": "free",
   "tag.rate": "x{rate}",
   "tag.promoNight": "free until {hour}",
@@ -281,6 +284,7 @@ var ZH = {
   "pool.checkinAllBusy": "签到中…",
   "pool.checkinAllDone": "已签到 {count} 个账号",
   "pool.checkinAllNone": "所有账号今天都已签到",
+  "pool.checkinAllFailed": "已签到 {count} 个，{failed} 个失败",
   "pool.emptyRegion": "{region}这一侧还没有登录的账号。",
   "pool.emptyHint": "请在该版本的 WorkBuddy 桌面 App 里登录，再点「重新检测账号」。",
   "pool.sourceOff": "WorkBuddy 来源已在插件设置里关闭。",
@@ -314,6 +318,7 @@ var ZH = {
   "source.claimable": "今日可签到",
   "source.noAccounts": "未找到本机登录",
   "source.noCampaign": "该账号无签到活动",
+  "source.campaignUnknown": "签到状态读取失败",
   "source.deviceCheckedIn": "本机今日已签到",
   "qoder.fallback": "用的是备用端口；供应商行仍指向 {port}",
   "badge.next": "下一个",
@@ -461,6 +466,7 @@ var ZH = {
   "foot.docs": "文档",
   "foot.license": "许可",
   "err.bridge": "面板桥不可用。",
+  "err.busy": "面板正在处理其他操作，请稍候再试。",
   "tag.free": "免费",
   "tag.rate": "x{rate}",
   "tag.promoNight": "夜间免费 · 到 {hour}",
@@ -590,16 +596,23 @@ function clockHour(hour) {
 }
 
 /**
+ * The banner text currently shown, so a later pass can tell its own message
+ * from one another action put up (or cleared).
+ */
+var bannerText = "";
+
+/**
  * Show the banner. A failure reaching the panel arrives wrapped in whatever
  * envelope the bridge used; the reason itself is what the user needs, so the
  * envelope is stripped here once instead of at every call site.
  */
 function note(message, kind) {
   var banner = $("banner");
-  if (!message) { show(banner, false); banner.textContent = ""; return; }
+  if (!message) { show(banner, false); banner.textContent = ""; bannerText = ""; return; }
   banner.textContent = String(message)
     .replace(/^Error invoking remote method '[^']*':\s*/, "")
     .replace(/^Error:\s*/, "");
+  bannerText = banner.textContent;
   banner.className = kind === "warn" ? "banner warn" : "banner";
   show(banner, true);
 }
@@ -711,7 +724,7 @@ function renderHeader() {
   // away would keep naming a problem the state document no longer reports. Only
   // the banner this pass itself last showed is cleared, so a message another
   // action put up is not wiped by the poll landing behind it.
-  if (warning !== headerWarning) {
+  if (warning !== headerWarning || (warning !== "" && bannerText === "")) {
     headerWarning = warning;
     note(warning === "" ? null : warning, "warn");
   }
@@ -1063,7 +1076,8 @@ function sourceAccountCard(account, kind) {
       ? t("source.checkedIn")
       : deviceDone ? t("source.deviceCheckedIn")
         : opensLabel !== "" ? opensLabel
-          : checkin.active ? t("source.claimable") : t("source.noCampaign")));
+          : checkin.campaignsUnavailable === true ? t("source.campaignUnknown")
+            : checkin.active ? t("source.claimable") : t("source.noCampaign")));
     if (!doneToday && checkin.active && checkin.amount > 0) {
   row.appendChild(el("span", "muted", checkin.amount + " "
     + (checkin.unit === undefined || checkin.unit === "credits" ? t("credits.keepUnit") : checkin.unit)));
@@ -1265,12 +1279,31 @@ function claimSourceCheckins(source) {
     }
     var counts = payload ? payload[source] : null;
     var claimed = counts && typeof counts.claimed === "number" ? counts.claimed : 0;
-    announce(claimed > 0 ? t("pool.checkinAllDone", { count: claimed }) : t("pool.checkinAllNone"));
+    var failed = counts && typeof counts.failed === "number" ? counts.failed : 0;
+    // A round that failed used to read as "every account is already checked in
+    // today": the counts carry `failed` (and the reason), a source whose round
+    // threw carries none of its own, and the panel read the missing number as
+    // "nothing to collect". The user was told the day was done while nothing
+    // had been collected.
+    announce(failed > 0
+      ? checkinFailureText(claimed, failed, counts && counts.reason)
+      : claimed > 0 ? t("pool.checkinAllDone", { count: claimed }) : t("pool.checkinAllNone"));
   }).catch(function (error) {
     checkinBusy = null;
     note(String(error && error.message ? error.message : error));
     render();
   });
+}
+
+/**
+ * What to say when a check-in round reports failures.
+ *
+ * The counts alone cannot name the cause, and the upstream's own words are
+ * worth more than "failed": the reason is appended when the host has one.
+ */
+function checkinFailureText(claimed, failed, reason) {
+  var text = t("pool.checkinAllFailed", { count: claimed, failed: failed });
+  return typeof reason === "string" && reason !== "" ? text + " · " + reason : text;
 }
 
 /** The busy key of one source account row: source, region and label together. */
@@ -2509,8 +2542,9 @@ function modelSheetBody(model, entry) {
   body.appendChild(pair);
 
   // Thinking levels: only a model whose catalog offers a reason menu gets the
-  // control. Trae and Qoder report no levels at all, so a menu there could
-  // never take effect.
+  // control. WorkBuddy reports its own table, and Trae and Qoder advertise
+  // theirs through the gateway, so the menu appears wherever the upstream
+  // actually offers levels and the save reaches the declaration.
   var levels = effectiveLevels(model, entry);
   if (levels.length > 0) {
     var levelsWrap = el("div", "field");
@@ -2794,7 +2828,14 @@ function adopt(next) {
 }
 
 function runBusy(id, work) {
-  if (busy !== null) return Promise.reject(new Error("panel is busy"));
+  // A second action while one is running used to reject here and nowhere else:
+  // every caller answers with its own `.catch(function () {})`, so the click did
+  // nothing and said nothing. The banner is raised here, once, so a busy panel
+  // answers every control the same way.
+  if (busy !== null) {
+    note(t("err.busy"), "warn");
+    return Promise.reject(new Error("panel is busy"));
+  }
   notePress(document.activeElement);
   busy = id;
   render();
@@ -2840,7 +2881,15 @@ function adoptAndMaybePoll(next, attempts) {
   adopt(next);
   render();
   if (!next || next.refreshing !== true) { stopPolling(); return; }
-  if (attempts >= 15) { stopPolling(); return; }
+  if (attempts >= 15) {
+    // Giving up on the pass, not on the document. Leaving `refreshing` set here
+    // left the header saying "detecting…" for good: nothing else comes back for
+    // it, so the flag had to be cleared by the one who stopped watching.
+    stopPolling();
+    adopt(next && typeof next === "object" ? Object.assign({}, next, { refreshing: false }) : next);
+    render();
+    return;
+  }
   stopPolling();
   refreshPoll = window.setTimeout(function () {
     refreshPoll = null;
@@ -3036,7 +3085,10 @@ function claimAllCheckins() {
       return;
     }
     var claimed = payload && typeof payload.claimed === "number" ? payload.claimed : 0;
-    announce(claimed > 0 ? t("pool.checkinAllDone", { count: claimed }) : t("pool.checkinAllNone"));
+    var failed = payload && typeof payload.failed === "number" ? payload.failed : 0;
+    announce(failed > 0
+      ? checkinFailureText(claimed, failed, payload && payload.reason)
+      : claimed > 0 ? t("pool.checkinAllDone", { count: claimed }) : t("pool.checkinAllNone"));
   }).catch(function (error) {
     checkinBusy = null;
     note(String(error && error.message ? error.message : error));
@@ -3080,6 +3132,24 @@ function toggleAllVisible() {
 
 function fetchModelList() {
   return runBusy("fetch", function () { return invoke("xd.rescan"); }).catch(function () {});
+}
+
+/**
+ * Ask the plugin for a live model roster, silently, once per panel.
+ *
+ * Opening the panel is when the list has to be right: a roster read that timed
+ * out while the host was starting leaves the plugin's static fallback in force,
+ * and the model page then listed the fallback's own models and reported the
+ * user's saved choice as retired - on every start, until a manual fetch. The
+ * model page keeps its own "fetch list" button for a deliberate re-read.
+ */
+var modelRosterRequested = false;
+function requestModelRoster() {
+  if (modelRosterRequested || bridge === null) return;
+  modelRosterRequested = true;
+  invoke("xd.fetchModels").then(function (next) {
+    adoptAndMaybePoll(next, 0);
+  }).catch(function () {});
 }
 function discardDraft() {
   // Only the page in view: another page's unsaved edits are not this button's to
@@ -3203,6 +3273,9 @@ function selectTab(name) {
     tabs[i].setAttribute("aria-selected", isActive ? "true" : "false");
   }
   if (name === "check" && doctorResult === null) runDoctor();
+  // The model page shows a roster, so entering it is the moment to make sure
+  // that roster is the vendor's and not this plugin's own fallback.
+  if (name === "models") requestModelRoster();
 }
 
 function labelTabs() {
@@ -3323,6 +3396,9 @@ function boot() {
     invoke("xd.state").then(function (next) {
       adoptAndMaybePoll(next, 0);
       pollCheckinLog(0);
+      // After the first document, so a panel opened while the plugin process is
+      // still starting does not burn its one roster request on a dead bridge.
+      requestModelRoster();
     }).catch(function (error) {
       bootAttempts += 1;
       if (bootAttempts < 4) {

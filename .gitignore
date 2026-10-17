@@ -5,3 +5,4 @@ node_modules/
 # release artifact rather than source: keeping it in history would carry a
 # ~180 KB binary through every version bump.
 dist/
+*.norm

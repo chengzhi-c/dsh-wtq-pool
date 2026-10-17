@@ -94,7 +94,7 @@ test('a bridge that stops early releases its upstream reader', async () => {
           if (stop === 'oversized line') {
             // One line with no newline in it: the decoder's own guard throws,
             // which is a bridge failure rather than an upstream one.
-            controller.enqueue(encoder.encode('data: ' + 'x'.repeat(9 * 1024 * 1024)))
+            controller.enqueue(encoder.encode('data: ' + 'x'.repeat(65 * 1024 * 1024)))
           }
         },
         pull() { return new Promise(() => {}) },
@@ -138,7 +138,7 @@ test('a peek that fails releases the upstream reader', async () => {
     // nothing.
     let closed = false
     const endless = new ReadableStream({
-      start(controller) { controller.enqueue(encoder.encode('data: ' + 'x'.repeat(9 * 1024 * 1024))) },
+      start(controller) { controller.enqueue(encoder.encode('data: ' + 'x'.repeat(65 * 1024 * 1024))) },
       pull() { return new Promise(() => {}) },
       cancel() { closed = true },
     })

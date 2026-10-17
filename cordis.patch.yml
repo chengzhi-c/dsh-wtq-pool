@@ -4,3 +4,5 @@
 - insert:
     - id: llm-dsh-xdpool
       name: dsh-wtq-pool
+      disabled: false
+      inject: [llm, settings]

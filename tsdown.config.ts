@@ -5,22 +5,15 @@ const PLUGIN_ID = 'dsh-wtq-pool'
 /**
  * Browser-only packages the host supplies at runtime through
  * `window.__ModuleLoader__`. The client bundle must never bundle these: the
- * loader `require`s them against the host's own registry, and bundling
- * `react`/`react-dom` would inline a build that opens with a `process.env`
- * check and throws at module-evaluation time in the browser.
+ * loader `require`s them against the host's own registry, and bundling `react`
+ * would inline a build that opens with a `process.env` check and throws at
+ * module-evaluation time in the browser.
  */
 const CLIENT_EXTERNALS = [
   'react',
-  'react-dom',
+  // The client tsconfig sets the automatic JSX runtime, so any JSX in these
+  // `.tsx` files compiles to this import rather than to `react` directly.
   'react/jsx-runtime',
-  'react-dom/client',
-  '@deepseek-ai/cordis',
-  '@deepseek-ai/dsh-client-runtime/client',
-  '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-locale/client',
-  '@deepseek-ai/dsh-client-ui-settings/client',
-  '@deepseek-ai/dsh-client-ui-settings-plugins/client',
-  '@deepseek-ai/dsh-client-ui-primitives',
 ] as const
 
 /** Host-side packages the running harness provides; never bundle these. */

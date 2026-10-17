@@ -15,6 +15,8 @@
  * @module dsh-wtq-pool/pi-compat
  */
 
+import { safeMessage } from './loopback'
+
 /** One model row of a provider declaration. */
 export interface ProviderModelDescriptor {
   id: string
@@ -146,7 +148,7 @@ export const pi = {
   },
   ui: {
     showToast: async (text: string, kind?: string): Promise<void> => {
-      if (bridge.notify === undefined) return
+      if (bridge.notify === undefined) absent()
       await bridge.notify(text, kind === 'warn' ? 'warn' : 'info')
     },
     openPanel: async (): Promise<void> => {
@@ -156,14 +158,15 @@ export const pi = {
   },
   services: {
     /**
-     * The core registers one background service whose `start` brings every
+     * The background services the core registers, whose `start` brings every
      * gateway up. Cordis has no second lifecycle stage to hang that on, so the
-     * start hook is stashed here for the entry to run itself; `stop` is what the
-     * entry's cleanup calls.
+     * hooks are stashed here for the entry to run itself; `stop` is what the
+     * entry's cleanup calls. Keyed by the service's own id, so a registration
+     * that repeats one replaces it rather than leaving a second start/stop pair
+     * beside a first that is still the only one called.
      */
     register: (service: { id: string; start: () => unknown; stop: () => unknown }): void => {
-      serviceStart = service.start
-      serviceStop = service.stop
+      services.set(service.id, { start: service.start, stop: service.stop })
     },
   },
   /**
@@ -179,15 +182,46 @@ export const pi = {
   },
 }
 
-let serviceStart: (() => unknown) | undefined
-let serviceStop: (() => unknown) | undefined
+/** The hooks the services above registered, in registration order. */
+const services = new Map<string, { start: () => unknown; stop: () => unknown }>()
 
-/** Run the single service the core registered, if it did. */
+/**
+ * Run every service the core registered, if it did.
+ *
+ * One service's failure must not skip the ones after it: they are registered
+ * independently, and a service that never started is a gateway that never
+ * bound, which the panel then reports as missing with no reason attached.
+ */
 export async function startRegisteredService(): Promise<void> {
-  if (serviceStart !== undefined) await serviceStart()
+  for (const service of services.values()) {
+    try {
+      await service.start()
+    } catch (error) {
+      // Redacted like every other message this plugin hands out: a start
+      // rejection can quote the credential or the absolute path it was reading.
+      console.warn('[dsh-wtq-pool] service failed to start:', safeMessage(error))
+    }
+  }
 }
 
-/** Stop the single service the core registered, if it did. */
+/**
+ * Stop every service the core registered, if it did.
+ *
+ * One service's failure must not skip the ones after it: a gateway that never
+ * closed holds its port, and the next start falls back to a temporary one.
+ *
+ * The map is deliberately NOT cleared. Disabling and re-enabling the plugin
+ * runs stop and then start with no load in between, and clearing it here left
+ * the re-enable with nothing to start: the gateways never came back until a
+ * full reload. Registration is keyed by id, so the next load overwrites rather
+ * than accumulates.
+ */
 export async function stopRegisteredService(): Promise<void> {
-  if (serviceStop !== undefined) await serviceStop()
+  for (const service of services.values()) {
+    try {
+      await service.stop()
+    } catch (error) {
+      console.warn('[dsh-wtq-pool] service failed to stop:', safeMessage(error))
+    }
+  }
 }
