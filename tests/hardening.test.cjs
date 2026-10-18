@@ -1912,7 +1912,7 @@ test('the activity report refuses to substitute the uin for the uid', async () =
     })
   } })
   await assert.rejects(
-    () => client.reportChatActivity({ accessToken: 't', refreshToken: 'r', expiresAtMs: 0, uin: '330106411316', domain: 'www.workbuddy.cn', sourcePath: '' }, 'c1'),
+    () => client.reportChatActivity({ accessToken: 't', refreshToken: 'r', expiresAtMs: 0, uin: '900000000000', domain: 'www.workbuddy.cn', sourcePath: '' }, 'c1'),
     /uid/,
     'a credential with no uid must fail loudly rather than send the uin',
   )

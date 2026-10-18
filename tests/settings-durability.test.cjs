@@ -369,6 +369,36 @@ test('a Trae model that states a credit rate carries it to the panel', () => {
 })
 
 /**
+ * Trae lists its own helper slots in the same directory as the models, and it
+ * suffixes some of them over time (`fast_apply_new`). A name-equality filter let
+ * the suffixed ones through, so the picker offered a row that answers nothing.
+ * The prefix match has to drop the variants and keep a real model.
+ */
+test('a Trae helper slot with a variant suffix is not offered as a model', () => {
+  const host = loadHost()
+  try {
+    host.internals.traeGateways.set('cn', {
+      gateway: {
+        models: () => [
+          { id: 'fast_apply_new', name: 'Fast Apply', contextWindow: 128000, maxTokens: 16000 },
+          { id: 'title_generation_v2', name: 'Title Generation', contextWindow: 128000, maxTokens: 16000 },
+          { id: 'summary', name: 'Summary', contextWindow: 128000, maxTokens: 16000 },
+          { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 128000, maxTokens: 16000 },
+        ],
+      },
+    })
+
+    const ids = [...host.internals.sourceRosterFor(
+      'trae:cn', host.internals.traeGateways.get('cn').gateway.models(), host.internals.traeNativeOf,
+    )].map((row) => row.id)
+    assert.deepEqual(ids, ['deepseek-v4.1-flash'],
+      'only the real model survives the helper-slot filter')
+  } finally {
+    host.cleanup()
+  }
+})
+
+/**
  * Two dictionary writes in flight at once both survive.
  *
  * A dictionary-shaped setting is read as a whole, edited and written back as a
