@@ -8,6 +8,8 @@
 
 <h1 align="center">WTQ Pool</h1>
 
+<p align="center"><sub>For DeepSeek Harness · <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool">PI-Desktop edition</a></sub></p>
+
 <p align="center"><b>Use local WorkBuddy, Trae and Qoder sign-ins in DeepSeek Harness, with automatic failover when an account is rate-limited or out of quota.</b></p>
 
 <p align="center">
@@ -164,7 +166,7 @@ The host-agnostic core:
 
 | Module | Responsibility |
 | --- | --- |
-| `loopback.ts` | The loopback security model (Host/Origin checks, response writing, message redaction) |
+| `loopback.ts` | The loopback security model (Host/Origin checks, response writing, relay pumping via pumpToResponse/relayStreamOf, message redaction) |
 | `accounts.ts` | WorkBuddy sign-in parsing, token encryption, the account pool and its cooldowns |
 | `upstream.ts` | The WorkBuddy upstream client, error classification, rate-limit reset parsing |
 | `catalog.ts` | The model catalog and its static fallback list |

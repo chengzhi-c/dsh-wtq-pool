@@ -777,7 +777,7 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
         lastRows = []
         fingerprint = ''
         const message = error instanceof Error ? error.message : String(error)
-        ctx.logger.error('dsh-wtq-pool: provider registration failed', error)
+        ctx.logger.error('dsh-wtq-pool: provider registration failed', safeMessage(error))
         return { ok: false, changed: false, error: message }
       }
     },
@@ -827,7 +827,7 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
       // `apply()` and take the fiber with it. The rows keep being served by the
       // directory registration above, so what is lost is the picker's live
       // discovery, not the providers.
-      ctx.logger.error('dsh-wtq-pool: model discovery was refused', error)
+      ctx.logger.error('dsh-wtq-pool: model discovery was refused', safeMessage(error))
     }
     return () => {
       disposeDiscovery?.()
@@ -883,6 +883,6 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
     })
     .catch((error: unknown) => {
       if (stopped) return
-      ctx.logger.error('dsh-wtq-pool: activation failed', error)
+      ctx.logger.error('dsh-wtq-pool: activation failed', safeMessage(error))
     })
 }

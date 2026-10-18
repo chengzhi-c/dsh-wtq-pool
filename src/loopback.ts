@@ -486,15 +486,28 @@ export function relayStreamOf(response: Response): ReadableStream<Uint8Array> {
  */
 export async function pumpToResponse(source: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
   const reader = source.getReader()
-  // A caller that hangs up leaves the upstream read pending forever; releasing
-  // the source here is what closes the vendor's socket with the client's.
+  const releaseLock = (): void => {
+    try { reader.releaseLock() } catch { /* already released by a broken source */ }
+  }
+  // A client that hung up during the peek leaves a response that is destroyed
+  // but still reports `writable`; writing then parks forever because neither
+  // drain nor close will fire again.
+  if (res.destroyed || res.writableEnded) {
+    await reader.cancel().catch(() => {})
+    releaseLock()
+    return
+  }
   const cancel = (): void => { void reader.cancel().catch(() => {}) }
   res.once('close', cancel)
   try {
     for (;;) {
       const next = await reader.read()
       if (next.done) break
+      // A close can land between the read and the write; writing a destroyed
+      // response raises ERR_STREAM_DESTROYED and reads as a mid-write failure.
+      if (res.destroyed || res.writableEnded) break
       if (!res.write(Buffer.from(next.value))) {
+        if (res.destroyed) break
         await new Promise<void>((resolve) => {
           const wake = (): void => {
             res.off('drain', wake)
@@ -508,9 +521,9 @@ export async function pumpToResponse(source: ReadableStream<Uint8Array>, res: Se
     }
   } finally {
     res.off('close', cancel)
-    try { reader.releaseLock() } catch { /* already released by a broken source */ }
+    releaseLock()
   }
-  if (res.writable) res.end()
+  if (res.writable && !res.destroyed) res.end()
 }
 
 /**
@@ -567,6 +580,16 @@ export function guardsPass(req: IncomingMessage, res: ServerResponse): boolean {
   }
   if (!originIsLoopback(req.headers.origin)) {
     writeOpenAIError(res, 403, 'origin_not_allowed', 'Origin must be a loopback origin')
+    return false
+  }
+  // A cross-site GET (an <img> probe) carries no Origin, so the checks above
+  // let it through to routes that start account or directory reads. Browsers
+  // label it here; a native client sends no such header and is unaffected.
+  // `same-site` is another loopback port (ports are not part of the site), which
+  // a local client may legitimately use; only a remote page is `cross-site`.
+  const site = req.headers['sec-fetch-site']
+  if (typeof site === 'string' && site !== '' && site !== 'same-origin' && site !== 'same-site' && site !== 'none') {
+    writeOpenAIError(res, 403, 'origin_not_allowed', 'cross-site request to a loopback gateway')
     return false
   }
   if (!bearerAccepted(req)) {

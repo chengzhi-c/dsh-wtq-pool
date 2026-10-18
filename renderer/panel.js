@@ -657,6 +657,8 @@ var draftSlot = null;
 var busy = null;           // id of the control awaiting a response
 var checkinBusy = null;
 var doctorResult = null;
+/** Hours text typed but not yet saved, so a poll cannot overwrite it. */
+var autoHoursDraft = null;
 /** Account ids whose credit package list the user opened. Absent = collapsed. */
 var openCredits = {};
 /** The warning the header banner is currently showing, so it can be cleared. */
@@ -1418,7 +1420,9 @@ function renderAutoCheckin() {
   $("autoHoursLabel").textContent = t("auto.hours");
   var input = $("autoHours");
   input.placeholder = t("auto.hoursHint");
-  if (document.activeElement !== input) input.value = (auto.hours || []).join(",");
+  if (document.activeElement !== input) {
+    input.value = autoHoursDraft !== null ? autoHoursDraft : (auto.hours || []).join(",");
+  }
   var save = $("autoHoursSave");
   save.textContent = t("auto.hoursSave");
   save.disabled = busy !== null;
@@ -1481,9 +1485,14 @@ function autoNoteRows(auto) {
   if (last.error) return [{ text: t("auto.lastFailedAt", { slot: slot, message: last.error }), tone: "fail" }];
   var rows = [];
   if (last.pending === true) rows.push({ text: t("auto.running"), tone: "" });
+  // The head count is every source's claimed accounts, matching the rows
+  // below; `last.claimed` alone is WorkBuddy's share and read as a total.
+  var claimedTotal = (Number(last.claimed) || 0)
+    + (last.qoder ? Number(last.qoder.claimed) || 0 : 0)
+    + (last.trae ? Number(last.trae.claimed) || 0 : 0);
   rows.push({
     text: t(last.manual === true ? "auto.lastManual" : "auto.lastAuto",
-      { slot: slot, count: Number(last.claimed) || 0 }),
+      { slot: slot, count: claimedTotal }),
     tone: last.pending === true ? "" : "ok",
   });
   var push = function (label, counts) {
@@ -1538,6 +1547,11 @@ function autoNoteRows(auto) {
 
 /** Paint the check-in log as rows, so the caller does not build markup inline. */
 function paintAutoNote(host, auto) {
+  // A user who scrolled up to read an older line must not be pulled back to the
+  // bottom by every 2 s poll; only a new pass (row count change) or a box that
+  // was already at the bottom follows the tail.
+  var atBottom = host.scrollTop + host.clientHeight >= host.scrollHeight - 4;
+  var rowCount = host.childElementCount;
   clear(host);
   autoNoteRows(auto).forEach(function (row) {
     var line = el("div", "log-line" + (row.tone ? " " + row.tone : ""));
@@ -1545,10 +1559,7 @@ function paintAutoNote(host, auto) {
     line.appendChild(el("span", "log-text", row.text));
     host.appendChild(line);
   });
-  // The log is a scroll region capped at a few rows, so a fresh pass would
-  // otherwise leave the newest line - the one the user just waited for - below
-  // the fold.
-  host.scrollTop = host.scrollHeight;
+  if (host.childElementCount !== rowCount || atBottom) host.scrollTop = host.scrollHeight;
 }
 function renderAccounts() {
   var host = $("accounts");
@@ -2093,8 +2104,18 @@ function renderModels() {
   var key = page.source + "\u0000" + page.key + "\u0000"
     + list.map(function (model) { return model.id; }).sort().join("\u0000");
   var slot = page.source + "\u0000" + page.key;
-  if (drafts[slot] === undefined || drafts[slot].key !== key) {
+  if (drafts[slot] === undefined) {
     drafts[slot] = { key: key, draft: draftFor(list, page.selection) };
+  } else if (drafts[slot].key !== key) {
+    // The roster changed under an open draft (a catalog refresh, a fetch): keep
+    // the user's unsaved ticks and overrides for every id that survived, and
+    // start newly listed ids from the saved selection. Replacing the whole
+    // draft silently discarded edits the savebar was still offering to save.
+    var fresh = draftFor(list, page.selection);
+    Object.keys(fresh).forEach(function (id) {
+      if (Object.prototype.hasOwnProperty.call(drafts[slot].draft, id)) fresh[id] = drafts[slot].draft[id];
+    });
+    drafts[slot] = { key: key, draft: fresh };
   }
   draft = drafts[slot].draft;
   draftSlot = slot;
@@ -2814,6 +2835,12 @@ function render() {
       lastPressed = null;
     }
   }
+  // A pending pass whose poll was stopped (or never started) gets its watcher
+  // back here: every state adoption ends in this render, and the log row is the
+  // only thing that reports the pass as running.
+  if (state && state.autoCheckin && state.autoCheckin.last && state.autoCheckin.last.pending === true) {
+    pollCheckinLog(checkinPollAttempts);
+  }
 }
 
 // ---------------------------------------------------------------- actions
@@ -2907,6 +2934,9 @@ function adoptAndMaybePoll(next, attempts) {
 var checkinPoll = null;
 var CHECKIN_POLL_MS = 2000;
 var CHECKIN_POLL_LIMIT = 90;
+var CHECKIN_POLL_SLOW_MS = 10000;
+var checkinPollAttempts = 0;
+var checkinPollAt = null;
 
 function stopCheckinPoll() {
   if (checkinPoll !== null) {
@@ -2919,20 +2949,30 @@ function stopCheckinPoll() {
 function pollCheckinLog(attempts) {
   var last = state && state.autoCheckin && state.autoCheckin.last;
   if (!last || last.pending !== true) { stopCheckinPoll(); return; }
+  // Progress is counted per pass: a new `at` starts a fresh fast window.
+  var stamp = typeof last.at === "string" ? last.at : "";
+  if (stamp !== checkinPollAt) { checkinPollAt = stamp; attempts = 0; }
+  checkinPollAttempts = attempts;
+  // A pass running beside another action is not a reason to stop watching it,
+  // but the poll must not run while that action re-renders. `runBusy` calls
+  // back here when it finishes, so dropping the timer now is safe.
   if (busy !== null && busy !== "checkin") { stopCheckinPoll(); return; }
-  if (attempts >= CHECKIN_POLL_LIMIT) { stopCheckinPoll(); return; }
   if (checkinPoll !== null) return;
+  // Past the fast window the pass is either long or wedged; keep a slow watch
+  // instead of giving up, or the row reads "running" for the rest of the day.
+  var delay = attempts >= CHECKIN_POLL_LIMIT ? CHECKIN_POLL_SLOW_MS : CHECKIN_POLL_MS;
   checkinPoll = window.setTimeout(function () {
     checkinPoll = null;
     var revision = stateRevision;
     invoke("xd.state").then(function (again) {
       if (revision !== stateRevision) { pollCheckinLog(attempts + 1); return; }
-      if (busy !== null && busy !== "checkin") return;
+      // Another action adopted the state; its own render re-arms the watch.
+      if (busy !== null && busy !== "checkin") { stopCheckinPoll(); return; }
       adopt(again);
       render();
       pollCheckinLog(attempts + 1);
-    }).catch(function () { stopCheckinPoll(); });
-  }, CHECKIN_POLL_MS);
+    }).catch(function () { pollCheckinLog(attempts + 1); });
+  }, delay);
 }
 
 function refresh() {
@@ -3047,6 +3087,11 @@ function setAutoCheckin(enabled, hours) {
   }
   return runBusy("autoCheckin", function () {
     return invoke("xd.setAutoCheckin", { enabled: enabled === true, hours: hours });
+  }).then(function (result) {
+    // Saved: the field now follows the host's value again.
+    autoHoursDraft = null;
+    render();
+    return result;
   }).catch(function () {});
 }
 function claimCheckin(accountId) {
@@ -3149,7 +3194,12 @@ function requestModelRoster() {
   modelRosterRequested = true;
   invoke("xd.fetchModels").then(function (next) {
     adoptAndMaybePoll(next, 0);
-  }).catch(function () {});
+  }).catch(function (error) {
+    // A failed read must not latch the panel onto the static fallback for the
+    // rest of its life: release the guard so the next visit tries again.
+    modelRosterRequested = false;
+    note(String(error && error.message ? error.message : error), "warn");
+  });
 }
 function discardDraft() {
   // Only the page in view: another page's unsaved edits are not this button's to
@@ -3272,7 +3322,9 @@ function selectTab(name) {
     tabs[i].className = isActive ? "subtab active" : "subtab";
     tabs[i].setAttribute("aria-selected", isActive ? "true" : "false");
   }
-  if (name === "check" && doctorResult === null) runDoctor();
+  // Entering the tab while another action runs would raise the busy banner and
+  // silently skip the doctor; the next entry retries.
+  if (name === "check" && doctorResult === null && busy === null) runDoctor();
   // The model page shows a roster, so entering it is the moment to make sure
   // that roster is the vendor's and not this plugin's own fallback.
   if (name === "models") requestModelRoster();
@@ -3316,6 +3368,9 @@ function bind() {
   }
   // Bound once, with the state read at click time: this is a static node, so the
   // handler cannot live in the render pass that redraws it.
+  $("autoHours").addEventListener("input", function () {
+    autoHoursDraft = $("autoHours").value;
+  });
   $("autoHoursSave").addEventListener("click", function () {
     var auto = (state && state.autoCheckin) || { enabled: false };
     setAutoCheckin(auto.enabled === true, parseCheckinHours($("autoHours").value));

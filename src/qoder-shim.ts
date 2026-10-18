@@ -273,6 +273,20 @@ export function bridgeQoderStream(
   let usage: Record<string, unknown> | undefined
   const reader = source.getReader()
   let cancelled = false
+  // A producer parked on a full queue waits for this; the consumer's next read
+  // (pull) or its cancel resolves it, with a slow re-check as a fallback.
+  let wakeRoom: (() => void) | undefined
+  const waitForRoom = (): Promise<void> => new Promise((resolve) => {
+    let settled = false
+    const wake = (): void => {
+      if (settled) return
+      settled = true
+      wakeRoom = undefined
+      resolve()
+    }
+    wakeRoom = wake
+    setTimeout(wake, 50)
+  })
 
   const chunk = (delta: Record<string, unknown> | null, finishReason: string | null = null): Uint8Array =>
     encoder.encode(`data: ${JSON.stringify({
@@ -351,6 +365,7 @@ export function bridgeQoderStream(
     if (finished) return
     finished = true
     clearTail()
+    wakeRoom?.()
     try {
       ctrl?.enqueue(encoder.encode('data: [DONE]\n\n'))
       ctrl?.close()
@@ -381,7 +396,7 @@ export function bridgeQoderStream(
     released = true
     clearTail()
     await reader.cancel().catch(() => {})
-    reader.releaseLock()
+    try { reader.releaseLock() } catch { /* already released */ }
   }
 
   return new ReadableStream<Uint8Array>({
@@ -406,7 +421,7 @@ export function bridgeQoderStream(
               for (const payload of frames.push(decoder.decode(next.value, { stream: true }))) consume(payload, controller)
               if (!frames.ended) {
                 while (!cancelled && !finished && (controller.desiredSize ?? 1) <= 0) {
-                  await new Promise<void>((resolve) => { setTimeout(resolve, 1) })
+                  await waitForRoom()
                 }
                 continue
               }
@@ -442,7 +457,9 @@ export function bridgeQoderStream(
           // left to read the frames.
           if (cancelled) controller.error(error)
           else if (!finished) {
-            if (!(error instanceof Error && error.name === 'AbortError')) options.onFailure?.(error)
+            if (!(error instanceof Error && error.name === 'AbortError')) {
+              try { options.onFailure?.(error) } catch { /* the frames below are the answer */ }
+            }
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({
               id,
               object: 'chat.completion.chunk',
@@ -464,7 +481,8 @@ export function bridgeQoderStream(
         }
       })()
     },
-    cancel(reason) { cancelled = true; clearTail(); return reader.cancel(reason) },
+    pull() { wakeRoom?.() },
+    cancel(reason) { cancelled = true; clearTail(); wakeRoom?.(); return reader.cancel(reason) },
   })
 }
 

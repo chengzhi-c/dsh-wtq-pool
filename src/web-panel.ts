@@ -23,7 +23,7 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 
 import { PANEL_BASE } from './panel-route.ts'
-import { BodyTooLargeError, answerRequest, hostIsLoopback, originIsLoopback, readJsonBody, safeMessage, writeJson } from './loopback.ts'
+import { BodyTooLargeError, answerRequest, hostIsLoopback, isJsonContentType, originIsLoopback, readJsonBody, safeMessage, writeJson } from './loopback.ts'
 
 /** Re-exported for the tests, which build panel URLs against the same base. */
 export { PANEL_BASE }
@@ -407,6 +407,7 @@ export function registerPanelRoutes(ctx: { webServer: WebServerSeam }, deps: Pan
           kind: 'exact',
           path: `${PANEL_BASE}/invoke`,
           handler: (req, res) => guarded(req, res, 'POST', async () => {
+            if (!isJsonContentType(req)) return writeJson(res, 415, { error: 'Content-Type must be application/json' })
             const body = await readJsonBody(req, MAX_BODY_BYTES)
             const channel = typeof body['channel'] === 'string' ? body['channel'] : ''
             if (channel === '') return writeJson(res, 400, { error: 'channel is required' })

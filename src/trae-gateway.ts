@@ -338,6 +338,14 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       writeOpenAIError(res, 502, 'upstream_error', 'Trae SOLO returned no stream')
       return
     }
+    // The peek can take seconds on a slow first token; a caller who stopped
+    // waiting in that window still has a response object that reports writable.
+    // Cancel the bridge too: its push loop is parked on this stream's queue and
+    // would otherwise keep one timer alive for the rest of the process.
+    if (watcher.signal.aborted) {
+      void relayStreamOf(relayed).cancel().catch(() => {})
+      return
+    }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',

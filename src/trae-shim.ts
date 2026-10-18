@@ -304,6 +304,20 @@ export function bridgeTraeStream(
   const sse = new SseDecoder()
   const reader = source.getReader()
   let cancelled = false
+  // A producer parked on a full queue waits for this; the consumer's next read
+  // (pull) or its cancel resolves it, with a slow re-check as a fallback.
+  let wakeRoom: (() => void) | undefined
+  const waitForRoom = (): Promise<void> => new Promise((resolve) => {
+    let settled = false
+    const wake = (): void => {
+      if (settled) return
+      settled = true
+      wakeRoom = undefined
+      resolve()
+    }
+    wakeRoom = wake
+    setTimeout(wake, 50)
+  })
   let sawToolCalls = false
   let emittedFinishReason = false
   let upstreamDone = false
@@ -392,7 +406,7 @@ export function bridgeTraeStream(
     if (released) return
     released = true
     await reader.cancel().catch(() => {})
-    reader.releaseLock()
+    try { reader.releaseLock() } catch { /* already released */ }
   }
 
   return new ReadableStream<Uint8Array>({
@@ -415,7 +429,7 @@ export function bridgeTraeStream(
               for (const event of sse.push(decoder.decode(next.value, { stream: true }))) consume(event, controller)
               if (!upstreamDone) {
                 while (!cancelled && (controller.desiredSize ?? 1) <= 0) {
-                  await new Promise<void>((resolve) => { setTimeout(resolve, 1) })
+                  await waitForRoom()
                 }
                 continue
               }
@@ -446,7 +460,9 @@ export function bridgeTraeStream(
             // An abort is this gateway's own `res.on('close')` reaching the
             // relay: the caller stopped waiting, which is the intended path and
             // not an upstream failure.
-            if (!(error instanceof Error && error.name === 'AbortError')) options.onFailure?.(error)
+            if (!(error instanceof Error && error.name === 'AbortError')) {
+              try { options.onFailure?.(error) } catch { /* the frames below are the answer */ }
+            }
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({
               id,
               object: 'chat.completion.chunk',
@@ -467,7 +483,8 @@ export function bridgeTraeStream(
         }
       })()
     },
-    cancel(reason) { cancelled = true; return reader.cancel(reason) },
+    pull() { wakeRoom?.() },
+    cancel(reason) { cancelled = true; wakeRoom?.(); return reader.cancel(reason) },
   })
 }
 

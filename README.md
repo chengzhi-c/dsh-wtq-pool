@@ -2,11 +2,13 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/logo-dark.png">
     <source media="(prefers-color-scheme: light)" srcset="https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/logo.png">
-    <img src="https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/logo.png" width="240" alt="WTQ账号池">
+    <img src="https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/logo.png" width="240" alt="WTQ Pool">
   </picture>
 </p>
 
-<h1 align="center">WTQ账号池</h1>
+<h1 align="center">WTQ Pool</h1>
+
+<p align="center"><sub>DeepSeek Harness 版 · <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool">PI-Desktop 版</a></sub></p>
 
 <p align="center"><b>把本机已登录的 WorkBuddy、Trae、Qoder 账号接入 DeepSeek Harness，限流或额度用尽时自动换号。</b></p>
 
@@ -165,7 +167,7 @@ pnpm test                # Node 自带测试，离线回归
 
 | 模块 | 职责 |
 | --- | --- |
-| `loopback.ts` | 回环端点的安全模型（Host/Origin 校验、响应写入、报错脱敏） |
+| `loopback.ts` | 回环端点的安全模型、响应写入、中继泵送（pumpToResponse / relayStreamOf）与报错脱敏 |
 | `accounts.ts` | WorkBuddy 登录文件解析、令牌加解密、账号池与冷却 |
 | `upstream.ts` | WorkBuddy 上游客户端、错误分类、限流重置解析 |
 | `catalog.ts` | 模型目录与静态兜底列表 |

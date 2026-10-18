@@ -4461,7 +4461,10 @@ function checkinSummaryText(result) {
     : ", streak " + (Number(growth.streak) || 0) + " tier(s), tasks " + (Number(growth.tasks) || 0)
       + " (+" + (Number(growth.credit) || 0) + " credits)";
   const row = (value, label) => value === undefined ? "" : ", " + label + " " + JSON.stringify(value);
-  return "WTQ Pool - checked in " + result.claimed + " account(s)" + row(result.travel, "travel")
+  const checkedIn = (Number(result.claimed) || 0)
+    + (Number(result.qoder?.claimed) || 0)
+    + (Number(result.trae?.claimed) || 0);
+  return "WTQ Pool - checked in " + checkedIn + " account(s)" + row(result.travel, "travel")
     + growthText + row(result.qoder, "Qoder") + row(result.trae, "Trae");
 }
 
@@ -5077,7 +5080,14 @@ async function autoCheckinTick(now) {
       // never ran into the panel, and steer its timer at a round already tried.
       if (!stillLoaded(retryGeneration)) return autoCheckinLast;
       qoderRetryAt = typeof retry.opensAt === "number" && retry.opensAt > Date.now() ? retry.opensAt : 0;
-      autoCheckinLast = { ...autoCheckinLast, qoder: retry, at: new Date().toISOString() };
+      // A late round adds to the day's earlier claim; replacing the row would
+      // drop the morning's count from the panel's total.
+      const claimedBefore = Number(autoCheckinLast?.qoder?.claimed) || 0
+      autoCheckinLast = {
+        ...autoCheckinLast,
+        qoder: { ...retry, claimed: claimedBefore + (Number(retry.claimed) || 0) },
+        at: new Date().toISOString(),
+      };
       log("info", "deferred Qoder check-in: " + JSON.stringify(retry));
     } catch (error) {
       // Clearing the retry time before the call is what stops one tick from
@@ -5090,9 +5100,12 @@ async function autoCheckinTick(now) {
       // already reset.
       if (stillLoaded(retryGeneration)) {
         qoderRetryAt = Date.now() + QODER_RETRY_BACKOFF_MS;
+        // The failed retry is this round's outcome only; the day's earlier claim
+        // stays in the row the panel totals.
+        const claimedBefore = Number(autoCheckinLast?.qoder?.claimed) || 0
         autoCheckinLast = {
           ...autoCheckinLast,
-          qoder: { claimed: 0, skipped: 0, failed: 1, reason: safeMessage(error) },
+          qoder: { claimed: claimedBefore, skipped: 0, failed: 1, reason: safeMessage(error) },
           at: new Date().toISOString(),
         };
         log("warn", "deferred Qoder check-in failed: " + messageOf(error));
