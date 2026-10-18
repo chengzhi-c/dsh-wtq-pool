@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto'
 import type { TraeStreamEvent } from './trae-sse'
 import { SseDecoder, decodeTraeEvent } from './trae-sse'
-import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, redactSecrets, replaySource, retryAfterHeader } from './loopback'
+import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, redactSecrets, replaySource, retryAfterHeader, withRelayStream } from './loopback'
 
 /** What the gateway must answer when Trae refuses inside the stream. */
 export interface TraeFailure {
@@ -396,68 +396,76 @@ export function bridgeTraeStream(
   }
 
   return new ReadableStream<Uint8Array>({
-    // Driven by the consumer, one upstream read per `pull`, rather than by
-    // `start`: a loop in `start` drained the whole upstream turn into this
-    // stream's queue whatever the consumer was doing, so a slow reader was fed
-    // the entire reply from memory.
-    async pull(controller) {
-      try {
-        const next = await reader.read()
-        if (cancelled) return
-        if (!next.done) {
-          for (const event of sse.push(decoder.decode(next.value, { stream: true }))) consume(event, controller)
-          // More to come: the next chunk is read when the consumer has room.
-          if (!upstreamDone) return
-        }
-        // The decoder is flushed before the SSE tail: a stream that ends in the
-        // middle of a multi-byte character holds those bytes, and `finish()`
-        // alone left them on the floor with the rest of the tail.
-        const rest = decoder.decode()
-        const events = rest === '' ? sse.finish() : [...sse.push(rest), ...sse.finish()]
-        for (const event of events) consume(event, controller)
-        // A clean EOF is a valid termination even without an explicit done
-        // event; the client still needs a non-null finish_reason.
-        if (!emittedFinishReason) {
-          emittedFinishReason = true
-          controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
-        }
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-        controller.close()
-      } catch (error: unknown) {
-        // Same contract as the Qoder bridge: a failure after output has started
-        // cannot change the 200 the client already holds, so the stream ends in
-        // the shape a client can finish on - an in-band error frame, the
-        // terminal finish chunk, then `[DONE]`. Erroring the controller left a
-        // truncated body with neither marker, which is a turn the caller can
-        // only end by timing out.
-        if (cancelled) controller.error(error)
-        else {
-          // An abort is this gateway's own `res.on('close')` reaching the
-          // relay: the caller stopped waiting, which is the intended path and
-          // not an upstream failure. It arrives before the stream's `cancel`
-          // runs, so `cancelled` is still false here and the error itself is
-          // the only signal - recorded as a warning it wrote one line per
-          // cancelled turn, which buried the failures worth reading.
-          if (!(error instanceof Error && error.name === 'AbortError')) options.onFailure?.(error)
-          // Redacted here because this frame is the one place a stream error's
-          // text reaches the client without passing through `writeOpenAIError`.
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [],
-            error: { message: redactSecrets(error instanceof Error ? error.message : String(error)), type: 'upstream_error' },
-          })}\n\n`))
-          if (!emittedFinishReason) {
-            emittedFinishReason = true
-            controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+    /**
+     * Push from one loop rather than pull one chunk at a time.
+     *
+     * The pull-driven version asked the host to call back for every upstream
+     * chunk, and in the plugin process those callbacks stopped arriving after a
+     * few kilobytes, leaving a turn that had started and then went silent. A
+     * single loop owns the read side; `desiredSize` is the only backpressure, so
+     * at most a chunk or two is held ahead of the client.
+     */
+    start(controller) {
+      void (async () => {
+        try {
+          for (;;) {
+            const next = await reader.read()
+            if (cancelled) return
+            if (!next.done) {
+              for (const event of sse.push(decoder.decode(next.value, { stream: true }))) consume(event, controller)
+              if (!upstreamDone) {
+                while (!cancelled && (controller.desiredSize ?? 1) <= 0) {
+                  await new Promise<void>((resolve) => { setTimeout(resolve, 1) })
+                }
+                continue
+              }
+            }
+            // The decoder is flushed before the SSE tail: a stream that ends in
+            // the middle of a multi-byte character holds those bytes, and
+            // `finish()` alone left them on the floor with the rest of the tail.
+            const rest = decoder.decode()
+            const events = rest === '' ? sse.finish() : [...sse.push(rest), ...sse.finish()]
+            for (const event of events) consume(event, controller)
+            // A clean EOF is a valid termination even without an explicit done
+            // event; the client still needs a non-null finish_reason.
+            if (!emittedFinishReason) {
+              emittedFinishReason = true
+              controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+            }
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+            controller.close()
+            return
           }
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-          controller.close()
+        } catch (error: unknown) {
+          // Same contract as the Qoder bridge: a failure after output has
+          // started cannot change the 200 the client already holds, so the
+          // stream ends in the shape a client can finish on - an in-band error
+          // frame, the terminal finish chunk, then `[DONE]`.
+          if (cancelled) controller.error(error)
+          else {
+            // An abort is this gateway's own `res.on('close')` reaching the
+            // relay: the caller stopped waiting, which is the intended path and
+            // not an upstream failure.
+            if (!(error instanceof Error && error.name === 'AbortError')) options.onFailure?.(error)
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [],
+              error: { message: redactSecrets(error instanceof Error ? error.message : String(error)), type: 'upstream_error' },
+            })}\n\n`))
+            if (!emittedFinishReason) {
+              emittedFinishReason = true
+              controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+            }
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+            controller.close()
+          }
+        } finally {
+          await release()
         }
-      }
-      await release()
+      })()
     },
     cancel(reason) { cancelled = true; return reader.cancel(reason) },
   })
@@ -555,9 +563,9 @@ export async function openTraeResponse(
     )
   }
   const replayed = replaySource(buffered, reader, ended)
-  // The peeked events were already decoded; the bridge must see them once.
-  return new Response(bridgeTraeStream(replayed, model, options), {
+  const relay = bridgeTraeStream(replayed, model, options)
+  return withRelayStream(new Response(relay, {
     status: 200,
     headers: { 'Content-Type': 'text/event-stream' },
-  })
+  }), relay)
 }

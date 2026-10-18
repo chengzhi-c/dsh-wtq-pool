@@ -8,8 +8,7 @@
  * identity, `fetchImpl`), so the whole path can be exercised offline.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { Readable } from 'node:stream'
-import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessage, listedModels, readRequestBody, retryAfterHeader, writeJson, writeOpenAIError } from './loopback'
+import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessage, listedModels, pumpToResponse, readRequestBody, relayStreamOf, retryAfterHeader, writeJson, writeOpenAIError } from './loopback'
 import type { TraeCredential } from './trae-discovery'
 import type { TraeIdentity, TraeReasoningCapability, TraeSoloModel, TraeUpstreamErrorKind } from './trae-upstream'
 import { TraeSoloUpstreamClient } from './trae-upstream'
@@ -345,23 +344,27 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     })
-    const body = Readable.fromWeb(relayed.body as Parameters<typeof Readable.fromWeb>[0])
-    // Transport-level only: a relay failure arrives through `onFailure` above,
-    // so anything reaching here is the socket itself. An `AbortError` is this
-    // gateway's own `res.on('close')` reaching the relay - the caller stopped
-    // waiting, which is the intended path, not a Trae failure, and one warning
-    // per cancelled turn buried everything worth reading. Every other error is
-    // logged: the failures that matter arrive after the response headers, where
-    // no client-side signal is involved and the old caller-signal gate silenced
-    // them entirely.
-    body.on('error', (error: unknown) => {
+    // Before the first token, not with it: Node holds headers back until the
+    // first body write, so a queued or thinking upstream left the client with
+    // no response at all for as long as that took.
+    res.flushHeaders()
+    // Read the bridge's own stream rather than the wrapper `Response` puts
+    // around it, and pump it directly rather than through `Readable.fromWeb`:
+    // both adapters stop delivering this plugin-built stream after the first
+    // chunks in the plugin process, which stalled the turn before a frame
+    // reached the client.
+    void pumpToResponse(relayStreamOf(relayed), res).catch((error: unknown) => {
+      // Transport-level only: a relay failure arrives through `onFailure`
+      // above, so anything reaching here is the socket itself. An `AbortError`
+      // is this gateway's own `res.on('close')` reaching the relay - the caller
+      // stopped waiting, which is the intended path, not a Trae failure, and
+      // one warning per cancelled turn buried everything worth reading.
       const aborted = watcher.signal.aborted || (error instanceof Error && error.name === 'AbortError')
       if (!aborted) {
         logger?.warn?.(LOG_PREFIX + ': trae relay stream failed mid-flight', error)
       }
       if (res.writable) res.end()
     })
-    body.pipe(res)
   }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {

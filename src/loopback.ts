@@ -452,6 +452,68 @@ export const PEEK_MAX_CHUNKS = 64
 export const PEEK_MAX_BYTES = 262_144
 
 /**
+ * The relay stream a `Response` was built from.
+ *
+ * `Response` wraps the stream it is given in another `ReadableStream`, and in
+ * the plugin process that wrapper stops delivering to its reader after the
+ * first chunks: the caller holds a 200 whose body never arrives. The bridges
+ * hand their stream over under this key as well, and the gateways pump that one
+ * directly. Nothing that reads `response.body` is affected.
+ */
+export const RELAY_STREAM = Symbol.for('wtq-pool.relay-stream')
+
+/** Attach the unwrapped relay stream to a response built around it. */
+export function withRelayStream<T extends Response>(response: T, stream: ReadableStream<Uint8Array>): T {
+  Object.defineProperty(response, RELAY_STREAM, { value: stream, enumerable: false })
+  return response
+}
+
+/** The stream to relay: the attached one when present, else the response body. */
+export function relayStreamOf(response: Response): ReadableStream<Uint8Array> {
+  const attached = (response as unknown as Record<symbol, ReadableStream<Uint8Array> | undefined>)[RELAY_STREAM]
+  if (attached !== undefined) return attached
+  if (response.body === null) throw new Error('response carries no body')
+  return response.body as ReadableStream<Uint8Array>
+}
+
+/**
+ * Relay one web stream to a Node response, honouring backpressure.
+ *
+ * Written out rather than `Readable.fromWeb` + `pipe`: that adapter stops
+ * delivering a stream this plugin built itself, so the client held a 200 whose
+ * body never arrived. Ends the response once the source ends; a read or write
+ * failure is the caller's to classify.
+ */
+export async function pumpToResponse(source: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
+  const reader = source.getReader()
+  // A caller that hangs up leaves the upstream read pending forever; releasing
+  // the source here is what closes the vendor's socket with the client's.
+  const cancel = (): void => { void reader.cancel().catch(() => {}) }
+  res.once('close', cancel)
+  try {
+    for (;;) {
+      const next = await reader.read()
+      if (next.done) break
+      if (!res.write(Buffer.from(next.value))) {
+        await new Promise<void>((resolve) => {
+          const wake = (): void => {
+            res.off('drain', wake)
+            res.off('close', wake)
+            resolve()
+          }
+          res.once('drain', wake)
+          res.once('close', wake)
+        })
+      }
+    }
+  } finally {
+    res.off('close', cancel)
+    try { reader.releaseLock() } catch { /* already released by a broken source */ }
+  }
+  if (res.writable) res.end()
+}
+
+/**
  * Replay the bytes a peek consumed, then drain the rest of the upstream.
  *
  * The relay hands the client a stream it already read the head of, so the bytes

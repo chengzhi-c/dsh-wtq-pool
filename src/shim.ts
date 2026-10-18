@@ -329,6 +329,10 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           'Connection': 'keep-alive',
           'X-Accel-Buffering': 'no',
         })
+        // Headers before the first token: Node holds them until the first body
+        // write, so a slow or queued upstream showed the client no response at
+        // all until it produced something.
+        res.flushHeaders()
         let sawDone = false
         const decoder = new TextDecoder()
         const sse = new SseDecoder()

@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto'
 import { QODER_EFFORT_ORDER, type QoderChatModel } from './qoder-client'
 import { QoderFrameDecoder, decodeQoderFrame, type QoderFrame } from './qoder-sse'
-import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, redactSecrets, replaySource, retryAfterHeader } from './loopback'
+import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, redactSecrets, relayStreamOf, replaySource, retryAfterHeader, withRelayStream } from './loopback'
 
 /**
  * How long a turn that has already emitted its finish chunk waits for anything
@@ -291,6 +291,7 @@ export function bridgeQoderStream(
   }
 
   const consume = (payload: string, controller: ReadableStreamDefaultController<Uint8Array>): void => {
+    if (finished) return
     const decoded = decodeQoderFrame(payload)
     if (decoded.type === 'unknown') return
     if (decoded.type === 'failure') {
@@ -335,17 +336,31 @@ export function bridgeQoderStream(
 
   let released = false
   let tailTimer: ReturnType<typeof setTimeout> | undefined
+  let ctrl: ReadableStreamDefaultController<Uint8Array> | undefined
+  let finished = false
   /**
-   * Wake the pending read so the tail below runs.
+   * End the turn from outside `pull`.
    *
-   * Cancelling the source resolves the read as an end rather than rejecting it,
-   * and that is the path which already emits the terminal frames. The reader
-   * itself is released by `release`, on the way out.
+   * The vendor keeps its socket open after the finish chunk, so a timer has to
+   * close the relay; waiting for a read that the vendor will never end left the
+   * client on a turn that was already over ("still generating" after the text
+   * stopped). Closing the controller directly is what makes that independent of
+   * whether a read happens to be pending.
    */
-  const endTurn = (): void => { void reader.cancel().catch(() => {}) }
+  const finalize = (): void => {
+    if (finished) return
+    finished = true
+    clearTail()
+    try {
+      ctrl?.enqueue(encoder.encode('data: [DONE]\n\n'))
+      ctrl?.close()
+    } catch { /* the consumer is already gone */ }
+    void reader.cancel().catch(() => {})
+  }
+  const endTurn = finalize
   const endSoon = (): void => {
     if (tailTimer !== undefined) return
-    tailTimer = setTimeout(endTurn, TAIL_GRACE_MS)
+    tailTimer = setTimeout(finalize, TAIL_GRACE_MS)
     tailTimer.unref?.()
   }
   const clearTail = (): void => {
@@ -370,75 +385,84 @@ export function bridgeQoderStream(
   }
 
   return new ReadableStream<Uint8Array>({
-    // Driven by the consumer, one upstream read per `pull`, rather than by
-    // `start`: a loop in `start` drained the whole upstream turn into this
-    // stream's queue whatever the consumer was doing, so a slow reader was fed
-    // the entire reply from memory.
-    async pull(controller) {
-      try {
-        const next = await reader.read()
-        if (cancelled) return
-        if (!next.done) {
-          for (const payload of frames.push(decoder.decode(next.value, { stream: true }))) consume(payload, controller)
-          // More to come: the next chunk is read when the consumer has room.
-          if (!frames.ended) return
-        }
-        // The decoder is flushed before the frame decoder's tail, for the same
-        // reason the WorkBuddy relay's is: bytes of a multi-byte character split
-        // across the last two chunks would otherwise be dropped.
-        const rest = decoder.decode()
-        for (const payload of (rest === '' ? frames.finish() : [...frames.push(rest), ...frames.finish()])) {
-          consume(payload, controller)
-        }
-        // A clean EOF is a valid termination even without an explicit finish
-        // chunk, and even when nothing was produced at all: the client still
-        // needs a non-null finish_reason and a [DONE]. Trae and WorkBuddy close
-        // the same way, and an empty turn is what the OpenAI shape describes -
-        // erroring here would leave a client that already has a 200 with a
-        // truncated response instead.
-        if (!emittedFinishReason) {
-          emittedFinishReason = true
-          controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
-        }
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-        controller.close()
-      } catch (error: unknown) {
-        // A failure after output started cannot change the 200 the client
-        // already has, so the stream has to end the way a client can act on:
-        // an in-band error frame, the terminal finish chunk, then [DONE].
-        // Erroring the controller instead left the caller with a truncated
-        // body that had neither a `finish_reason` nor `[DONE]`, so every client
-        // keyed on either one waited out its own timeout on a turn that had
-        // already failed.
-        //
-        // A caller hang-up is the one case that stays an error: nobody is left
-        // to read the frames. It arrives as an AbortError BEFORE the stream's
-        // own `cancel` runs, so `cancelled` is still false at this point and
-        // the error itself is the only signal that this is not a real
-        // upstream failure - reported as one, it wrote a line per cancelled
-        // turn and buried the failures worth reading.
-        if (cancelled) controller.error(error)
-        else {
-          if (!(error instanceof Error && error.name === 'AbortError')) options.onFailure?.(error)
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [],
-            // Redacted here because this frame is the one place a stream error's
-            // text reaches the client without passing through `writeOpenAIError`.
-            error: { message: redactSecrets(error instanceof Error ? error.message : String(error)), type: 'upstream_error' },
-          })}\n\n`))
-          if (!emittedFinishReason) {
-            emittedFinishReason = true
-            controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+    /**
+     * Push from one loop rather than pull one chunk at a time.
+     *
+     * The pull-driven version asked the host to call back for every upstream
+     * chunk, and in the plugin process those callbacks stopped arriving after a
+     * few kilobytes: the turn opened, streamed a little, and then went silent
+     * until the client gave up. One loop owns the read side; `desiredSize` is
+     * the only backpressure.
+     */
+    start(controller) {
+      ctrl = controller
+      void (async () => {
+        try {
+          for (;;) {
+            if (finished) return
+            const next = await reader.read()
+            if (cancelled || finished) return
+            if (!next.done) {
+              for (const payload of frames.push(decoder.decode(next.value, { stream: true }))) consume(payload, controller)
+              if (!frames.ended) {
+                while (!cancelled && !finished && (controller.desiredSize ?? 1) <= 0) {
+                  await new Promise<void>((resolve) => { setTimeout(resolve, 1) })
+                }
+                continue
+              }
+            }
+            // The decoder is flushed before the frame decoder's tail, for the
+            // same reason the WorkBuddy relay's is: bytes of a multi-byte
+            // character split across the last two chunks would otherwise be
+            // dropped.
+            const rest = decoder.decode()
+            for (const payload of (rest === '' ? frames.finish() : [...frames.push(rest), ...frames.finish()])) {
+              consume(payload, controller)
+            }
+            // A clean EOF is a valid termination even without an explicit finish
+            // chunk, and even when nothing was produced at all: the client still
+            // needs a non-null finish_reason and a [DONE]. Trae and WorkBuddy
+            // close the same way, and an empty turn is what the OpenAI shape
+            // describes - erroring here would leave a client that already has a
+            // 200 with a truncated response instead.
+            if (!finished) {
+              if (!emittedFinishReason) {
+                emittedFinishReason = true
+                controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+              }
+              finalize()
+            }
+            return
           }
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-          controller.close()
+        } catch (error: unknown) {
+          // A failure after output started cannot change the 200 the client
+          // already has, so the stream has to end the way a client can act on:
+          // an in-band error frame, the terminal finish chunk, then [DONE].
+          // A caller hang-up is the one case that stays an error: nobody is
+          // left to read the frames.
+          if (cancelled) controller.error(error)
+          else if (!finished) {
+            if (!(error instanceof Error && error.name === 'AbortError')) options.onFailure?.(error)
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [],
+              // Redacted here because this frame is the one place a stream error's
+              // text reaches the client without passing through `writeOpenAIError`.
+              error: { message: redactSecrets(error instanceof Error ? error.message : String(error)), type: 'upstream_error' },
+            })}\n\n`))
+            if (!emittedFinishReason) {
+              emittedFinishReason = true
+              controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+            }
+            finalize()
+          }
+        } finally {
+          await release()
         }
-      }
-      await release()
+      })()
     },
     cancel(reason) { cancelled = true; clearTail(); return reader.cancel(reason) },
   })
@@ -471,10 +495,10 @@ export async function openQoderResponse(
       { status: response.status },
     )
   }
-  const source = response.body
-  if (source === null) {
+  if (response.body === null) {
     return Response.json({ error: { message: `Qoder response ${response.status} carried no body`, type: 'upstream_error', code: 502 } }, { status: 502 })
   }
+  const source = relayStreamOf(response)
   const reader = source.getReader()
   const decoder = new TextDecoder()
   const frames = new QoderFrameDecoder()
@@ -546,8 +570,9 @@ export async function openQoderResponse(
     )
   }
   const replayed = replaySource(buffered, reader, ended)
-  return new Response(bridgeQoderStream(replayed, model, options), {
+  const relay = bridgeQoderStream(replayed, model, options)
+  return withRelayStream(new Response(relay, {
     status: 200,
     headers: { 'Content-Type': 'text/event-stream' },
-  })
+  }), relay)
 }

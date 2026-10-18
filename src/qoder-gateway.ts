@@ -11,8 +11,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { Readable } from 'node:stream'
-import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessage, listedModels, readRequestBody, retryAfterHeader, writeJson, writeOpenAIError } from './loopback'
+import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessage, listedModels, pumpToResponse, readRequestBody, relayStreamOf, retryAfterHeader, writeJson, writeOpenAIError } from './loopback'
 import type { QoderRegion } from './qoder-discovery'
 import type { QoderChatModel, QoderClientCredential, QoderUpstreamErrorKind } from './qoder-client'
 import { QoderUpstreamClient } from './qoder-client'
@@ -329,23 +328,25 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     })
-    const body = Readable.fromWeb(relayed.body as Parameters<typeof Readable.fromWeb>[0])
-    // Transport-level only: a relay failure arrives through `onFailure` above,
-    // so anything reaching here is the socket itself. An `AbortError` is this
-    // gateway's own `res.on('close')` reaching the relay - the caller stopped
-    // waiting, which is the intended path, not a Qoder failure, and one warning
-    // per cancelled turn buried everything worth reading. Every other error is
-    // logged: the failures that matter arrive after the response headers, where
-    // no client-side signal is involved and the old caller-signal gate silenced
-    // them entirely.
-    body.on('error', (error: unknown) => {
+    // Headers before the first token: Node holds them until the first body
+    // write, and a queued or thinking upstream otherwise shows the client no
+    // response at all until it produces something.
+    res.flushHeaders()
+    // The bridge's own stream, not the wrapper `Response` puts around it, and
+    // pumped directly rather than through `Readable.fromWeb`: both adapters
+    // stop delivering a stream this plugin built in the plugin process.
+    void pumpToResponse(relayStreamOf(relayed), res).catch((error: unknown) => {
+      // Transport-level only: a relay failure arrives through `onFailure`
+      // above, so anything reaching here is the socket itself. An `AbortError`
+      // is this gateway's own `res.on('close')` reaching the relay - the caller
+      // stopped waiting, which is the intended path, not a Qoder failure, and
+      // one warning per cancelled turn buried everything worth reading.
       const aborted = watcher.signal.aborted || (error instanceof Error && error.name === 'AbortError')
       if (!aborted) {
         logger?.warn?.(LOG_PREFIX + ': qoder relay stream failed mid-flight', error)
       }
       if (res.writable) res.end()
     })
-    body.pipe(res)
   }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
