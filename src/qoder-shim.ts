@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto'
 import { QODER_EFFORT_ORDER, type QoderChatModel } from './qoder-client'
 import { QoderFrameDecoder, decodeQoderFrame, type QoderFrame } from './qoder-sse'
-import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, redactSecrets, relayStreamOf, replaySource, retryAfterHeader, withRelayStream } from './loopback'
+import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, openAIFinishReason, redactSecrets, relayStreamOf, replaySource, retryAfterHeader, withRelayStream } from './loopback'
 
 /**
  * How long a turn that has already emitted its finish chunk waits for anything
@@ -332,7 +332,7 @@ export function bridgeQoderStream(
         if (typeof finish === 'string' && finish !== '' && finish !== 'null') {
           if (!emittedFinishReason) {
             emittedFinishReason = true
-            controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : finish))
+            controller.enqueue(chunk({}, openAIFinishReason(finish, sawToolCalls)))
             // Over for the client; the vendor's socket is not necessarily over.
             endSoon()
           }
@@ -443,7 +443,7 @@ export function bridgeQoderStream(
             if (!finished) {
               if (!emittedFinishReason) {
                 emittedFinishReason = true
-                controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+                controller.enqueue(chunk({}, openAIFinishReason(undefined, sawToolCalls)))
               }
               finalize()
             }
@@ -472,7 +472,7 @@ export function bridgeQoderStream(
             })}\n\n`))
             if (!emittedFinishReason) {
               emittedFinishReason = true
-              controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+              controller.enqueue(chunk({}, openAIFinishReason(undefined, sawToolCalls)))
             }
             finalize()
           }

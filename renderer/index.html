@@ -12,7 +12,6 @@
     window chrome of its own; the sticky header below is the whole top band.
   -->
   <meta name="dsh-panel" content="v1" />
-  <meta name="pi-plugin-chrome" content="v3" />
   <title>WTQ Pool</title>
   <link rel="stylesheet" href="./panel.css" />
 </head>
@@ -33,15 +32,19 @@
   <p class="sr-only" id="live" aria-live="polite"></p>
 
   <main class="page">
-    <div id="banner" class="banner" hidden></div>
+    <div id="banner" class="banner" role="alert" hidden></div>
 
     <!-- Source is the top level: WorkBuddy / Trae / Qoder each own one page of
-         every view below, so the three sources never mix on one screen. -->
-    <nav class="tabs" id="sourceTabs" role="tablist">
-      <button type="button" class="tab active" data-source="workbuddy" role="tab" aria-selected="true">WorkBuddy</button>
-      <button type="button" class="tab" data-source="trae" role="tab" aria-selected="false">Trae</button>
-      <button type="button" class="tab" data-source="qoder" role="tab" aria-selected="false">Qoder</button>
-    </nav>
+         every view below, so the three sources never mix on one screen. The risk
+         note shares their line: it applies to whichever of the three is chosen. -->
+    <div class="tabs-row">
+      <nav class="tabs" id="sourceTabs" role="tablist">
+        <button type="button" class="tab active" data-source="workbuddy" role="tab" aria-selected="true">WorkBuddy</button>
+        <button type="button" class="tab" data-source="trae" role="tab" aria-selected="false">Trae</button>
+        <button type="button" class="tab" data-source="qoder" role="tab" aria-selected="false">Qoder</button>
+      </nav>
+      <p class="tab-risk" id="riskNote"></p>
+    </div>
 
     <!-- Only appears when the host has not registered this plugin's model
          groups yet, which needs one plugin reload to clear. -->
@@ -49,13 +52,14 @@
 
     <!-- Second level: the three views of the selected source. -->
     <nav class="subtabs" id="viewTabs" role="tablist">
-      <button type="button" class="subtab active" data-tab="pool" role="tab" aria-selected="true"></button>
-      <button type="button" class="subtab" data-tab="models" role="tab" aria-selected="false"></button>
-      <button type="button" class="subtab" data-tab="check" role="tab" aria-selected="false"></button>
+      <button type="button" class="subtab active" id="view-pool" data-tab="pool" role="tab" aria-controls="poolView" aria-selected="true"></button>
+      <button type="button" class="subtab" id="view-models" data-tab="models" role="tab" aria-controls="modelsView" aria-selected="false"></button>
+      <button type="button" class="subtab" id="view-check" data-tab="check" role="tab" aria-controls="checkView" aria-selected="false"></button>
+      <button type="button" class="subtab" id="view-growth" data-tab="growth" role="tab" aria-controls="growthView" aria-selected="false"></button>
     </nav>
 
-    <section id="poolView" class="view">
-      <div class="source-group" id="workbuddyGroup" data-source="workbuddy">
+    <section id="poolView" class="view" role="tabpanel" aria-labelledby="view-pool">
+      <div class="source-group" data-source="workbuddy">
         <div class="source-head" id="workbuddyHead"></div>
         <nav class="regions" id="regionTabs" role="tablist"></nav>
         <div class="strip" id="poolStrip"></div>
@@ -78,6 +82,19 @@
       </div>
       <div class="card">
         <div class="card-head">
+          <span class="card-title" id="rewriteTitle"></span>
+          <span class="muted" id="rewriteState"></span>
+        </div>
+        <div class="switch-row">
+          <button type="button" class="small" id="rewriteClientName"></button>
+          <span class="switch-copy">
+            <span class="switch-lead" id="rewriteText"></span>
+            <span class="hint" id="rewriteHint"></span>
+          </span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">
           <span class="card-title" id="autoTitle"></span>
           <span class="muted" id="autoState"></span>
         </div>
@@ -88,6 +105,17 @@
           <button type="button" id="autoHoursSave" class="small"></button>
           <button type="button" id="autoRunNow" class="small"></button>
         </div>
+        <!-- One button, by hand: the token keep-alive has no schedule, so there
+             is no switch to turn it on or off with. It sits on the same card as
+             the check-in because both walk the same accounts, but it has no
+             hour to set. -->
+        <div class="switch-row">
+          <button type="button" class="small" id="tokenKeepAliveRun"></button>
+          <span class="switch-copy">
+            <span class="switch-lead" id="keepAliveText"></span>
+            <span class="hint" id="keepAliveHint"></span>
+          </span>
+        </div>
         <!-- Its own box, below the controls rather than beside them: the lines
              are a log of what a pass did, and sharing a row with the hour field
              made both hard to read. -->
@@ -96,7 +124,7 @@
       </div>
     </section>
 
-    <section id="modelsView" class="view" hidden>
+    <section id="modelsView" class="view" role="tabpanel" aria-labelledby="view-models" hidden>
       <!-- One model page for all three sources: the region row and the two
            columns below are shared. What differs - which roster, which stored
            selection, which gateway the save writes - is answered in panel.js,
@@ -116,7 +144,7 @@
           <div class="pane-search">
             <input type="search" id="modelSearch" class="search" />
           </div>
-          <div id="models" class="model-rows"></div>
+          <ul id="models" class="model-rows"></ul>
         </section>
 
         <section class="model-col">
@@ -142,7 +170,7 @@
       </div>
     </section>
 
-    <section id="checkView" class="view" hidden>
+    <section id="checkView" class="view" role="tabpanel" aria-labelledby="view-check" hidden>
       <div class="card">
         <div class="card-head">
           <span class="card-title" id="checkTitle"></span>
@@ -152,6 +180,29 @@
         </div>
         <div id="findings"></div>
         <pre id="report" class="report"></pre>
+      </div>
+    </section>
+
+    <!-- The growth centre on its own page, beside the pool and the models: it
+         is the one half of the check-in pass a user may want on its own, and
+         burying it under the pool page hid it behind the account list. One
+         row per account, expanded for the tier and task detail behind it. -->
+    <section id="growthView" class="view" role="tabpanel" aria-labelledby="view-growth" hidden>
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title" id="growthTitle"></span>
+          <span class="muted" id="growthState"></span>
+        </div>
+        <div class="switch-row">
+          <button type="button" class="small" id="growthRead"></button>
+          <button type="button" class="small" id="growthRun"></button>
+          <span class="switch-copy">
+            <span class="switch-lead" id="growthText"></span>
+            <span class="hint" id="growthHint"></span>
+          </span>
+        </div>
+        <div id="growthAccounts"></div>
+        <div class="hint log-box" id="growthNote"></div>
       </div>
     </section>
 

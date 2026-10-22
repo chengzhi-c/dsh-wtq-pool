@@ -13,7 +13,6 @@ import * as path from 'node:path'
 import * as os from 'node:os'
 import * as fs from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { AsyncLocalStorage } from 'node:async_hooks'
 
 import * as piAi from '@earendil-works/pi-ai'
 import { createProvider } from '@earendil-works/pi-ai'
@@ -25,7 +24,7 @@ import type { ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import z from '@deepseek-ai/schemastery'
 import type { SettingsPathOp } from '@deepseek-ai/dsh-settings'
 
-import { installPi, startRegisteredService, stopRegisteredService, type CommandSpec, type ProviderDescriptor } from './pi-compat'
+import { installPi, startRegisteredService, stopRegisteredService, type ProviderDescriptor } from './pi-compat'
 import { registerPanelRoutes, type WebServerSeam } from './web-panel.ts'
 import { ROW_ID } from './ids.ts'
 import { safeMessage } from './loopback'
@@ -132,6 +131,8 @@ export interface Config {
   removedAccounts?: unknown[]
   /** Whether the credits readout is shown beside the composer. */
   showComposerPoints?: boolean
+  /** Whether the client name is rewritten for the domestic host's channel check. */
+  rewriteClientName?: boolean
   /** How each Trae/Qoder region spreads requests. */
   sourceDistributions?: Record<string, string>
 }
@@ -201,6 +202,7 @@ export const Config: z<Config> = z.object({
   preferredSourceAccounts: asVolatile(z.any().description('Picked Trae/Qoder account per region')),
   removedAccounts: asVolatile(z.any().description('Accounts removed from the pool for good')),
   showComposerPoints: asVolatile(z.boolean().default(false).description('Show the active account credits beside the composer')),
+  rewriteClientName: asVolatile(z.boolean().default(false).description('Rename the client in the prompt WorkBuddy receives (domestic channel check 11128)')),
   sourceDistributions: asVolatile(z.any().description('How each Trae/Qoder region spreads requests')),
 }) as z<Config>
 
@@ -274,23 +276,9 @@ interface SettingsService {
   mutate?(ns: string, ops: readonly SettingsPathOp[], expectedRevision?: number): Promise<void> | void
 }
 
-interface RegisterCommandResult {
-  kind: 'success' | 'error'
-  text?: string
-}
-
-interface CommandsService {
-  register(definition: {
-    name: string
-    description: string
-    handler: () => RegisterCommandResult | Promise<RegisterCommandResult>
-  }): (() => void) | undefined
-}
-
 interface ClientContext {
   llm: LlmSeam
   settings: SettingsService
-  commands?: CommandsService
   logger: { info?(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void }
   effect(callback: () => unknown, label?: string): unknown
   inject(names: string[], callback: (scoped: ClientContext) => unknown): unknown
@@ -568,12 +556,6 @@ function registrationFingerprint(descriptors: ProviderDescriptor[]): string {
 export function apply(ctx: ClientContext, config: Config = {}): void {
   const current = (): Config => unwrapVolatileDeep(config)
   const settingsNamespace = settingsNamespaceOf(ctx)
-  // Per invocation: the notes a command's own toasts carry. A single shared
-  // buffer let two commands running at once clear each other's output, and the
-  // store follows the command's own async context, so a notification the core
-  // raises from a background pass is logged without joining a toast.
-  const commandNotes = new AsyncLocalStorage<string[]>()
-  const commands = new Map<string, () => void>()
   const settingsListeners = new Map<(next: Record<string, unknown>) => void, () => void>()
   // The handlers currently subscribed, so a push dropped while a write was in
   // flight can be re-delivered to all of them once the writes settle.
@@ -671,51 +653,6 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
       settingsHandlers.delete(handler)
       settingsListeners.get(handler)?.()
       settingsListeners.delete(handler)
-    },
-    notify: (text, kind) => {
-      commandNotes.getStore()?.push(text)
-      const line = `dsh-wtq-pool: ${text}`
-      // The severity is forwarded, not flattened: the core sends a `warn` toast
-      // for a failed pass, and logging that at info buried the one line that
-      // says something went wrong.
-      if (kind === 'warn') ctx.logger.warn?.(line)
-      else ctx.logger.info?.(line)
-    },
-    // The card lives on the Plugins page; say where instead of pretending to
-    // focus a window this host does not give the plugin.
-    openPanel: () => {
-      commandNotes.getStore()?.push('面板在 插件页 → 「账号池」卡片')
-    },
-    registerCommand: async (spec: CommandSpec) => {
-      // Through `get`, not the property: `commands` is not one of this plugin's
-      // injected services, and this host throws on an uninjected property read.
-      const service = ctx.get('commands') as CommandsService | undefined
-      if (service === undefined) return
-      const commandName = spec.id.replace(/[^a-z0-9_-]+/gi, '-').toLowerCase()
-      const dispose = service.register({
-        name: commandName,
-        description: spec.title,
-        handler: async (): Promise<RegisterCommandResult> => {
-          // A buffer of this run's own, scoped to this run's async context: two
-          // commands at once used to share one and clear each other's lines, so
-          // the toast named the wrong pass.
-          const notes: string[] = []
-          return commandNotes.run(notes, async () => {
-            try {
-              await spec.run()
-              return { kind: 'success', text: notes.join('\n') || spec.title }
-            } catch (error: unknown) {
-              // Redacted like every other message this plugin hands out.
-              return { kind: 'error', text: safeMessage(error) }
-            }
-          })
-        },
-      })
-      if (typeof dispose === 'function') commands.set(spec.id, dispose)
-    },
-    unregisterCommand: async (id: string) => {
-      commands.get(id)?.()
-      commands.delete(id)
     },
     /**
      * Publish the provider rows.
@@ -853,9 +790,7 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
     stopped = true
     lastRows = []
     // This activation's own state is its to release, whichever activation is
-    // newest: its rows, its commands, its listeners and its registrations.
-    for (const dispose of commands.values()) dispose()
-    commands.clear()
+    // newest: its rows, its listeners and its registrations.
     for (const dispose of settingsListeners.values()) dispose()
     settingsListeners.clear()
     disposeRegistration?.()

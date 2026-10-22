@@ -10,8 +10,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessage, listedModels, pumpToResponse, readRequestBody, relayStreamOf, retryAfterHeader, writeJson, writeOpenAIError } from './loopback'
 import type { TraeCredential } from './trae-discovery'
-import type { TraeIdentity, TraeReasoningCapability, TraeSoloModel, TraeUpstreamErrorKind } from './trae-upstream'
-import { TraeSoloUpstreamClient } from './trae-upstream'
+import type { TraeIdentity, TraeReasoningCapability, TraeSoloModel, TraeSoloVariant, TraeUpstreamErrorKind } from './trae-upstream'
+import { TraeSoloUpstreamClient, mergeTraeDirectory, traeVariantFor } from './trae-upstream'
 import { openTraeResponse } from './trae-shim'
 import { LOG_PREFIX } from './log'
 
@@ -33,6 +33,14 @@ export interface TraeGatewayOptions {
   logger?: TraeGatewayLogger
   /** Ids this run publishes. Discovery lists these and no others. Absent means the whole directory. */
   listedIds?: () => readonly string[]
+  /**
+   * The window this plugin publishes for a model, when the host knows it.
+   *
+   * Max mode is a second, larger window the upstream serves only on request, and
+   * it is billed on the larger tier's terms. It is therefore asked for only when
+   * the published declaration really exceeds the model's default window.
+   */
+  publishedWindowOf?: (modelId: string) => number | undefined
   /**
    * Told when one sign-in's attempt failed for a reason that is the sign-in's
    * own, with the wait the upstream named when it named one.
@@ -87,6 +95,18 @@ function capabilityMapOf(models: readonly TraeSoloModel[]): Map<string, TraeReas
   return map
 }
 
+/**
+ * Whether a failure says this model is not served by the function that was asked.
+ *
+ * Trae answers `4001` in its own envelope when the chosen function does not know
+ * the `config_name`, which is a fact about the function rather than about the
+ * request. Every other 4xx is the request's own and is passed through untouched.
+ */
+function functionGone(status: number, kind: TraeUpstreamErrorKind | undefined, message: string): boolean {
+  if (kind === 'not_found') return true
+  return status === 400 && /"code"\s*:\s*"?4001\b/.test(message)
+}
+
 export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
   const logger = options.logger
 
@@ -94,7 +114,7 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
   let catalogAt = 0
   let catalogFailedAt = 0
   let catalogErrorText = ''
-  let catalogInFlight: Promise<TraeSoloModel[]> | undefined
+  let catalogInFlight: Promise<readonly TraeSoloModel[]> | undefined
 
   /**
    * Every sign-in that could read the directory, in the order the chat path
@@ -140,10 +160,15 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
         for (const credential of candidates) {
           try {
             const read = await clientFor(credential).fetchModels()
-            cachedModels = read
+            // A partial read is merged into what is already known rather than
+            // replacing it. The function that failed is one that would have
+            // listed models, and the ones only it lists are absent from this
+            // answer - keeping them callable is the difference between a
+            // degraded roster and a model that answers 404 for a full TTL.
+            cachedModels = read.partial ? mergeTraeDirectory(cachedModels, read.models) : read.models
             catalogAt = Date.now()
             catalogFailedAt = 0
-            return read
+            return cachedModels
           } catch (error: unknown) {
             lastError = error
           }
@@ -184,7 +209,8 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
     let functions = functionMapOf(directory)
     if (functions.size === 0) functions = functionMapOf(cachedModels)
     if (functions.size === 0) {
-      writeOpenAIError(res, 503, 'upstream_unavailable', 'Trae model directory is not available yet')
+      writeOpenAIError(res, 503, 'upstream_unavailable',
+        catalogErrorText !== '' ? catalogErrorText : 'Trae model directory is not available yet')
       return
     }
     // A model the directory does not list is refused here, on the same terms as
@@ -194,6 +220,44 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
     if (!directory.some(entry => entry.id === model) && !cachedModels.some(entry => entry.id === model)) {
       writeOpenAIError(res, 404, 'not_found', `model not in the Trae directory: ${model}`)
       return
+    }
+
+    // The window the host is holding for this model, and the entry it belongs to,
+    // are read before the credential scan below: that scan awaits, and a directory
+    // refresh landing during it would leave this request pairing one generation's
+    // entry with another generation's published figure.
+    const published = options.publishedWindowOf?.(model)
+    const entry = directory.find((row) => row.id === model) ?? cachedModels.find((row) => row.id === model)
+    const serving = entry === undefined ? undefined : traeVariantFor(entry, published)
+
+    /**
+     * Which functions to try for this model, in order.
+     *
+     * The published answer leads. A partial directory read still carries the answer
+     * of a function that has just failed, so the leader can be a function the
+     * upstream no longer serves - and then every request for the model fails while
+     * an answer that did arrive this time sits unused. The rest of the answers are
+     * the fallback, one attempt each, taken only for a refusal that says this model
+     * is not there.
+     */
+    const functionOrder: string[] = []
+    const pushFunction = (name: string | undefined): void => {
+      if (name !== undefined && name !== '' && !functionOrder.includes(name)) functionOrder.push(name)
+    }
+    pushFunction(serving?.function ?? functions.get(model))
+    // The window in force: what the host published, else the model's own default.
+    const target = published ?? entry?.contextWindow
+    if (entry !== undefined && target !== undefined) {
+      const reach = (row: TraeSoloVariant): number => Math.max(row.contextWindow ?? 0, row.maxContextWindow ?? 0)
+      // Answers that can still reach the published window come first, then the
+      // ones that cannot: a narrower answer is a worse fit than the leader but a
+      // better outcome than refusing the turn outright, and the upstream rejects
+      // it on its own if the request really does not fit.
+      const answering = [...(entry.variants ?? [])].sort((a, b) => {
+        const fits = (row: TraeSoloVariant): number => (reach(row) >= target ? 1 : 0)
+        return fits(b) - fits(a) || reach(b) - reach(a) || (b.maxTokens ?? 0) - (a.maxTokens ?? 0)
+      })
+      for (const row of answering) pushFunction(row.function)
     }
 
     let credentials: TraeCredential[]
@@ -208,7 +272,7 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       return
     }
     if (watcher.signal.aborted) return
-    const capabilities = capabilityMapOf(directory)
+    const capabilities = capabilityMapOf([...cachedModels, ...directory])
 
     /**
      * One sign-in's attempt: the chat call plus the peek that turns a refusal
@@ -216,7 +280,7 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
      * because a refusal is usually a property of the sign-in (an expired login,
      * a subscription gate), which is what the next sign-in is for.
      */
-    const attemptOnce = async (credential: TraeCredential): Promise<
+    const attemptOnce = async (credential: TraeCredential, functionName: string | undefined): Promise<
       | { ok: true; relayed: Response }
       | { ok: false; status: number; message: string; kind?: TraeUpstreamErrorKind; retryAfter?: string | null }
     > => {
@@ -226,8 +290,16 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       const result = await clientFor(credential).chatStream(
         raw,
         watcher.signal,
-        functions.get(model),
+        functionName,
         capabilities.get(model),
+        undefined,
+        // Max mode is asked for only when the published window is above the tier
+        // this function serves: that is the case the host sized its budget for.
+        // The window has to be *stated* for that comparison to mean anything: a
+        // row that names only an output budget has no default tier to exceed, and
+        // reading it as 0 put the Max flag on every request to it.
+        published !== undefined && serving !== undefined
+          && serving.contextWindow !== undefined && published > serving.contextWindow,
       )
       if (!result.ok) return { ok: false, status: result.status, message: result.message, kind: result.kind, retryAfter: result.retryAfter }
       // A relay failure ends the stream in a shape the client can finish on, so
@@ -292,7 +364,15 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       if (watcher.signal.aborted) return
       const credential = credentials[index]
       if (credential === undefined) continue
-      const attempt = await attemptOnce(credential)
+      let attempt = await attemptOnce(credential, functionOrder[0])
+      // A refusal that names this model ("not in the directory / 4001") is about the
+      // function chosen, not about the request: another answer may still serve it.
+      for (let candidate = 1; candidate < functionOrder.length; candidate += 1) {
+        if (attempt.ok) break
+        if (!functionGone(attempt.status, attempt.kind, attempt.message)) break
+        logger?.warn?.(`${LOG_PREFIX}: ${model} is refused by ${functionOrder[candidate - 1]} (http ${attempt.status}); trying ${functionOrder[candidate]}`)
+        attempt = await attemptOnce(credential, functionOrder[candidate])
+      }
       if (attempt.ok) {
         opened = attempt
         break

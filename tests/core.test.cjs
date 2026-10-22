@@ -48,6 +48,112 @@ function writeSignIn(dir) {
   return dir
 }
 
+/** One readable sign-in file with a chosen identity, so a test can swap accounts. */
+function writeAccountSignIn(dir, uin, nickname) {
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'workbuddy-desktop-ai.info'), JSON.stringify({
+    auth: { accessToken: `token-${uin}`, refreshToken: `refresh-${uin}`, expiresAt: Date.now() + 3600000, lastRefreshTime: Date.now() },
+    account: { uin, nickname },
+  }))
+}
+
+/**
+ * Switching accounts in the global client must not lose the previous one.
+ *
+ * The global client writes one live file and no timestamped snapshot, so the
+ * second sign-in overwrites the first and the pool used to see a single
+ * account however many had signed in. The archive keeps the overwritten
+ * credential, and the account keeps serving: an account switch replaces the
+ * file, it does not revoke the token already issued from it.
+ */
+test('an account overwritten by the next global sign-in is kept and keeps serving', async () => {
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const root = scratch('global-switch')
+  const authDir = path.join(root, 'auth')
+  const dataPath = path.join(root, 'data')
+
+  writeAccountSignIn(authDir, 'uin-first', 'First')
+  const pool = new WorkBuddyAccountPool({ authDirs: [authDir], dataPath: () => dataPath })
+  assert.equal((await pool.scan()).length, 1, 'the first sign-in is discovered')
+
+  // The app signs in elsewhere: same live file, new identity.
+  writeAccountSignIn(authDir, 'uin-second', 'Second')
+  const accounts = await pool.scan()
+  assert.equal(accounts.length, 2, 'the overwritten account is still listed')
+  const first = accounts.find(account => account.credential.uin === 'uin-first')
+  const second = accounts.find(account => account.credential.uin === 'uin-second')
+  assert.equal(first?.archived, true, 'the overwritten account is marked archived')
+  assert.equal(second?.archived, undefined, 'the live account is not archived')
+  assert.deepEqual(
+    pool.available(Date.now()).map(account => account.credential.uin).sort(),
+    ['uin-first', 'uin-second'],
+    'the archived account is still handed out: its token has not expired',
+  )
+
+  // Signing the first account back in makes it live again.
+  writeAccountSignIn(authDir, 'uin-first', 'First')
+  const restored = await pool.scan()
+  assert.equal(
+    restored.find(account => account.credential.uin === 'uin-first')?.archived,
+    undefined,
+    'a re-signed account leaves the archive',
+  )
+})
+
+/**
+ * The archive writer reads the whole file, merges, and writes it back.
+ * A damaged document used to read as empty, so the next scan saved only the
+ * live sign-in and dropped every overwritten account the file still held.
+ */
+test('a damaged credential archive is left untouched', async () => {
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const root = scratch('damaged-archive')
+  const authDir = path.join(root, 'auth')
+  const dataPath = path.join(root, 'data')
+  writeAccountSignIn(authDir, 'uin-live', 'Live')
+  const pool = new WorkBuddyAccountPool({ authDirs: [authDir], dataPath: () => dataPath })
+  await pool.scan()
+  const archive = path.join(dataPath, 'credentials-archive.json')
+  const damaged = '{"version":1,"entries":['
+  fs.writeFileSync(archive, damaged)
+  writeAccountSignIn(authDir, 'uin-next', 'Next')
+  await pool.scan()
+  assert.equal(fs.readFileSync(archive, 'utf8'), damaged, 'a parse failure must not be rewritten as a smaller archive')
+})
+
+/**
+ * The archive is worth exactly as long as the token it holds.
+ *
+ * An archived credential that has expired must stop being served, and one
+ * whose only renewal path is gone with it must not be served either: both would
+ * spend a request on a guaranteed 401. Keeping it listed would be reporting an
+ * account the user cannot use.
+ */
+test('an archived account stops serving once its token expires', async () => {
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const root = scratch('global-switch-expiry')
+  const authDir = path.join(root, 'auth')
+  const dataPath = path.join(root, 'data')
+
+  fs.mkdirSync(authDir, { recursive: true })
+  fs.writeFileSync(path.join(authDir, 'workbuddy-desktop-ai.info'), JSON.stringify({
+    auth: { accessToken: 'token-first', refreshToken: '', expiresAt: Date.now() + 60000 },
+    account: { uin: 'uin-first', nickname: 'First' },
+  }))
+  const pool = new WorkBuddyAccountPool({ authDirs: [authDir], dataPath: () => dataPath })
+  await pool.scan()
+
+  // The switch, then enough time for the archived token to lapse.
+  writeAccountSignIn(authDir, 'uin-second', 'Second')
+  await pool.scan()
+  const later = Date.now() + 2 * 60000
+  assert.deepEqual(
+    pool.available(later).map(account => account.credential.uin),
+    ['uin-second'],
+    'an archived account with an expired token is not handed out',
+  )
+})
+
 /**
  * A scan in flight when the auth directory is repointed must not put the old
  * directory's accounts back.
@@ -267,10 +373,10 @@ test('a Qoder turn ends for the client when the upstream holds the socket open',
  * A Qoder check-in answers with a JSON document, and the whole of it decides
  * whether the claim reads as granted or failed.
  *
- * The success body used to be read through the bounded error-body helper, which
- * stops at 300 bytes. A real claim answer is longer than that, so it arrived
- * truncated, failed to parse, and the check-in was reported as failed while the
- * upstream had already granted the reward - its own `grantId` is in that body.
+ * The success body must not go through the bounded error-body helper, which
+ * stops at 300 bytes: a real claim answer is longer than that, so it would
+ * arrive truncated, fail to parse, and read as failed while the upstream had
+ * already granted the reward - its own `grantId` is in that body.
  */
 test('a Qoder claim answer longer than the error-body cap is read whole', async () => {
   const { QoderUpstreamClient } = require('../src/qoder-client.ts')

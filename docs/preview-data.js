@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Demo data for the panel preview page (docs/index.html).
  *
  * Synthetic only - accounts, credits and model ids here are illustrative and
@@ -12,7 +12,6 @@
   const state = {
     sources: { workbuddy: true, trae: true, qoder: true },
     disabledRegions: [],
-    pluginVersion: '1.0.4',
     unpublishedDeclarations: [],
     modelCap: 64,
     distribution: 'priority',
@@ -25,7 +24,10 @@
         claimed: 3,
         at: iso(-0.2),
         travel: { departed: 2, claimed: 2, adopted: 1 },
-        growth: { streak: 1, tasks: 2, credit: 400, failed: 0 },
+        growth: {
+          streak: 1, credit: 400, failed: 0,
+          detail: { accounts: 4, makeup: 1, gift: 1, compensation: 0, activity: 4, streak: 1, lottery: 2, failed: 0 },
+        },
         qoder: { claimed: 1, skipped: 0, failed: 0 },
         trae: { claimed: 1, skipped: 0, failed: 0 },
       },
@@ -47,7 +49,6 @@
         id: 'wb-cn-1',
         label: 'lin.cn@example.com',
         region: 'cn',
-        domain: 'codebuddy.cn',
         expiresAt: iso(0.02),
         cooling: false,
         rateLimitHits: 0,
@@ -79,7 +80,9 @@
         id: 'wb-cn-2',
         label: 'du.cn@example.com',
         region: 'cn',
-        domain: 'codebuddy.cn',
+        // Signed in from the panel rather than the desktop app: this is what
+        // draws the delete action beside the switch.
+        own: true,
         expiresAt: iso(4),
         cooling: false,
         rateLimitHits: 1,
@@ -98,7 +101,6 @@
         id: 'wb-cn-3',
         label: 'wu.cn@example.com',
         region: 'cn',
-        domain: 'codebuddy.cn',
         expiresAt: iso(6),
         cooling: true,
         cooldownUntil: new Date(Date.now() + 9 * 60000).toISOString(),
@@ -114,7 +116,6 @@
         id: 'wb-global-1',
         label: 'lin.intl@example.com',
         region: 'global',
-        domain: 'workbuddy.ai',
         expiresAt: iso(9),
         cooling: false,
         rateLimitHits: 0,
@@ -152,7 +153,7 @@
       {
         id: 'kimi-k2-thinking', name: 'Kimi K2 Thinking', alias: 'kimi', region: 'cn', multiplier: 0.2,
         supportsImages: false, contextWindow: 256000, maxOutputTokens: 32000,
-        nativeContextWindow: 256000, nativeMaxOutputTokens: 32000, nativeSupportsImages: false,
+        nativeContextWindow: 256000, maxContextWindow: 1000000, nativeMaxOutputTokens: 32000, maxOutputAtCeiling: 16000, nativeSupportsImages: false,
         nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: true,
       },
       {
@@ -233,7 +234,8 @@
             { id: 'doubao-seed-1.6', name: 'Doubao Seed 1.6', alias: 'doubao', nativeContextWindow: 256000,
               nativeMaxOutputTokens: 32000, nativeSupportsImages: true, nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: true },
             { id: 'kimi-k2-thinking', name: 'Kimi K2 Thinking', alias: '', nativeContextWindow: 256000,
-              nativeMaxOutputTokens: 32000, nativeSupportsImages: false, nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: false },
+              maxContextWindow: 1000000, nativeMaxOutputTokens: 32000, maxOutputAtCeiling: 16000,
+              nativeSupportsImages: false, nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: false },
           ],
           selection: { enabledModelIds: ['deepseek-v3.2', 'doubao-seed-1.6'], overrides: { 'doubao-seed-1.6': { alias: 'doubao' } } },
         },
@@ -308,6 +310,7 @@
       { id: 'accounts', ok: true, detail: '4 account(s): lin.cn@example.com, du.cn@example.com, wu.cn@example.com, lin.intl@example.com' },
       { id: 'rotation', ok: true, detail: '3 of 4 account(s) can serve a request now' },
       { id: 'host-registered-providers', ok: true, detail: 'the host is serving every provider this plugin declares' },
+      { id: 'at-rest-key', ok: true, detail: 'no at-rest key failure' },
       { id: 'WTQ Pool (CN): endpoint', ok: true, detail: 'listening on http://127.0.0.1:42831/v1' },
       { id: 'WTQ Pool (CN): models', ok: true, detail: '6 model(s) in the catalog' },
       { id: 'WTQ Pool (CN): declared', ok: true, detail: 'registered with the running host' },

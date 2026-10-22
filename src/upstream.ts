@@ -15,7 +15,8 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 
 import type { WorkBuddyCredential } from './accounts'
-import { boundedRetryAfterSeconds, redactSecrets } from './loopback'
+import { CHECKIN_TIME_ZONE, zonedDay } from './checkin-time'
+import { boundedRetryAfterSeconds, redactSecrets, withRelayStream } from './loopback'
 
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
 export type UpstreamErrorKind =
@@ -100,29 +101,6 @@ export interface WorkBuddyBuddy {
   name: string
 }
 
-/** One growth-centre task, flattened from the upstream's loosely-shaped entry. */
-export interface WorkBuddyTask {
-  /** Upstream task code; the claim path is built from it. */
-  taskCode: string
-  title: string
-  /** Reward in credits, when the task declares one. */
-  credit: number
-  /** Reward in energy, when the task declares one. */
-  energy: number
-  /** Progress target; 0 is a valid value (a task with no counter). */
-  target: number
-  /** Current progress; 0 is a valid value. */
-  current: number
-  /** Upstream enrolment state: not_accepted / accepted / claimed. */
-  acceptStatus: string
-  /** Progress reached its target and the reward is still outstanding. */
-  claimable: boolean
-  /** Reward already collected. */
-  claimed: boolean
-  /** Upstream marked the task locked (not yet reachable). */
-  locked: boolean
-}
-
 /** One streak tier and what redeeming it pays. */
 export interface WorkBuddyStreakTier {
   /** Tier key, e.g. `7d`. */
@@ -143,6 +121,11 @@ export interface WorkBuddyStreakStatus {
   nextTier: string
   /** Days still needed for `nextTier`. */
   nextTierRemaining: number
+  /**
+   * Make-up cards in hand. The same response carries the balance, so a reader
+   * that wants the card count does not pay a second request for it.
+   */
+  makeupCards: number
   tiers: readonly WorkBuddyStreakTier[]
 }
 
@@ -220,6 +203,39 @@ const ERROR_BODY_TIMEOUT_MS = 10_000
 const STREAM_HEADERS_TIMEOUT_MS = 60_000
 /** Longest a relayed chat stream may go without a single byte. */
 const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000
+/**
+ * Lifetime assumed for a token whose answer carries no `expiresIn`.
+ *
+ * It must exceed the refresh margin, or a refreshed credential would read as
+ * already-expiring and every request would refresh again. An hour is
+ * comfortably past that margin and far short of any cap, so a token with a
+ * real lifetime always replaces it in time.
+ */
+export const ASSUMED_TOKEN_LIFETIME_MS = 60 * 60 * 1000
+
+/** Longest expiry `Date` can represent; anything past it is not a date. */
+const MAX_EXPIRY_MS = 4_102_444_800_000
+
+/**
+ * Absolute expiry for a token the vendor issued, from its `expiresIn`.
+ *
+ * The figure comes from the vendor's own answer, so it is bounded here rather
+ * than trusted: a garbled one (1e300, Infinity) would otherwise store a
+ * timestamp past `Date`'s range, and the panel's `toISOString()` for that row
+ * then threw, failing the whole document rather than the one field. A value
+ * this function refuses falls back to the assumed lifetime, not to 0: 0 means
+ * "never expires", which would leave a token that really was not fresh being
+ * served as if it were.
+ */
+export function tokenExpiryMs(expiresInSec: number | undefined): number {
+  const assumed = () => Date.now() + ASSUMED_TOKEN_LIFETIME_MS
+  if (typeof expiresInSec !== 'number' || !Number.isFinite(expiresInSec) || expiresInSec <= 0) {
+    return assumed()
+  }
+  const at = Date.now() + expiresInSec * 1000
+  if (!Number.isFinite(at) || at > MAX_EXPIRY_MS) return assumed()
+  return at
+}
 
 /**
  * A response's `Retry-After`, in whole seconds, bounded.
@@ -583,7 +599,7 @@ function gatewayRejectionText(status: number): string {
     `the WorkBuddy gateway rejected this credential (http ${status}). This usually means the ` +
     'account is using a stale sign-in the upstream no longer accepts: sign in again in ' +
     'the WorkBuddy desktop app, then pick the account on the plugin card. ' +
-    "Run the WTQ Pool connection check (the command palette entry, or the panel's connection tab) to list every credential found."
+    "Run the WTQ Pool connection check (the panel's connection tab) to list every credential found."
   )
 }
 
@@ -880,51 +896,6 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {}
 }
 
-/**
- * Flatten one upstream task entry.
- *
- * Progress is reported two ways depending on the task: flat `current`/`target`
- * fields, or a nested `progress: {current, target}`. The nested form wins when
- * it carries anything, because a task that reports both puts the live counter
- * there. Entries without a usable `task_code` are dropped — without one the
- * claim path cannot be built.
- */
-function parseTask(value: unknown): WorkBuddyTask | undefined {
-  const raw = asRecord(value)
-  const taskCode = typeof raw['task_code'] === 'string' ? raw['task_code'] : ''
-  if (taskCode === '') return undefined
-
-  let current = numberField(raw, 'current')
-  let target = numberField(raw, 'target')
-  const nested = asRecord(raw['progress'])
-  const nestedCurrent = numberField(nested, 'current')
-  const nestedTarget = numberField(nested, 'target')
-  if (nestedTarget > 0 || nestedCurrent > 0) {
-    current = nestedCurrent
-    target = nestedTarget
-  }
-
-  const acceptStatus = typeof raw['accept_status'] === 'string' ? raw['accept_status'] : ''
-  const claimed = acceptStatus === 'claimed'
-  return {
-    taskCode,
-    title: typeof raw['title'] === 'string' && raw['title'] !== '' ? raw['title'] : taskCode,
-    credit: numberField(raw, 'reward_credit'),
-    energy: numberField(raw, 'reward_energy'),
-    target,
-    current,
-    acceptStatus,
-    // A task with a counter is claimable once the counter is met. A task with
-    // none (target 0, "complete your profile" and its kin) has nothing to meet,
-    // so requiring `target > 0` made it permanently unclaimable and the pass
-    // skipped it in silence: the reward was simply never collected. For those
-    // the accept state is the whole answer.
-    claimable: !claimed && (target <= 0 || current >= target),
-    claimed,
-    locked: raw['locked'] === true,
-  }
-}
-
 /** Parse one catalog entry; entries without usable token limits are dropped. */
 function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | undefined {
   if (typeof value !== 'object' || value === null) return undefined
@@ -1088,14 +1059,18 @@ export class WorkBuddyUpstreamClient {
       deadline.arrived()
     }
     if (response.ok) {
+      if (response.body === null) return { ok: true, response }
+      // The watchdog stream is handed over under the relay key as well: a
+      // Response built around a stream this plugin made stops delivering to a
+      // `Readable.fromWeb` reader after the first chunks, so the gateway pumps
+      // this stream directly instead.
+      const relayed = withIdleWatchdog(response.body, timeouts?.idleMs, signal)
       return {
         ok: true,
-        response: response.body === null
-          ? response
-          : new Response(withIdleWatchdog(response.body, timeouts?.idleMs, signal), {
-            status: response.status,
-            headers: response.headers,
-          }),
+        response: withRelayStream(new Response(relayed, {
+          status: response.status,
+          headers: response.headers,
+        }), relayed),
       }
     }
     const text = (await readErrorBody(response, ERROR_BODY_LIMIT, signal))
@@ -1260,7 +1235,13 @@ export class WorkBuddyUpstreamClient {
     let nearestExpiryMs: number | undefined
     const SOON_MS = 3 * 24 * 60 * 60 * 1000
     const parseDate = (raw: unknown): number | undefined => {
-      if (typeof raw === 'number' && raw > 1_000_000_000_000) return raw
+      // Milliseconds when the number is already one, seconds when it is an epoch
+      // a second long: every other date reader in this plugin normalises the two
+      // this way, and taking only the millisecond shape silently dropped a
+      // pack's expiry, which then left the `expiry` distribution blind to it.
+      if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+        return raw > 1_000_000_000_000 ? raw : raw > 1_000_000_000 ? raw * 1000 : undefined
+      }
       if (typeof raw === 'string' && raw !== '') {
         const parsed = Date.parse(raw)
         if (!Number.isNaN(parsed)) return parsed
@@ -1584,6 +1565,7 @@ export class WorkBuddyUpstreamClient {
       days: numberField(streak, 'days'),
       nextTier: typeof streak['next_tier'] === 'string' ? streak['next_tier'] : '',
       nextTierRemaining: numberField(streak, 'next_tier_remaining'),
+      makeupCards: numberField(asRecord(data['makeup_cards']), 'balance'),
       tiers,
     }
   }
@@ -1604,108 +1586,86 @@ export class WorkBuddyUpstreamClient {
   }
 
   /**
-   * Fetch the growth task list for one account.
+   * Call a billing-domain endpoint and return its unwrapped `data`.
    *
-   * The upstream answers `data.tasks[]`, and `claimable` is derived locally —
-   * the upstream does not mark it. The task list is the one growth endpoint
-   * that DOES carry the `/v2` prefix.
+   * Counterpart of {@link growthJson}: same envelope, but these paths carry the
+   * `/v2/billing/meter` prefix and the billing host. Kept separate because the
+   * prefix is part of the path, not something the caller should remember.
    */
-  async listTasks(credential: WorkBuddyCredential): Promise<readonly WorkBuddyTask[]> {
-    const response = await this.fetchImpl(`${chatBase(credential)}/v2/activity/growth/tasks`, {
+  private async billingJson(
+    credential: WorkBuddyCredential,
+    path: string,
+    body?: unknown,
+  ): Promise<Record<string, unknown>> {
+    const response = await this.fetchImpl(`${billingBase(credential)}${path}`, {
       redirect: 'error',
-      headers: chatHeaders(credential),
+      method: 'POST',
+      headers: billingHeaders(credential),
+      body: body === undefined ? '{}' : JSON.stringify(body),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
     const envelope = await readEnvelope(response)
     if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
-    const raw = Array.isArray(asRecord(envelope.data)['tasks']) ? asRecord(envelope.data)['tasks'] as unknown[] : []
-    const out: WorkBuddyTask[] = []
-    for (const entry of raw) {
-      const parsed = parseTask(entry)
-      if (parsed !== undefined) out.push(parsed)
-    }
-    return out
+    return asRecord(envelope.data)
   }
 
   /**
-   * Accept (enrol in) tasks by code.
+   * The one-off starter gift. Once per account; a second claim is a business
+   * error, which the caller treats as "nothing to collect".
    *
-   * Accepting is the "sign up" half: it produces no progress by itself, and the
-   * upstream answers success for an already-accepted task, so replaying this is
-   * safe. Progress is lit by real activity (a chat, an activity report).
-   *
-   * Returns the codes the upstream refused. One retired or renamed code makes
-   * the whole batch fail, which used to cost the account every reward of the
-   * pass, because the caller's second list read never ran. The batch is
-   * therefore retried code by code when it fails as a whole: a code the
-   * upstream will not take is reported instead of thrown, and the rest still
-   * lands.
+   * No `/v2` prefix: that form answers a 404 route miss, while the bare path is
+   * the one the console itself posts to.
    */
-  async acceptTasks(credential: WorkBuddyCredential, taskCodes: readonly string[]): Promise<readonly string[]> {
-    if (taskCodes.length === 0) return []
-    const post = async (codes: readonly string[]): Promise<void> => {
-      const response = await this.fetchImpl(`${chatBase(credential)}/v2/activity/growth/tasks/accept`, {
-        redirect: 'error',
-        method: 'POST',
-        headers: chatHeaders(credential),
-        body: JSON.stringify({ task_codes: [...codes] }),
-        signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
-      })
-      const envelope = await readEnvelope(response)
-      if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
-    }
-    try {
-      await post(taskCodes)
-      return []
-    } catch (error: unknown) {
-      if (taskCodes.length === 1) throw error
-      const refused: string[] = []
-      for (const code of taskCodes) {
-        try {
-          await post([code])
-        } catch {
-          refused.push(code)
-        }
-      }
-      // Every code refused on its own is the batch's own failure, not one bad
-      // code: it is rethrown so the caller's accounting still sees a failed
-      // account rather than a pass that silently collected nothing.
-      if (refused.length === taskCodes.length) throw error
-      return refused
-    }
+  async claimGift(credential: WorkBuddyCredential): Promise<number> {
+    return numberField(await this.billingJson(credential, '/billing/meter/claim-gift'), 'credit')
+  }
+
+  /** Campaign compensation, when the account has any waiting. */
+  async claimCompensation(credential: WorkBuddyCredential): Promise<number> {
+    return numberField(await this.billingJson(credential, '/billing/meter/claim-compensation'), 'credit')
   }
 
   /**
-   * Claim one task's reward.
+   * Whether yesterday is still empty on the streak heatmap.
    *
-   * Two details differ from list/accept and are load-bearing:
-   *
-   * - The task code rides the PATH, not the body.
-   * - It is served by the web origin, not the chat host, and only when the
-   *   request carries the growth-centre Origin/Referer plus
-   *   `x-client-platform: web`. The chat host's `/reward/claim` path does not
-   *   exist and answers 400 "task not completed".
-   *
-   * A repeat claim answers `already_claimed` with zero credit, which is treated
-   * as success so the caller can stay idempotent.
+   * A missed day breaks the run, and the run is what unlocks the 7/14/28-day
+   * tiers, so this is read before deciding to spend a make-up card on it.
    */
-  async claimTaskReward(credential: WorkBuddyCredential, taskCode: string): Promise<{ credit: number; energy: number }> {
-    const headers: Record<string, string> = {
-      ...billingHeaders(credential),
-      'Accept': 'application/json, text/plain, */*',
-      'Origin': 'https://www.workbuddy.cn',
-      'Referer': 'https://www.workbuddy.cn/profile/growth-center',
-      'x-client-platform': 'web',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  async missedYesterday(credential: WorkBuddyCredential): Promise<boolean> {
+    const data = await this.growthJson(credential, 'GET', '/activity/growth/heatmap')
+    const cells = Array.isArray(data['cells']) ? data['cells'] : []
+    // Yesterday in the check-in zone, not the host zone: the upstream resets at
+    // 00:00 CST and a machine in another zone would aim at the wrong day.
+    const yesterday = zonedDay(-1)
+    for (const entry of cells) {
+      const cell = asRecord(entry)
+      const date = typeof cell['date'] === 'string' ? cell['date'].slice(0, 10) : ''
+      if (date === yesterday) return numberField(cell, 'score') === 0
     }
-    const response = await this.fetchImpl(
-      `https://www.workbuddy.cn/activity/growth/tasks/${encodeURIComponent(taskCode)}/claim`,
-      { method: 'POST', redirect: 'error', headers, signal: AbortSignal.timeout(JSON_TIMEOUT_MS) },
-    )
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
-    const data = asRecord(envelope.data)
-    if (data['already_claimed'] === true) return { credit: 0, energy: 0 }
-    return { credit: numberField(data, 'credit'), energy: numberField(data, 'energy') }
+    return false
+  }
+
+  /** Spend one make-up card on a past day (`YYYY-MM-DD`). */
+  async useMakeupCard(credential: WorkBuddyCredential, date: string): Promise<void> {
+    await this.growthJson(credential, 'POST', '/activity/growth/makeup-cards/use', { target_date: date })
+  }
+
+  /** Make-up cards in hand; the streak is only repairable while this is above zero. */
+  async makeupCards(credential: WorkBuddyCredential): Promise<number> {
+    const data = await this.growthJson(credential, 'GET', '/activity/growth/streak')
+    return numberField(asRecord(data['makeup_cards']), 'balance')
+  }
+
+  /** Draws available from redeemed streak tiers. */
+  async lotteryChances(credential: WorkBuddyCredential): Promise<number> {
+    const data = await this.growthJson(credential, 'GET', '/activity/growth/lottery/summary')
+    return numberField(data, 'chances')
+  }
+
+  /** Spend one draw; the prize payload is passed through as-is. */
+  async drawLottery(credential: WorkBuddyCredential): Promise<Record<string, unknown>> {
+    return await this.growthJson(credential, 'POST', '/activity/growth/lottery/draw', {
+      client_token: randomUUID(),
+    })
   }
 }

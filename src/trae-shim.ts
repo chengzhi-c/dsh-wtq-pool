@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto'
 import type { TraeStreamEvent } from './trae-sse'
 import { SseDecoder, decodeTraeEvent } from './trae-sse'
-import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, redactSecrets, replaySource, retryAfterHeader, withRelayStream } from './loopback'
+import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, openAIFinishReason, redactSecrets, replaySource, retryAfterHeader, withRelayStream } from './loopback'
 
 /** What the gateway must answer when Trae refuses inside the stream. */
 export interface TraeFailure {
@@ -225,9 +225,9 @@ export function describeTraeFailure(failure: TraeFailure): string {
   // and `extra` is an opaque diagnostic object that may carry it too.
   //
   // The leading separator is dropped when there is nothing in front of it: a
-  // refusal with no code and no extra used to be assembled as " · upstream:
-  // ...", and that stray bullet reached the client in the error frame and in
-  // the peeked 502 body.
+  // refusal with no code and no extra would otherwise be assembled as
+  // " · upstream: ...", and that stray bullet reaches the client in the error
+  // frame and in the peeked 502 body.
   const head = parts.join(' · ')
   const text = detail === '' ? head : head === '' ? `upstream: ${detail}` : `${head} · upstream: ${detail}`
   // A refusal with neither a code nor words still has to say something: an
@@ -392,7 +392,7 @@ export function bridgeTraeStream(
     if (decoded.type !== 'done' && decoded.type !== 'delta') return
     if (emittedFinishReason) return
     emittedFinishReason = true
-    controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : decoded.finishReason || 'stop'))
+    controller.enqueue(chunk({}, openAIFinishReason(decoded.finishReason, sawToolCalls)))
   }
 
   let released = false
@@ -444,7 +444,7 @@ export function bridgeTraeStream(
             // event; the client still needs a non-null finish_reason.
             if (!emittedFinishReason) {
               emittedFinishReason = true
-              controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+              controller.enqueue(chunk({}, openAIFinishReason(undefined, sawToolCalls)))
             }
             controller.enqueue(encoder.encode('data: [DONE]\n\n'))
             controller.close()
@@ -473,7 +473,7 @@ export function bridgeTraeStream(
             })}\n\n`))
             if (!emittedFinishReason) {
               emittedFinishReason = true
-              controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+              controller.enqueue(chunk({}, openAIFinishReason(undefined, sawToolCalls)))
             }
             controller.enqueue(encoder.encode('data: [DONE]\n\n'))
             controller.close()

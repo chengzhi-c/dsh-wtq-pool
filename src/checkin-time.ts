@@ -8,11 +8,10 @@
  * decision - the configured hours, the slot id, what is due right now - without
  * a clock to fake or a settings file to write.
  *
- * The two host entries carried their own copy of this, and they had already
- * drifted: one capped the configured hours and the other did not. The cap is
- * defensive rather than load-bearing - the filter below already leaves at most
- * 24 distinct values in 0..23 - but two copies of a rule is two chances to
- * disagree about it, so there is one copy now.
+ * The cap on the configured hours is defensive rather than load-bearing - the
+ * filter below already leaves at most 24 distinct values in 0..23 - but a host
+ * entry that skipped it would disagree with this one about which hours are in
+ * force, so the rule lives in one place.
  *
  * @module dsh-wtq-pool/checkin-time
  */
@@ -42,6 +41,22 @@ export function zonedDayHour(date: Date): { day: string; hour: number } {
     return found === undefined ? '00' : found.value
   }
   return { day: pick('year') + '-' + pick('month') + '-' + pick('day'), hour: Number(pick('hour')) }
+}
+
+/**
+ * Calendar day `offset` days from today in the check-in zone, as `YYYY-MM-DD`.
+ *
+ * Same zone as {@link zonedDayHour}, so a make-up target and a scheduled pass
+ * can never disagree about which day they mean. The offset is applied to the
+ * zone's own midnight rather than to the caller's clock: adding 24-hour steps
+ * across a DST boundary in some other zone lands on the wrong date.
+ */
+export function zonedDay(offset = 0): string {
+  const today = zonedDayHour(new Date()).day
+  if (offset === 0) return today
+  const [year, month, day] = today.split('-')
+  const shifted = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day) + offset))
+  return shifted.toISOString().slice(0, 10)
 }
 
 /**

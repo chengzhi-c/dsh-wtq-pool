@@ -250,3 +250,52 @@ test('the qoder relay ends a turn whose upstream never closes', async () => {
   assert.ok(elapsed < 5000, `the turn must close on its own, took ${elapsed}ms`)
   assert.ok(upstreamCancelled, 'the upstream socket must be released')
 })
+/**
+ * A turn cut off by the output budget is still reported as truncated.
+ *
+ * Both bridges answered `tool_calls` whenever the turn had emitted one, so an
+ * upstream `length` disappeared: the client read a truncated reply as a finished
+ * one and acted on tool arguments that were themselves cut off. Only the verdict
+ * that carries nothing of its own may be replaced.
+ */
+test('a truncated tool-call turn keeps the upstream finish_reason', async () => {
+  const { bridgeQoderStream } = require('../src/qoder-shim.ts')
+  const { bridgeTraeStream } = require('../src/trae-shim.ts')
+  const encoder = new TextEncoder()
+  const toolCall = { index: 0, id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":' } }
+
+  const qoderBody = await new Response(bridgeQoderStream(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [toolCall] }, finish_reason: null }] })}\n\n` +
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'length' }] })}\n\n`,
+      ))
+      controller.close()
+    },
+  }), 'fixture-model')).text()
+  assert.match(qoderBody, /"finish_reason":"length"/, 'qoder must not turn a truncated turn into a tool-call turn')
+  assert.match(qoderBody, /"tool_calls"/, 'the tool call itself still reaches the client')
+
+  const traeBody = await new Response(bridgeTraeStream(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(
+        `data: ${JSON.stringify({ response: '', tool_calls: [toolCall], finish_reason: 'length' })}\n\n`,
+      ))
+      controller.close()
+    },
+  }), 'fixture-model')).text()
+  assert.match(traeBody, /"finish_reason":"length"/, 'trae must not turn a truncated turn into a tool-call turn')
+})
+/**
+ * The rule itself: only `stop` and silence lose to the tool-call verdict.
+ */
+test('only a stop verdict is replaced by tool_calls', () => {
+  const { openAIFinishReason } = require('../src/loopback.ts')
+  assert.equal(openAIFinishReason('stop', true), 'tool_calls')
+  assert.equal(openAIFinishReason(undefined, true), 'tool_calls')
+  assert.equal(openAIFinishReason('', true), 'tool_calls')
+  assert.equal(openAIFinishReason('length', true), 'length')
+  assert.equal(openAIFinishReason('content_filter', true), 'content_filter')
+  assert.equal(openAIFinishReason('stop', false), 'stop')
+  assert.equal(openAIFinishReason(undefined, false), 'stop')
+})

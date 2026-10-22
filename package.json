@@ -1,8 +1,8 @@
 {
   "name": "dsh-wtq-pool",
   "displayName": "WTQ Pool",
-  "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 DeepSeek Harness。WorkBuddy 被限流时自动换号。三家各有开关，国内与国际各自成组。",
-  "version": "1.0.4",
+  "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 DeepSeek Harness。限流或额度用尽时自动换号，三家各自开关，国内与国际账号分别成组。",
+  "version": "1.0.5",
   "license": "MIT",
   "author": "chengzhi-c",
   "homepage": "https://github.com/chengzhi-c/dsh-wtq-pool#readme",
@@ -55,6 +55,7 @@
     "prepublishOnly": "tsdown",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:client": "tsc -p tsconfig.client.json --noEmit",
+    "pretest": "tsdown",
     "test": "node --test \"tests/*.test.cjs\""
   },
   "dsh": {

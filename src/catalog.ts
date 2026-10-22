@@ -108,9 +108,10 @@ export class WorkBuddyCatalog {
     const enabled = this.selection.enabledModelIds
     const allow = enabled === undefined ? undefined : new Set(enabled)
     const overrides = this.selection.overrides ?? {}
+    const bounded = this.live
     return this.models
       .filter(model => allow === undefined || allow.has(model.id))
-      .map(model => applyOverride(model, overrides[model.id]))
+      .map(model => applyOverride(model, overrides[model.id], bounded))
   }
 
   /**
@@ -138,10 +139,21 @@ export class WorkBuddyCatalog {
  *
  * A non-positive window or ceiling is ignored rather than stored: the host
  * rejects a zero value, so writing one would drop the row's number entirely.
+ *
+ * `bounded` is the catalog's own provenance: when the roster in force came from
+ * the upstream, an override may lower a limit but never raise it above what the
+ * vendor advertises. The host trusts the declared figure to size its context
+ * budget and its compaction threshold, so a window larger than the model really
+ * accepts made the host believe it had room the upstream does not have, and the
+ * reply was truncated or compacted well before the declared window was full.
+ * When the static fallback is still standing the figures are this plugin's own
+ * guess, and clamping to them would overwrite a correct saved value with a
+ * smaller invented one.
  */
 export function applyOverride(
   model: WorkBuddyModelInfo,
   override: ModelOverride | undefined,
+  bounded = false,
 ): WorkBuddyModelInfo {
   const next: WorkBuddyModelInfo = { ...model }
   if (override === undefined) return next
@@ -151,10 +163,14 @@ export function applyOverride(
     else next.alias = alias
   }
   if (override.contextWindow !== undefined && override.contextWindow > 0) {
-    next.contextWindow = override.contextWindow
+    next.contextWindow = bounded
+      ? Math.min(override.contextWindow, model.contextWindow)
+      : override.contextWindow
   }
   if (override.maxOutputTokens !== undefined && override.maxOutputTokens > 0) {
-    next.maxOutputTokens = override.maxOutputTokens
+    next.maxOutputTokens = bounded
+      ? Math.min(override.maxOutputTokens, model.maxOutputTokens)
+      : override.maxOutputTokens
   }
   if (override.supportsImages !== undefined) next.supportsImages = override.supportsImages
   if (override.thinkingLevels !== undefined && override.thinkingLevels.length > 0) {

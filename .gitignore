@@ -6,3 +6,19 @@ node_modules/
 # ~180 KB binary through every version bump.
 dist/
 *.norm
+
+# The plugin's own data directory holds live credentials, and a debugging session
+# that points the plugin at a checkout would otherwise leave them as untracked
+# files one `git add .` away from being committed.
+signins/
+*.info
+credentials-archive.json
+checkin-slots.json
+doctor.txt
+settings.json
+.tmp*/
+# The archive is written to `<name>.<uuid>.tmp` and renamed into place, so a
+# process that died between the two leaves a copy of EVERY credential under a
+# name the rule above does not match: `.tmp*/` is a directory pattern.
+credentials-archive.json.*.tmp
+checkin-slots.json.tmp

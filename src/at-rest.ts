@@ -147,6 +147,66 @@ function windowsRegistryAppPaths(): string[] {
 }
 
 /**
+ * The Windows directory, whichever of the two variables holds it.
+ *
+ * Both are read here rather than only in `scanInterpreter`, because the module
+ * path and the interpreter have to come from the same place: pinning the
+ * absolute path from `windir` while the 5.1 module directory was skipped for a
+ * missing `SystemRoot` left `Get-AuthenticodeSignature` unable to load for every
+ * candidate, which is the failure this pair exists to avoid.
+ */
+function systemRootOf(env: NodeJS.ProcessEnv): string | undefined {
+  const value = env['SystemRoot']?.trim() || env['windir']?.trim()
+  return value === undefined || value === '' ? undefined : value
+}
+
+/**
+ * The environment the signature scan runs in.
+ *
+ * `powershell` is Windows PowerShell 5.1, and it resolves
+ * `Microsoft.PowerShell.Security` by walking `PSModulePath` in order. Any machine
+ * with a Store-installed PowerShell 7 carries that build's Modules directory
+ * ahead of the system one, because the Store install prepends it to the variable
+ * the desktop host inherited. 5.1 then binds the 7 build's copy of the module
+ * first and the import dies on a type-data conflict, so
+ * `Get-AuthenticodeSignature` throws for every candidate. The scan's own catch
+ * swallows that, the policy function is handed an empty status, and the at-rest
+ * key reads as "no WorkBuddy executable found" on a machine holding two signed
+ * installs. Putting the 5.1 directory first makes the right copy win.
+ *
+ * The directory is derived from `SystemRoot` rather than written out, and the
+ * rest of the ambient path is left alone so a user's own modules still resolve.
+ * Applying it twice is a no-op, so the answer stays one directory long however
+ * often it is built.
+ */
+export function signatureScanEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const systemRoot = systemRootOf(env)
+  const ambient = env['PSModulePath']
+  const modules = systemRoot === undefined
+    ? undefined
+    : join(systemRoot, 'system32', 'WindowsPowerShell', 'v1.0', 'Modules')
+  if (modules === undefined) return { ...env }
+  if (ambient === modules || ambient?.startsWith(`${modules};`) === true) return { ...env }
+  return { ...env, PSModulePath: ambient === undefined || ambient === '' ? modules : `${modules};${ambient}` }
+}
+
+/**
+ * The interpreter to run the scan with, by absolute path.
+ *
+ * Resolved from `SystemRoot` rather than through `PATH`, for the same reason the
+ * scan exists at all: a user-level directory is on the default `PATH`
+ * (`%LOCALAPPDATA%\Microsoft\WindowsApps`), so a bare `powershell` would let
+ * whatever sits there be spawned inside a process holding every WorkBuddy token.
+ * Neither variable set answers `undefined`, and the caller treats that as "no
+ * scan" rather than guessing a path.
+ */
+export function scanInterpreter(env: NodeJS.ProcessEnv): string | undefined {
+  const systemRoot = systemRootOf(env)
+  if (systemRoot === undefined) return undefined
+  return join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+}
+
+/**
  * Every path an uninstall key names for a WorkBuddy-family install, paired with
  * the signature PowerShell found on it.
  *
@@ -160,7 +220,8 @@ function windowsRegistryAppPaths(): string[] {
  * PowerShell does the part only it can do: enumerate, clean the resource index
  * and quotes off `DisplayIcon`, stat the file, and read its signature. The
  * decision is {@link signatureAccepts}'s, in Node, because that is where it can
- * be tested without a registry to plant a key in.
+ * be tested without a registry to plant a key in, and it is handed a module path
+ * 5.1 can actually load, because the host's is not always one.
  */
 function readRegistryAppPaths(): string[] {
   const script = [
@@ -194,10 +255,12 @@ function readRegistryAppPaths(): string[] {
     '}',
   ].join('\n')
   let stdout: string
+  const interpreter = scanInterpreter(process.env)
+  if (interpreter === undefined) return []
   try {
-    stdout = execFileSync('powershell', [
+    stdout = execFileSync(interpreter, [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-    ], { encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 8_388_608 })
+    ], { encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 8_388_608, env: signatureScanEnv() })
   } catch {
     return []
   }

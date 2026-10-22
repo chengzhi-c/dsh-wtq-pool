@@ -17,9 +17,8 @@
 
 import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { Readable } from 'node:stream'
-import type { WorkBuddyAccountPool } from './accounts'
-import type { WorkBuddyCatalog } from './catalog'
+import type { WorkBuddyAccount, WorkBuddyAccountPool } from './accounts'
+import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog'
 import { parseRateLimitReset, WorkBuddyUpstreamClient, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream'
 import { SseDecoder } from './trae-sse'
 
@@ -67,7 +66,7 @@ export interface WorkBuddyShimOptions {
  * Loopback guards, the request body bound and the server shell live in
  * `./loopback` — one copy, shared with the Trae and Qoder gateways.
  */
-import { createLoopbackServer, guardsPass, isJsonContentType, listedModels, readRequestBody, safeMessage, writeJson, writeOpenAIError } from './loopback'
+import { boundedRetryAfterSeconds, createLoopbackServer, guardsPass, isJsonContentType, listedModels, readRequestBody, relayStreamOf, safeMessage, unapprovedChannelRefusal, writeJson, writeOpenAIError } from './loopback'
 import { LOG_PREFIX } from './log'
 /** HTTP status each upstream failure class surfaces as. */
 const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
@@ -102,6 +101,68 @@ function conversationKeyOf(raw: string): string | undefined {
   }
   return undefined
 }
+
+/**
+ * The effort to put back on a request that carries none.
+ *
+ * Some providers treat the field as mandatory and reject the whole request
+ * without it (`glm-5.1` answers HTTP 400 / 11133 "the request parameters were
+ * rejected by the model provider", although the same request with `off` or any
+ * rung of its ladder is served). The model's own declared default is what a
+ * client that expresses no preference should get.
+ *
+ * A default outside the model's own ladder is not sent: answering the refusal
+ * with a level the upstream also refuses would spend a second call to produce
+ * the same error.
+ */
+function declaredEffortOf(catalog: WorkBuddyCatalog, modelId: string): string | undefined {
+  const model = rosterFor(catalog).find((entry) => entry.id === modelId)
+  const effort = model?.defaultThinkingLevel
+  if (effort === undefined || effort === '') return undefined
+  const supported = model?.supportedEfforts
+  if (supported !== undefined && supported.length > 0 && !supported.includes(effort)) return undefined
+  return effort
+}
+
+/**
+ * The roster a request may target: the user's selection, else the whole catalog.
+ *
+ * A switch that turned every model off leaves `visible()` empty while the models
+ * are still callable, so the full roster is the fallback. Read through `typeof`
+ * rather than calling directly: this runs inside a live request, and a catalog
+ * object that cannot answer must not turn a chat completion into a 500.
+ */
+function rosterFor(catalog: WorkBuddyCatalog): readonly WorkBuddyModelInfo[] {
+  const visible = typeof catalog.visible === 'function' ? catalog.visible() : []
+  if (visible.length > 0) return visible
+  return typeof catalog.current === 'function' ? catalog.current() : []
+}
+
+/** The same body with `reasoning_effort` filled in, when it names no effort yet. */
+function withReasoningEffort(prepared: string, effort: string): string | undefined {
+  let body: unknown
+  try {
+    body = JSON.parse(prepared)
+  } catch {
+    return undefined
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return undefined
+  const request = body as Record<string, unknown>
+  // An empty string is "no preference" spelled differently, not a named level.
+  const named = request['reasoning_effort']
+  if (typeof named === 'string' && named !== '') return undefined
+  request['reasoning_effort'] = effort
+  return JSON.stringify(request)
+}
+
+/**
+ * The upstream's code for "the request parameters were rejected by the model
+ * provider": the refusal `glm-5.1` answers a request that carries no effort
+ * with. It is a general invalid-parameter code, not an effort-specific one, so
+ * the retry it triggers is gated on the request having named no effort at all -
+ * that is the one parameter this plugin can tell is missing.
+ */
+const PARAMETER_REJECTION = /"code"\s*:\s*"?11133\b/
 
 /** True when an upstream failure body means the request overran the model's
  *  context window (OpenAI `context_length_exceeded`, WorkBuddy code 11115 /
@@ -140,6 +201,66 @@ const spentAccountHoldUntil = (): number => Date.now() + SPENT_ACCOUNT_HOLD_MS
 function resetFromRetryAfter(seconds: number | undefined): number | undefined {
   if (seconds === undefined) return undefined
   return Date.now() + seconds * 1000
+}
+
+/** What a gateway with no usable account answers, and why. */
+export interface UnavailableAnswer {
+  status: number
+  code: string
+  detail: string
+  /** Present only for a rate limit, which is the only reason with a deadline. */
+  retryAfterSeconds?: number
+}
+
+/**
+ * The answer for a gateway whose every account is present but none is usable.
+ *
+ * The status follows the reason, not the timestamps. A `session` hold also
+ * writes a cooldown, so answering 429 whenever every reset sat in the future
+ * told the user to wait out a rate limit when the remedy was to sign in again,
+ * and put every other remedy below it out of reach.
+ *
+ * The remedy is the message: every reason here needs a different one, so the
+ * answer names the reason that applies rather than sending the user to a
+ * setting that was never the problem.
+ *
+ * A deadline travels with any answer that contains a rate-limited account, not
+ * only with the 429: the host keeps `Retry-After` on a 5xx too, and a mixed pool is
+ * the one case where waiting is part of the remedy for a request that will
+ * otherwise succeed a minute later. Each host then clamps that wait to its own
+ * retry budget, so a long deadline shortens rather than being ignored.
+ */
+export function unavailableAnswer(
+  pool: Pick<WorkBuddyAccountPool, 'unavailableReason'>,
+  live: readonly WorkBuddyAccount[],
+  now: number,
+  modelId: string,
+): UnavailableAnswer {
+  const reasons = live.map(account => pool.unavailableReason(account.id, now, modelId))
+  const only = new Set(reasons).size === 1 ? reasons[0] : null
+  const limited = live.filter((_, index) => reasons[index] === 'rate-limited')
+  // Bounded like every other Retry-After this plugin sends: a hold can
+  // legitimately last a day, and handing that to the caller parks it for the
+  // whole window on the strength of one number.
+  const retryAfterSeconds = limited.length === 0
+    ? undefined
+    : boundedRetryAfterSeconds(Math.ceil((Math.min(...limited.map(account => Math.max(
+      account.cooldownUntilMs,
+      account.modelCooldowns[modelId] ?? 0,
+    ))) - now) / 1000))
+  if (only === 'rate-limited') {
+    return { status: 429, code: 'soft_rate', detail: `every account is rate-limited for model ${modelId}`, retryAfterSeconds }
+  }
+  const detail = only === 'sign-in expired'
+    ? 'every WorkBuddy sign-in for this gateway has expired; sign in again in the desktop app'
+    : only === 'sign-in refused'
+      ? 'every WorkBuddy sign-in was refused by the upstream; sign in again in the desktop app'
+      : only === 'on hold'
+        ? `every WorkBuddy account is out of credits or otherwise on hold for model ${modelId}`
+        : only === 'under its credit reserve'
+          ? 'no account is available within its configured credit reserve'
+          : `no WorkBuddy account is available for model ${modelId}`
+  return { status: 503, code: 'accounts_unavailable', detail, retryAfterSeconds }
 }
 
 export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim {
@@ -231,6 +352,12 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     const tried: string[] = []
     let last: { kind: UpstreamErrorKind; status: number; message: string } | undefined
     let exhaustedByRateLimit = false
+    // Built once: the retry below is the only caller, and the answer does not
+    // change inside one request.
+    const effortFallback = (() => {
+      const effort = declaredEffortOf(catalog, modelId)
+      return effort === undefined ? undefined : withReasoningEffort(prepared, effort)
+    })()
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (controller.signal.aborted) return
@@ -285,14 +412,14 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         }
         if (regionAccounts.length > 0) {
           const now = Date.now()
-          const resets = regionAccounts.filter(account => !pool.isDisabled(account.id))
-            .map(account => Math.max(account.cooldownUntilMs, account.modelCooldowns[modelId] ?? 0))
-          if (resets.every(until => until > now)) {
-            res.setHeader('Retry-After', String(Math.max(1, Math.ceil((Math.min(...resets) - now) / 1000))))
-            writeOpenAIError(res, 429, 'soft_rate', `every account is rate-limited for model ${modelId}`)
-          } else {
-            writeOpenAIError(res, 503, 'accounts_unavailable', 'no account is available within its configured credit reserve')
+          const live = regionAccounts.filter(account => !pool.isDisabled(account.id))
+          // `soft_rate` is the kind a client retries by itself; every other
+          // reason needs the user, so it answers 503 with the remedy.
+          const answer = unavailableAnswer(pool, live, now, modelId)
+          if (answer.retryAfterSeconds !== undefined) {
+            res.setHeader('Retry-After', String(answer.retryAfterSeconds))
           }
+          writeOpenAIError(res, answer.status, answer.code, answer.detail)
           return
         }
         writeOpenAIError(
@@ -312,6 +439,18 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         // turn nobody reads, and come back classed as `aborted` anyway.
         if (controller.signal.aborted) return
         result = await client.chatStream(account.credential, prepared, controller.signal)
+      }
+      // One retry, only for the missing-parameter refusal: a request that named
+      // no effort at all and was rejected for it is served with the model's own
+      // declared default. Retrying every 400 would spend a second upstream call
+      // on requests that are genuinely malformed.
+      if (!result.ok && result.kind === 'client' && effortFallback !== undefined
+        && PARAMETER_REJECTION.test(result.message) && !controller.signal.aborted) {
+        // Logged because the retry is invisible otherwise: a turn that took two
+        // upstream calls looks like a slow model unless the reason is written
+        // down somewhere.
+        logger?.info?.(`${LOG_PREFIX}: ${modelId} refused a request that named no effort; retrying with the model's declared default`)
+        result = await client.chatStream(account.credential, effortFallback, controller.signal)
       }
 
       if (result.ok) {
@@ -336,7 +475,9 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         let sawDone = false
         const decoder = new TextDecoder()
         const sse = new SseDecoder()
-        const body = Readable.fromWeb(result.response.body as Parameters<typeof Readable.fromWeb>[0])
+        // The attached relay stream, not `response.body`: see `relayStreamOf`.
+        const relay = relayStreamOf(result.response)
+        const reader = relay.getReader()
         /**
          * End the relayed stream in a shape the client can finish on.
          *
@@ -355,59 +496,76 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
             res.write(`data: ${JSON.stringify({
               error: { message: safeMessage(error), type: 'upstream_error' },
             })}\n\n`)
+            // A finish chunk before the terminator, as both sibling bridges send:
+            // a client that waits for a non-null `finish_reason` otherwise reads
+            // this as a turn that never finished.
+            res.write(`data: ${JSON.stringify({
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            })}\n\n`)
             res.end('data: [DONE]\n\n')
           } catch {
             /* the client is already gone; nothing left to answer */
           }
         }
-        body.on('error', (error: unknown) => {
-          // The client hanging up aborts this read through `controller` — the
-          // abort is this shim working as designed, and it arrives here shaped
-          // like an upstream failure. Recorded, the thousands of them buried the
-          // failures that matter; the signal is what tells the two apart.
-          failInBand(error)
-        })
-        // The upstream can also just stop, without erroring and without having
-        // sent `[DONE]`. The error branch above covers the crash; this covers the
-        // quiet hang-up, which otherwise leaves the host waiting for a turn that
-        // will never be marked finished.
-        body.on('end', () => {
-          try {
-            // The tail is flushed, not assumed: a final event without its
-            // terminating newline, and a multi-byte character split across the
-            // last two chunks, both surface only here. Without the flush a
-            // `[DONE]` that did arrive reads as a stream that ended without
-            // one, and the answer gains a second terminator.
-            const rest = decoder.decode()
-            const events = rest === '' ? sse.finish() : [...sse.push(rest), ...sse.finish()]
-            if (events.some(event => event.data === '[DONE]')) sawDone = true
-          } catch {
-            // A malformed tail is the upstream's problem: the frames already
-            // piped stand, and the close below still ends the stream.
-          }
-          closeWithoutDone()
-        })
-
         /** End the response with `[DONE]` unless the upstream already sent it. */
         function closeWithoutDone(): void {
           if (sawDone || !res.writable) return
           logger?.warn?.(LOG_PREFIX + ': upstream stream ended without [DONE]')
           res.end('data: [DONE]\n\n')
         }
-        // Pipe first so the terminal frame reaches the client before we end it.
-        body.pipe(res)
-        body.on('data', (chunk: Buffer) => {
+
+        /**
+         * Relay the stream, watching for `[DONE]` on the way through.
+         *
+         * Read and written here rather than piped: the terminal frame has to
+         * reach the client before the response is ended, so the frame that
+         * carries `[DONE]` is written out and the loop stops on it.
+         */
+        const relayLoop = (async (): Promise<void> => {
           try {
-            if (!sse.push(decoder.decode(chunk, { stream: true })).some(event => event.data === '[DONE]')) return
-            sawDone = true
-            body.unpipe(res)
-            res.end()
-            body.destroy()
+            for (;;) {
+              const { done, value } = await reader.read()
+              if (done) break
+              if (!res.writable) return
+              res.write(value)
+              try {
+                const decoded = decoder.decode(value, { stream: true })
+                if (sse.push(decoded).some(event => event.data === '[DONE]')) {
+                  // The terminal frame is the last thing the client needs. Ending
+                  // the response here is what closes the turn: `closeWithoutDone`
+                  // deliberately does nothing once `[DONE]` has been seen. The
+                  // upstream is cancelled rather than drained, so a stream that
+                  // keeps talking after its terminator is not read any further.
+                  sawDone = true
+                  if (res.writable) res.end()
+                  await reader.cancel().catch(() => {})
+                  return
+                }
+              } catch {
+                // Malformed frames are relayed as they arrived; the tail flush at
+                // the end is what decides whether `[DONE]` was really missing.
+              }
+            }
+            if (!sawDone) {
+              try {
+                const rest = decoder.decode()
+                const events = rest === '' ? sse.finish() : [...sse.push(rest), ...sse.finish()]
+                if (events.some(event => event.data === '[DONE]')) sawDone = true
+              } catch {
+                // Same as above: the frames already relayed stand.
+              }
+            }
+            closeWithoutDone()
           } catch (error: unknown) {
-            body.destroy(error instanceof Error ? error : new Error(String(error)))
+            // The client hanging up aborts this read through `controller`. That
+            // is this shim working as designed and it arrives here shaped like an
+            // upstream failure, so the signal is what tells the two apart.
+            failInBand(error)
+          } finally {
+            try { reader.releaseLock() } catch { /* already released */ }
           }
-        })
-        return
+        })()
+        return await relayLoop
       }
 
       last = { kind: result.kind, status: result.status, message: result.message }
@@ -467,7 +625,17 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         // hold names itself as one and is held until the next balance read or a
         // manual cooldown reset rather than returning to the head of the queue
         // every minute.
-        pool.penalize(account.id, spentAccountHoldUntil(), undefined, true)
+        //
+        // The reason travels with the hold because only one of the two clears on
+        // a balance read: a probe that finds credits says nothing about a
+        // sign-in the upstream still refuses, and releasing both let a 401'ing
+        // account back to the head of the queue on every probe cycle.
+        pool.penalize(
+          account.id,
+          spentAccountHoldUntil(),
+          undefined,
+          result.kind === 'hard_credit' ? 'spent' : 'session',
+        )
       } else {
         pool.penalize(account.id)
       }
@@ -494,6 +662,14 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         `${subject}. Shorten the conversation, start a new chat, or pick a model with a larger window ` +
           `(e.g. hy4-preview).`,
       )
+      return
+    }
+    // A refusal aimed at the caller's identity is not something rotation can
+    // clear, so it is answered with the cause and the way forward rather than
+    // the vendor's block of tips.
+    const unapproved = unapprovedChannelRefusal(last.message)
+    if (unapproved !== undefined) {
+      writeOpenAIError(res, 400, 'upstream_channel_check', unapproved)
       return
     }
     writeOpenAIError(

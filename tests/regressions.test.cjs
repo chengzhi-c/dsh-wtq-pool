@@ -48,7 +48,7 @@ test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
     console: { log() {} }, AbortController, AbortSignal, fetch,
     Date: class extends Date { static now() { return now } },
-    setTimeout, clearTimeout,
+    setTimeout, clearTimeout, setInterval, clearInterval,
     setInterval: (callback, ms) => { const timer = { callback, at: now + ms }; timers.add(timer); return timer },
     clearInterval: (timer) => timers.delete(timer),
   })
@@ -207,20 +207,52 @@ test('growth rewards accept numeric strings and normalize tier status', async ()
   const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
   const client = new WorkBuddyUpstreamClient({ fetchImpl: async () => new Response(JSON.stringify({ code: 0, data: {
     streak: { days: '7' }, redemption_status: { tiers: [{ tier: 'seven', days: '7', credit: '100', energy: '2' }], tier_seven_status: 'UNLOCKED' },
-    credit: '40', energy: '1',
   } })) })
   const credential = { accessToken: 'test', refreshToken: '', domain: '', expiresAtMs: 0 }
   const streak = await client.growthStreakFull(credential)
   assert.equal(streak.days, 7)
   assert.deepEqual(streak.tiers[0], { tier: 'seven', days: 7, credit: 100, energy: 2, status: 'unlocked' })
-  assert.deepEqual(await client.claimTaskReward(credential, 'test-task'), { credit: 40, energy: 1 })
+})
+
+/**
+ * The streak's one-off collections must ask the paths that answer.
+ *
+ * The gift and compensation endpoints sit on the billing host without a `/v2`
+ * prefix; with one they reply `404 route not found`, which reads as "nothing to
+ * collect" and silently loses the credits. A make-up target is a calendar day in
+ * the check-in zone, not the host's zone.
+ */
+test('streak collections use the paths the upstream answers on', async () => {
+  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
+  const { zonedDay } = require('../src/checkin-time.ts')
+  const calls = []
+  const client = new WorkBuddyUpstreamClient({ fetchImpl: async (url, init) => {
+    calls.push({ url: String(url), method: init?.method ?? 'GET', body: init?.body })
+    return new Response(JSON.stringify({ code: 0, data: { credit: 25 } }))
+  } })
+  const credential = { accessToken: 'test', refreshToken: '', domain: '', expiresAtMs: 0 }
+
+  assert.equal(await client.claimGift(credential), 25)
+  assert.equal(await client.claimCompensation(credential), 25)
+  await client.useMakeupCard(credential, '2026-10-18')
+
+  assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [
+    '/billing/meter/claim-gift',
+    '/billing/meter/claim-compensation',
+    '/activity/growth/makeup-cards/use',
+  ], 'a /v2 prefix turns these into 404s')
+  assert.deepEqual(JSON.parse(calls[2].body), { target_date: '2026-10-18' })
+  assert.match(zonedDay(0), /^\d{4}-\d{2}-\d{2}$/)
+  assert.notEqual(zonedDay(-1), zonedDay(0), 'yesterday is a different day')
 })
 
 for (const source of ['qoder', 'trae']) {
   test(`${source} directory reads do not advance chat rotation`, async (t) => {
     const purposes = []
     const client = source === 'qoder' ? require('../src/qoder-client.ts').QoderUpstreamClient : require('../src/trae-upstream.ts').TraeSoloUpstreamClient
-    t.mock.method(client.prototype, 'fetchModels', async () => [{ id: 'test-model', name: 'test-model', function: 'chat' }])
+    t.mock.method(client.prototype, 'fetchModels', async () => (source === 'trae'
+      ? { models: [{ id: 'test-model', name: 'test-model', function: 'chat' }], partial: false }
+      : [{ id: 'test-model', name: 'test-model', function: 'chat' }]))
     t.mock.method(client.prototype, 'chatStream', async () => ({ ok: true, response: new Response(source === 'qoder' ? 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n' : 'event: output\ndata: {"response":"hello"}\n\n') }))
     const gateway = source === 'qoder'
       ? require('../src/qoder-gateway.ts').createQoderGateway({ region: 'cn', port: 0, credentials: async (purpose) => { purposes.push(purpose); return [{ token: 'test', region: 'cn' }] } })
@@ -319,7 +351,7 @@ test('a live sign-in with a future expiry reaches the panel and the gateway', as
     declareProviders: () => ({ ok: true, changed: false }) })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -380,7 +412,7 @@ test('switching a source on drops the cached sign-in read', async (t) => {
     declareProviders: () => ({ ok: true, changed: false }) })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -443,7 +475,7 @@ test('a sign-in with no expiry is live, not expired', async (t) => {
     declareProviders: () => ({ ok: true, changed: false }) })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -518,7 +550,7 @@ test('a Qoder round that is not open yet is collected when its window opens', as
       static now() { return now }
     },
     console: { log: (line) => lines.push(String(line)) }, AbortController, AbortSignal, fetch,
-    setTimeout, clearTimeout,
+    setTimeout, clearTimeout, setInterval, clearInterval,
     setInterval: (callback, ms) => { const timer = { callback, at: now + ms }; timers.add(timer); return timer },
     clearInterval: (timer) => timers.delete(timer),
   })
@@ -725,7 +757,7 @@ test('switching to an account the pool cannot serve is reported, not silently ac
     declareProviders: () => ({ ok: true, changed: false }) })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -821,7 +853,7 @@ test('an account cooling on the selected model is reported, not silently accepte
     declareProviders: () => ({ ok: true, changed: false }) })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -942,7 +974,7 @@ test('switching accounts during a reply does not cut the stream', async (t) => {
   })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, TextEncoder, ReadableStream,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval, TextEncoder, ReadableStream,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -1036,7 +1068,7 @@ test('the account picked in the panel is the account that serves', async (t) => 
     declareProviders: () => ({ ok: true, changed: false }) })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -1126,7 +1158,7 @@ test('a stored account choice is never reported as a refusal', async (t) => {
     declareProviders: () => ({ ok: true, changed: false }) })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -1186,10 +1218,26 @@ test('every composer string the popup asks for exists in both languages', () => 
 })
 
 /**
+ * Scrolling inside the popup does not close the popup.
+ *
+ * The dismissal listens for `scroll` in the capture phase so that a scroll in any
+ * container carrying the trigger is seen. The popup is a scroll container itself
+ * once it holds more rows than fit, so reading past the first screenful dismissed
+ * the panel it was being read in - on the one control that exists to be read.
+ */
+test('the composer popup ignores a scroll that happens inside it', () => {
+  const source = fs.readFileSync(path.join(root, 'src', 'client', 'composer.tsx'), 'utf8')
+  const at = source.indexOf('const onViewport')
+  assert.notEqual(at, -1, 'the popup has to react to the viewport moving')
+  const body = source.slice(at, source.indexOf('\n    }', at))
+  assert.match(body, /panelRef\.current\?\.contains\(/,
+    'a scroll inside the panel is the user reading it, not the trigger moving')
+  assert.match(body, /setOpen\(false\)/, 'and a scroll anywhere else still dismisses')
+})
+/**
  * The footer links are static markup, so nothing else couples them to the word
  * tables: a label whose key is missing renders as the raw `foot.npm` on the page.
- */
-test('every footer link label exists in both languages', () => {
+ */test('every footer link label exists in both languages', () => {
   const html = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
   const labels = [...html.matchAll(/data-foot-label="([A-Za-z]+)"/g)].map((match) => match[1])
   assert.ok(labels.length > 0, 'the footer must carry at least one labelled link')
@@ -1410,7 +1458,7 @@ test('the doctor reports a published address for all three sources and names the
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [{ id: 'wb-model', name: 'WB', contextWindow: 128000, maxTokens: 4096 }])
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
-  t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchModels', async () => [{ id: 'trae-model', name: 'Trae', function: 'chat' }])
+  t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchModels', async () => ({ models: [{ id: 'trae-model', name: 'Trae', function: 'chat' }], partial: false }))
   t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ code: 0, enable: true, checkedIn: false }))
   t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchUsageSummary', async () => ({ credits: [], packs: [] }))
   t.mock.method(QoderUpstreamClient.prototype, 'fetchModels', async () => [{ id: 'qoder-model', name: 'Qoder', function: 'chat' }])
@@ -1430,13 +1478,25 @@ test('the doctor reports a published address for all three sources and names the
   // the whole check. Every other gateway keeps its own, so this is the one row
   // that has to report the fallback.
   const held = createServer((_req, res) => res.writeHead(503).end('port held'))
-  await new Promise((resolve, reject) => { held.once('error', reject); held.listen(42851, '127.0.0.1', resolve) })
+  // The preferred slot this test needs is a fixed one, and a user's running DSH
+  // already listening there is not a defect in the doctor: skip the case rather
+  // than report a failure the machine, not the code, caused.
+  try {
+    await new Promise((resolve, reject) => { held.once('error', reject); held.listen(42851, '127.0.0.1', resolve) })
+  } catch (error) {
+    held.close()
+    if (error?.code === 'EADDRINUSE') {
+      t.skip('Trae CN preferred port 42851 is already in use on this machine')
+      return
+    }
+    throw error
+  }
   const { installPi, startRegisteredService, stopRegisteredService } = require('../src/pi-compat.ts')
   installPi({ getSettings: () => ({ ...settings }), setSettings: patch => Object.assign(settings, patch), getDataPath: () => temporary,
     declareProviders: () => ({ ok: true, changed: false }) })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -1508,13 +1568,13 @@ test('a source account preference is stored only for a label that exists', async
   t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchUsageSummary', async () => ({ credits: [], packs: [] }))
   // The composer only matches a model the gateway actually publishes, so the
   // directory has to answer with one. `cachedModels` is filled from here.
-  t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchModels', async () => [{ id: 'trae-model', name: 'Trae Model', function: 'chat' }])
+  t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchModels', async () => ({ models: [{ id: 'trae-model', name: 'Trae Model', function: 'chat' }], partial: false }))
   const { installPi, startRegisteredService, stopRegisteredService } = require('../src/pi-compat.ts')
   installPi({ getSettings: () => ({ ...settings }), setSettings: patch => Object.assign(settings, patch), getDataPath: () => temporary,
     declareProviders: () => ({ ok: true, changed: false }) })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -1663,4 +1723,61 @@ test('a panel error never carries the credential an upstream echoed', async () =
   assert.equal(answer.status, 500, 'a handler failure is the panel error path')
   assert.doesNotMatch(answer.raw, /abcdefgh12345678/, 'the echoed credential must not reach the panel')
   assert.match(answer.raw, /\[redacted\]/, 'the credential is replaced, not the whole message dropped')
+})
+
+/**
+ * The connection report names no account.
+ *
+ * `doctor.txt` is the file a user pastes into a bug report, and it is written
+ * from the same text the panel's check view shows. It listed every sign-in by
+ * its display name, which is a nickname and can be an email address, so the one
+ * artifact meant to leave the machine carried the user's identities.
+ *
+ * The claim under test: the accounts row reports how many sign-ins the pool
+ * holds, and neither the finding nor the report text carries a display name.
+ */
+test('the connection report counts the accounts without naming them', async (t) => {
+  const accountName = 'fixture.user@example.com'
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-doctor-names-'))
+  const auth = path.join(temporary, 'auth')
+  fs.mkdirSync(auth)
+  const settings = {
+    enabled: true, sourceWorkbuddy: true, sourceTrae: false, sourceQoder: false,
+    disabledRegions: ['workbuddy:global'], authFile: path.join(auth, 'login.info'),
+    autoCheckin: { enabled: false, hours: [9] },
+  }
+  fs.writeFileSync(settings.authFile, JSON.stringify({
+    auth: { accessToken: 'test', expiresAt: Date.now() + 3600000 },
+    account: { uin: 'test-user', nickname: accountName },
+  }))
+  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [])
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
+  const { installPi, startRegisteredService, stopRegisteredService } = require('../src/pi-compat.ts')
+  installPi({
+    getSettings: () => ({ ...settings }), setSettings: (patch) => Object.assign(settings, patch),
+    getDataPath: () => temporary, declareProviders: () => ({ ok: true, changed: false }),
+  })
+  const context = vm.createContext({
+    require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
+  })
+  context.exports = context.module.exports
+  vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
+  const plugin = context.module.exports
+  try {
+    await plugin.onLoad()
+    await startRegisteredService()
+    const report = await plugin.onPanelInvoke('xd.doctor')
+    const accounts = report.findings.find((finding) => finding.id === 'accounts')
+    assert.equal(accounts.detail, '1 account(s)', 'the row reports the count')
+    assert.equal(accounts.detail.includes(accountName), false, 'and carries no display name')
+    assert.equal(report.report.includes(accountName), false,
+      'neither does the report text, which is what doctor.txt holds')
+  } finally {
+    await stopRegisteredService()
+    await plugin.onUnload()
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
 })

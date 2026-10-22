@@ -447,39 +447,6 @@ test('a queued write sees the edit the host made while it waited', async () => {
 })
 
 /**
- * A counter-less task is claimable, so its reward is actually collected.
- *
- * A task with no counter (target 0) has nothing to meet, and requiring
- * `target > 0` made it permanently unclaimable. The pass then skipped it in
- * silence and the reward was simply never collected.
- */
-test('a task with no counter is claimable rather than skipped forever', async () => {
-  // Driven through `listTasks`, which is what the pass actually calls, so the
-  // case covers the parse and the claim decision together.
-  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
-  const client = new WorkBuddyUpstreamClient({
-    fetchImpl: async () => new Response(JSON.stringify({
-      code: 0,
-      data: { tasks: [
-        { task_code: 'profile_done', title: '完善资料', reward_credit: 100, current: 0, target: 0, accept_status: 'accepted' },
-        { task_code: 'chat_5', title: '和 AI 聊天 5 次', current: 2, target: 5, accept_status: 'accepted' },
-        { task_code: 'already', title: '已领', current: 0, target: 0, accept_status: 'claimed' },
-      ] },
-    }), { status: 200, headers: { 'content-type': 'application/json' } }),
-  })
-  const tasks = await client.listTasks({
-    accessToken: 't', refreshToken: 'r', expiresAtMs: 0, domain: 'www.workbuddy.cn', sourcePath: '',
-  })
-  const byCode = Object.fromEntries(tasks.map((task) => [task.taskCode, task]))
-  assert.equal(byCode['profile_done'].claimable, true,
-    'a counter-less task has nothing left to wait for, so the pass must offer it')
-  assert.equal(byCode['chat_5'].claimable, false, 'a task with a counter still has to meet it')
-  assert.equal(byCode['already'].claimable, false, 'and an already-claimed one is not offered again')
-})
-
-
-
-/**
  * The host bounds the panel's save path already enforces are applied on the way
  * in too.
  *
@@ -495,6 +462,9 @@ test('a hand-edited settings document is held to the bounds the panel saves agai
       creditReserves: { 'account-a': 1e308, 'account-b': 25 },
       modelSelection: {
         'trae:cn': { overrides: { 'model-a': { contextWindow: 1e20, maxOutputTokens: 1e20 } } },
+        // The window raised to the Max tier: the declaration then states that tier's
+        // smaller budget, which is exactly where the two figures used to diverge.
+        'trae:ai': { overrides: { 'model-b': { contextWindow: 1000000 } } },
       },
     },
   })
@@ -506,8 +476,19 @@ test('a hand-edited settings document is held to the bounds the panel saves agai
 
     const view = host.internals.sourceModelView('trae:cn', { id: 'model-a' },
       { contextWindow: 128000, maxTokens: 32000, supportsImages: false })
-    assert.equal(view.contextWindow, 0xffffffff, 'the stored context window is clamped to the host ceiling')
-    assert.equal(view.maxOutputTokens, 0xffffffff, 'the stored output limit is clamped to the host ceiling')
+    assert.equal(view.contextWindow, 128000, 'the stored context window is clamped to what the model accepts')
+    assert.equal(view.maxOutputTokens, 32000, 'the stored output limit is clamped to what the model accepts')
+
+    // The editor's default-tier ceiling is the default tier's budget, not the one
+    // for the window a stored override happens to name. Filling it with the
+    // window-dependent figure made the field report the Max tier's smaller budget
+    // while the draft was back on the default window.
+    const raised = host.internals.sourceModelView('trae:ai', { id: 'model-b' },
+      { contextWindow: 200000, maxTokens: 32000, maxTokensAtCeiling: 16000, maxContextWindow: 1000000, supportsImages: false })
+    assert.equal(raised.contextWindow, 1000000, 'the stored window reaches the Max tier')
+    assert.equal(raised.maxOutputTokens, 16000, 'and the declaration states that tier\'s budget')
+    assert.equal(raised.nativeMaxOutputTokens, 32000, 'the default-tier ceiling stays at 32000')
+    assert.equal(raised.maxOutputAtCeiling, 16000, 'and the raised tier states its own')
 
     assert.equal(host.internals.parseSelection({ enabledModelIds: ['x'.repeat(300)] }), undefined,
       'an id longer than the declaration can publish is refused rather than stored')

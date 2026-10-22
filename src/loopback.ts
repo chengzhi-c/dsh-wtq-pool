@@ -207,6 +207,44 @@ export function redactSecrets(text: string): string {
 }
 
 /**
+ * The vendor's channel check, answered as what it is.
+ *
+ * WorkBuddy's upstream refuses a request whose prompt names DeepSeek Harness as
+ * the client, with code 11128 and "Illegal API invocation from an unapproved
+ * channel". The refusal is about the caller's identity rather than the account:
+ * every account of that region answers it the same way, so rotating cannot clear
+ * it, and the body is a wall of mixed Chinese and English tips that names no
+ * cause a user can act on. The sentence below says what happened and what does
+ * work. Verified 2026-10-21 on the domestic host: the same prompt is served by
+ * the international WorkBuddy accounts, by Trae and by Qoder.
+ */
+export function unapprovedChannelRefusal(text: string): string | undefined {
+  if (!/"code"\s*:\s*11128\b/.test(text)) return undefined
+  return (
+    'the domestic WorkBuddy host refuses requests that name DeepSeek Harness as the client ' +
+    '(channel check 11128), on every account of that region. Use a model served by the ' +
+    'international WorkBuddy accounts, Trae or Qoder here.'
+  )
+}
+
+/**
+ * The `finish_reason` one turn is reported with.
+ *
+ * A turn that emitted tool calls says `tool_calls`, because that is what an
+ * OpenAI client looks for before it acts on them. It must not say that *over*
+ * what the upstream reported: `length` and `content_filter` describe how the
+ * turn ended, and a tool call cut off by the output budget is exactly the case
+ * where acting on its arguments spends a request on half a JSON body. So only
+ * the verdict that carries nothing of its own - `stop`, or nothing at all - is
+ * replaced.
+ */
+export function openAIFinishReason(upstream: string | undefined, sawToolCalls: boolean): string {
+  const stated = upstream === undefined || upstream === '' || upstream === 'null' ? undefined : upstream
+  if (stated !== undefined && stated !== 'stop') return stated
+  return sawToolCalls ? 'tool_calls' : 'stop'
+}
+
+/**
  * Models a discovery answer may name.
  *
  * The host rebuilds the picker from `GET /v1/models`, so these ids are the

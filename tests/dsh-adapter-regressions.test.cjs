@@ -62,16 +62,10 @@ function indexFixture() {
     const effects = []
     const volatileListeners = []
     const state = { fail: null, adapters: 0, providers: 0, bridge: null, discovery: null, volatileListeners }
-    // The command registry the core registers into, so a test can run the
-    // handlers it installed and read what each run collected.
-    const commands = new Map()
-    state.commands = commands
     installing = state
     module.exports.apply({
       settings, logger: { info() {}, warn() {}, error() {} },
-      get: (name) => name === 'commands'
-        ? { register: (spec) => { commands.set(spec.name, spec); return () => commands.delete(spec.name) } }
-        : undefined,
+      get: () => undefined,
       fiber,
       // `loader/volatile-update` is captured because DSH answers a plugin's own
       // volatile write by emitting it straight back at that plugin's fiber, and
@@ -546,46 +540,6 @@ test('every panel route guards the response socket it writes to', () => {
         `${suffix} must install an error sink on the response it writes to`)
     }
   } finally { dispose() }
-})
-
-/**
- * Two commands running at once each collect their own notes.
- *
- * The command service turns what a run notifies into that run's toast. A single
- * shared buffer let the second run clear the first's lines, and the first then
- * read the null the second's `finally` left behind - reported to the user as a
- * command failure that named nothing they had done.
- */
-test('two commands running at once each collect their own notes', async () => {
-  const activate = indexFixture()
-  const state = activate({}, {})
-  const gate = {}
-  gate.promise = new Promise((resolve) => { gate.open = resolve })
-  try {
-    await state.bridge.registerCommand({
-      id: 'fixture-slow', title: 'Slow',
-      run: async () => {
-        state.bridge.notify('slow-1', 'info')
-        await gate.promise
-        state.bridge.notify('slow-2', 'info')
-      },
-    })
-    await state.bridge.registerCommand({
-      id: 'fixture-fast', title: 'Fast',
-      run: async () => { state.bridge.notify('fast-1', 'info') },
-    })
-    const slow = state.commands.get('fixture-slow').handler()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    const fast = await state.commands.get('fixture-fast').handler()
-    gate.open()
-    const slowResult = await slow
-    assert.equal(fast.kind, 'success')
-    assert.equal(fast.text, 'fast-1', 'the second run reports only its own line')
-    assert.equal(slowResult.kind, 'success', 'the first run must not be reported as a failure')
-    assert.equal(slowResult.text, 'slow-1\nslow-2', 'the first run keeps the lines it notified across its await')
-  } finally {
-    await state.dispose()
-  }
 })
 
 /**

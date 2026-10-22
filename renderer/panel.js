@@ -5,7 +5,7 @@
  *
  * The panel owns no data and makes no network request: everything it shows
  * comes from the plugin's main process through `window.pluginBridge.invoke`,
- * and every channel name matches a case in `onPanelInvoke` (main.js).
+ * and every channel name matches a case in `onPanelInvoke` (src/host.ts).
  *
  * All API-derived text is written with textContent / createElement, never
  * innerHTML, so a model id or an upstream error can never inject markup.
@@ -28,6 +28,8 @@ var EN = {
   "tab.pool": "Pool",
   "tab.models": "Models",
   "tab.check": "Connection check",
+  "tab.growth": "Growth centre",
+  "risk.note": "! A ban is possible. Use at your own discretion; no liability accepted !",
   "host.missing": "The host has not registered {count} model group(s) from this plugin yet: reload the plugin so it re-reads the declaration.",
   "btn.rescan": "Detect accounts again",
   "btn.reset": "Clear all cooldowns",
@@ -53,7 +55,7 @@ var EN = {
   "pool.healthy": "Rate limits automatically switch to another available account.",
   "pool.allCooling": "Every account is rate-limited right now; requests pause until a cooldown lifts.",
   "pool.checkinAll": "Check in every account",
-  "pool.checkinAllHint": "Collect every account's daily check-in. The streak bonus and task rewards run with the scheduled pass.",
+  "pool.checkinAllHint": "Collect every account's daily check-in. The streak bonus is collected with it.",
   "pool.checkinAllBusy": "Checking in…",
   "pool.checkinAllDone": "Checked in {count} account(s)",
   "pool.checkinAllNone": "Every account is already checked in today",
@@ -61,12 +63,19 @@ var EN = {
   "pool.emptyRegion": "No {region} account is signed in yet.",
   "pool.emptyHint": "Sign in to that edition in the WorkBuddy desktop app, then press “Detect accounts again”.",
   "pool.sourceOff": "The WorkBuddy source is switched off in plugin settings.",
+  "login.add": "Add account",
+  "login.addHint": "Sign in to WorkBuddy in your browser. The account joins the pool the moment the browser finishes.",
+  "login.openAgain": "Open the link again",
+  "login.waiting": "Finish the sign-in in your browser; this panel picks the account up by itself.",
+  "login.timeout": "The sign-in did not finish. Start again for a new link.",
+  "login.added": "Added {name}",
+  "login.addedNoName": "Account added",
   "trae.title": "Trae",
   "trae.gateway": "{region} gateway on port {port}",
   "trae.models": "{count} model(s)",
   "trae.noModels": "no models published yet",
   "trae.off": "The Trae source is switched off in plugin settings.",
-  "trae.fallback": "using a spare port; the provider row still names {port}",
+  "trae.fallback": "preferred port {port} is taken; this session serves a spare port, which the provider row follows",
   "qoder.title": "Qoder",
   "qoder.gateway": "{region} gateway on port {port}",
   "qoder.models": "{count} model(s)",
@@ -94,7 +103,7 @@ var EN = {
   "source.campaignUnknown": "check-in state unavailable",
   "source.claimableAt": "Can claim after {time}",
   "source.deviceCheckedIn": "This device checked in today",
-  "qoder.fallback": "using a spare port; the provider row still names {port}",
+  "qoder.fallback": "preferred port {port} is taken; this session serves a spare port, which the provider row follows",
   "badge.next": "next up",
   "badge.cooling": "cooling",
   "badge.healthy": "healthy",
@@ -110,15 +119,22 @@ var EN = {
   "acct.automatic": "Automatic (follow account usage)",
   "acct.choiceHint": "The picked account goes first; a rate limit switches account until the cooldown lifts. Automatic follows the usage mode.",
   "acct.unavailable": "Selected account unavailable (automatic fallback)",
+  "acct.expired": "sign-in expired",
+  "acct.archivedHint": "The global client keeps one sign-in file, so switching accounts overwrites this one. The token was saved: the account keeps serving until it expires. Sign in again in WorkBuddy to renew it.",
   "acct.choiceCredits": "{label} · {credits} credits",
   "badge.preferred": "selected",
   "acct.on": "Enabled",
   "acct.off": "Switched off",
   "acct.switchOn": "Use this account again",
+  "acct.inPool": "In the rotation",
   "acct.switchOff": "Keep this account out of the pool for now",
   "acct.offHint": "Switched off: requests never use this account until you switch it back on.",
   "acct.remove": "Remove",
-  "acct.removeHint": "Removes the account for good. Restore it under “Removed accounts”.",
+  "acct.removeHint": "Takes the account out of the pool. Restore it under “Removed accounts”.",
+  "acct.delete": "Delete",
+  "acct.deleteHint": "Deletes the sign-in file this plugin wrote. The account is gone for good and cannot be restored.",
+  "acct.deleteConfirm": "Delete {name}? The sign-in file is removed and the account cannot be brought back.",
+  "acct.deleteConfirmAgain": "Press delete again to confirm",
   "acct.stateError": "Could not change this account: {message}",
   "pool.switchedOff": "{count} switched off",
   "removed.title": "Removed accounts",
@@ -126,7 +142,7 @@ var EN = {
   "removed.restore": "Restore",
   "acct.modelCool": "{model} cooling until {time}",
   "credits.title": "Credits",
-  "credits.unavailable": "credits unavailable",
+  "credits.unavailable": "Credits could not be read",
   "credits.package": "{remain} / {size}",
   "credits.monthly": "monthly",
   "credits.refreshAt": "refreshes {time}",
@@ -170,6 +186,10 @@ var EN = {
   "models.windowFollows": "Follows the catalog; editing pins your value.",
   "models.maxOutput": "Max output",
   "models.outputHelp": "The largest reply this model may produce.",
+  // The ceiling is the model's own figure. The host sizes its context budget and
+  // compaction threshold from the declared number, so a larger value made it
+  // wait for room the upstream never had.
+  "models.overCeiling": "This model takes at most {limit}; the larger value was not applied.",
   "models.levels": "Thinking levels",
   "models.defaultLevel": "Default thinking level",
   "models.capabilities": "Attachments",
@@ -182,7 +202,6 @@ var EN = {
   "models.dirty": "Unsaved changes",
   "models.saving": "Saving…",
   "models.saved": "Model selection saved",
-  "models.applyHint": "Saved. If the model picker does not follow, reload the plugin.",
   "models.saveError": "Could not save: {message}",
   "models.reload": "The model list changed. Reload the plugin to sync it.",
   "models.addressDrift": "The published address differs from the one this run bound. Reload the plugin.",
@@ -217,9 +236,42 @@ var EN = {
   "auto.rowQoder": "Qoder",
   "auto.rowTrae": "Trae",
   "auto.rowCounts": "{label}: {claimed} collected · {skipped} skipped · {failed} failed",
-  "auto.rowGrowth": "Streak and tasks: {streak} streak tier(s) · {tasks} task(s) · +{credit} credits · {failed} failed",
+  "auto.rowGrowth": "Streak: {streak} tier(s) · +{credit} credits · {failed} failed",
+  "auto.rowKeepAlive": "Token keep-alive {when}: {refreshed} refreshed · {fresh} already fresh · {failed} failed · {noToken} with no refresh token",
   "auto.rowTravelCounts": "{label}: {departed} sent · {claimed} claimed · {adopted} adopted",
-  "auto.hint": "Claims the daily reward of all three sources (WorkBuddy / Trae / Qoder), the streak bonus and task rewards of domestic WorkBuddy accounts, and runs the travel patrol in one pass; today's is skipped, a missed hour runs at the next start.",
+  "auto.hint": "Claims the daily reward of all three sources (WorkBuddy / Trae / Qoder), the streak bonus of domestic WorkBuddy accounts, and runs the travel patrol in one pass. A slot already collected today is skipped. A slot missed earlier today is collected at the next start.",
+  "keepAlive.runNow": "Refresh now",
+  "keepAlive.running": "Refreshing…",
+  "keepAlive.label": "Token keep-alive",
+  "keepAlive.hint": "Renews sign-in tokens that are close to expiry, on demand. An account you rarely use then does not hit an expired token on the turn that needed it. Tokens with plenty of time left are left alone.",
+  "growth.title": "Growth centre",
+  "growth.ready": "WorkBuddy",
+  "growth.running": "Running…",
+  "growth.read": "Read state",
+  "growth.reading": "Reading…",
+  "growth.readHint": "Reads what the centre holds without claiming anything.",
+  "growth.run": "Run now",
+  "growth.runHint": "Runs the growth half of the scheduled check-in on its own, and reports each step.",
+  "growth.hint": "Four steps: the make-up card, the gift and compensation, the activity report, and the streak tiers with their draws. A run consumes the make-up card and the draws; the rest are idempotent and pay nothing a second time.",
+  "growth.stateNone": "No state read yet",
+  "growth.stateStale": "The last run made this stale; read the state again",
+  "growth.stateSummary": "{accounts} account(s) · {tiers} tier(s) to redeem · {cards} make-up card(s) · {chances} draw(s)",
+  "growth.groupCount": "{count} account(s)",
+  "growth.stateFailed": "{failed} account(s) could not be read",
+  "growth.rowSummary": "Streak {days} day(s) · next tier {tier}, {remaining} to go",
+  "growth.rowHold": "{tiers} to redeem · {cards} card(s) · {chances} draw(s)",
+  "growth.rowTiers": "Streak tiers",
+  "growth.rowTier": "{tier} · {days} day(s) · +{credit} credits +{energy} energy · {status}",
+  "growth.tierClaimed": "claimed",
+  "growth.tierUnlocked": "ready to redeem",
+  "growth.tierLocked": "locked",
+  "growth.rowNothing": "Nothing to collect here",
+  "growth.rowFailed": "This account could not be read",
+  "growth.onlyWorkbuddy": "The growth centre belongs to WorkBuddy.",
+  "growth.runNone": "Nothing to collect on this pass",
+  "growth.runLine": "{when}: make-up {makeup} · gift +{gift} · compensation +{compensation} · activity {activity} · tiers {streak} · draws {lottery} · +{credit} credits",
+  "growth.runFailed": "{when}: {failed} step(s) failed",
+  "growth.busy": "A check-in pass is already running; wait for it to finish",
   "composer.title": "Composer credits",
   "composer.on": "On",
   "composer.off": "Off",
@@ -227,6 +279,13 @@ var EN = {
   "composer.hint": "When the selected model belongs to this plugin, its account's credits appear on the left of the composer. Click to switch accounts.",
   "composer.show": "Show credits",
   "composer.hide": "Hide credits",
+  "rewrite.title": "Client name",
+  "rewrite.on": "On",
+  "rewrite.off": "Off",
+  "rewrite.label": "Rename the client in the prompt the domestic host receives",
+  "rewrite.hint": "The domestic WorkBuddy host refuses a request whose prompt names DeepSeek Harness as the client (channel check 11128). Turned on, every occurrence of that name is sent as DeepSeek; turned off, the original wording is sent.",
+  "rewrite.show": "Rename client",
+  "rewrite.hide": "Stop renaming",
   "check.title": "Connection check",
   "check.empty": "Run the check to see whether a chat can reach WorkBuddy, Trae or Qoder.",
   "check.pass": "PASS",
@@ -255,6 +314,8 @@ var ZH = {
   "tab.pool": "账号池",
   "tab.models": "模型",
   "tab.check": "连接检查",
+  "tab.growth": "成长中心",
+  "risk.note": "！可能有封号风险，请斟酌使用，概不负责 ！",
   "host.missing": "宿主还没有注册本插件的 {count} 个模型组：重新加载插件让它重读声明。",
   "btn.rescan": "重新检测账号",
   "btn.reset": "清除所有冷却",
@@ -280,7 +341,7 @@ var ZH = {
   "pool.healthy": "限流时会自动切换到其他可用账号。",
   "pool.allCooling": "所有账号当前都被限流，请求会等到有账号冷却结束。",
   "pool.checkinAll": "全部签到",
-  "pool.checkinAllHint": "一次领完所有账号今天的签到。连登奖励和任务奖励随自动签到、立即运行领取。",
+  "pool.checkinAllHint": "一次领完所有账号今天的签到，连登奖励也随这一轮领取。",
   "pool.checkinAllBusy": "签到中…",
   "pool.checkinAllDone": "已签到 {count} 个账号",
   "pool.checkinAllNone": "所有账号今天都已签到",
@@ -288,12 +349,19 @@ var ZH = {
   "pool.emptyRegion": "{region}这一侧还没有登录的账号。",
   "pool.emptyHint": "请在该版本的 WorkBuddy 桌面 App 里登录，再点「重新检测账号」。",
   "pool.sourceOff": "WorkBuddy 来源已在插件设置里关闭。",
+  "login.add": "添加账号",
+  "login.addHint": "在浏览器里登录 WorkBuddy。浏览器登完，这个账号就进池子了。",
+  "login.openAgain": "再打开一次链接",
+  "login.waiting": "在浏览器里完成登录即可，面板会自己把这个账号收进来。",
+  "login.timeout": "登录没有完成。重新开始一次拿新链接。",
+  "login.added": "已添加 {name}",
+  "login.addedNoName": "账号已添加",
   "trae.title": "Trae",
   "trae.gateway": "{region}网关，端口 {port}",
   "trae.models": "{count} 个模型",
   "trae.noModels": "还没有发布模型",
   "trae.off": "Trae 来源已在插件设置里关闭。",
-  "trae.fallback": "用的是备用端口；供应商行仍指向 {port}",
+  "trae.fallback": "首选端口 {port} 被占用，本次改听备用端口，供应商行跟随本次地址",
   "qoder.title": "Qoder",
   "qoder.gateway": "{region}网关，端口 {port}",
   "qoder.models": "{count} 个模型",
@@ -320,7 +388,7 @@ var ZH = {
   "source.noCampaign": "该账号无签到活动",
   "source.campaignUnknown": "签到状态读取失败",
   "source.deviceCheckedIn": "本机今日已签到",
-  "qoder.fallback": "用的是备用端口；供应商行仍指向 {port}",
+  "qoder.fallback": "首选端口 {port} 被占用，本次改听备用端口，供应商行跟随本次地址",
   "badge.next": "下一个",
   "source.claimableAt": "{time} 后可签到",
   "badge.cooling": "冷却中",
@@ -337,15 +405,22 @@ var ZH = {
   "acct.automatic": "自动选择（按使用方式）",
   "acct.choiceHint": "优先用所选账号，限流时临时换号；自动选择则按使用方式分配。",
   "acct.unavailable": "所选账号暂不可用（自动换号）",
+  "acct.expired": "登录已过期",
+  "acct.archivedHint": "国际版只保留一个登录文件，切号时本账号的登录被覆盖。令牌已留存，账号可用到令牌到期。在 WorkBuddy 里重新登录可续期。",
   "acct.choiceCredits": "{label} · {credits} 积分",
   "badge.preferred": "已选",
   "acct.on": "启用中",
   "acct.off": "已停用",
   "acct.switchOn": "重新使用该账号",
+  "acct.inPool": "参与轮换",
   "acct.switchOff": "暂时不使用该账号",
   "acct.offHint": "已停用：在重新启用之前，请求不会使用该账号。",
   "acct.remove": "移除",
-  "acct.removeHint": "永久移出账号池；可在「已移除的账号」里恢复。",
+  "acct.removeHint": "把账号移出账号池；可在「已移除的账号」里恢复。",
+  "acct.delete": "删除",
+  "acct.deleteHint": "删掉这个插件自己写下的登录文件。账号就此没有了，不能恢复。",
+  "acct.deleteConfirm": "要删除 {name} 吗？登录文件会被删掉，这个账号再也回不来。",
+  "acct.deleteConfirmAgain": "再按一次确认删除",
   "acct.stateError": "账号设置失败：{message}",
   "pool.switchedOff": "{count} 个已停用",
   "removed.title": "已移除的账号",
@@ -397,6 +472,7 @@ var ZH = {
   "models.windowFollows": "跟随目录；手动修改后会固定为你的值。",
   "models.maxOutput": "最大输出",
   "models.outputHelp": "该模型单次回复的最大长度。",
+  "models.overCeiling": "该模型最多只接受 {limit}，更大的数值没有生效。",
   "models.levels": "思考等级",
   "models.defaultLevel": "默认思考等级",
   "models.capabilities": "附件",
@@ -409,7 +485,6 @@ var ZH = {
   "models.dirty": "有未保存的修改",
   "models.saving": "保存中…",
   "models.saved": "模型选择已保存",
-  "models.applyHint": "已保存。模型选择器没同步时，重新加载插件。",
   "models.saveError": "保存失败：{message}",
   "models.reload": "模型列表有变化。重新加载插件后同步。",
   "models.addressDrift": "对外公布的地址与本次运行的地址不一致。重新加载插件。",
@@ -435,6 +510,41 @@ var ZH = {
   "composer.hint": "开启后，选中本插件的模型时，输入框左侧显示正在使用的账号积分。点开可以换号。",
   "composer.show": "显示积分",
   "composer.hide": "隐藏积分",
+  "rewrite.title": "客户端名称",
+  "rewrite.on": "已开启",
+  "rewrite.off": "已关闭",
+  "rewrite.label": "改写发往国内版的提示词里的客户端名称",
+  "rewrite.hint": "WorkBuddy 国内版会拒绝提示词里把自己称作 DeepSeek Harness 的对话请求（渠道校验 11128）。开启后，提示词里这个名称的每一处都改为 DeepSeek；关闭后恢复原名。",
+  "rewrite.show": "改写名称",
+  "rewrite.hide": "恢复原名",
+  "growth.title": "成长中心",
+  "growth.ready": "WorkBuddy",
+  "growth.running": "运行中…",
+  "growth.read": "读取状态",
+  "growth.reading": "读取中…",
+  "growth.readHint": "只读成长中心现在有什么，不领。",
+  "growth.run": "立即执行",
+  "growth.runHint": "单独执行定时签到里那段成长链路，并按步骤报告结果。",
+  "growth.hint": "四项：补签卡、礼包与补偿、活跃上报、连登档位与抽奖。补签卡与抽奖次数在执行后扣减，其余分项可重复执行，不会二次到账。",
+  "growth.stateNone": "还没有读过状态",
+  "growth.stateStale": "跑过一趟之后状态就旧了，点「读取状态」更新",
+  "growth.stateSummary": "{accounts} 个账号 · 可兑换 {tiers} 档 · 补签卡 {cards} 张 · 抽奖 {chances} 次",
+  "growth.groupCount": "{count} 个账号",
+  "growth.stateFailed": "{failed} 个账号读不出来",
+  "growth.rowSummary": "连登 {days} 天 · 下一档 {tier}，还差 {remaining} 天",
+  "growth.rowHold": "可兑换 {tiers} 档 · 补签卡 {cards} 张 · 抽奖 {chances} 次",
+  "growth.rowTiers": "连登档位",
+  "growth.rowTier": "{tier} · {days} 天 · +{credit} 积分 +{energy} 能量 · {status}",
+  "growth.tierClaimed": "已领取",
+  "growth.tierUnlocked": "可兑换",
+  "growth.tierLocked": "未解锁",
+  "growth.rowNothing": "这里没有可领的",
+  "growth.rowFailed": "这个账号读不出来",
+  "growth.onlyWorkbuddy": "成长中心只跟 WorkBuddy 有关。",
+  "growth.runNone": "这一趟没有可领的",
+  "growth.runLine": "{when}：补签 {makeup} · 礼包 +{gift} · 补偿 +{compensation} · 活跃上报 {activity} · 档位 {streak} · 抽奖 {lottery} · 共 +{credit} 积分",
+  "growth.runFailed": "{when}：{failed} 个步骤失败",
+  "growth.busy": "签到正在跑，等它跑完",
   "auto.hours": "时间",
   "auto.hoursHint": "按北京时间（UTC+8），如 9 或 9,21",
   "auto.hoursSave": "保存时间",
@@ -450,9 +560,14 @@ var ZH = {
   "auto.rowQoder": "Qoder",
   "auto.rowTrae": "Trae",
   "auto.rowCounts": "{label}：领取 {claimed} · 跳过 {skipped} · 失败 {failed}",
-  "auto.rowGrowth": "连登与任务：连登 {streak} 档 · 任务 {tasks} 个 · +{credit} 积分 · 失败 {failed}",
+  "auto.rowGrowth": "连登：{streak} 档 · +{credit} 积分 · 失败 {failed}",
+  "auto.rowKeepAlive": "令牌保活 {when}：刷新 {refreshed} 个 · 无需处理 {fresh} 个 · 失败 {failed} 个 · 无刷新令牌 {noToken} 个",
   "auto.rowTravelCounts": "{label}：派出 {departed} · 领奖 {claimed} · 领养 {adopted}",
-  "auto.hint": "时间到后一次性领取三家（WorkBuddy / Trae / Qoder）的签到奖励、WorkBuddy 国内账号的连登奖励和任务奖励，并顺带完成猫猫旅行；今天已领过的跳过，错过的到下次启动补领。",
+  "auto.hint": "时间到后一次性领取三家（WorkBuddy / Trae / Qoder）的签到奖励、WorkBuddy 国内账号的连登奖励，并顺带完成猫猫旅行；今天已领过的时段跳过。当天错过的时段在下次启动时补领。",
+  "keepAlive.runNow": "立即刷新",
+  "keepAlive.running": "刷新中…",
+  "keepAlive.label": "登录令牌保活",
+  "keepAlive.hint": "按需续上快到期的登录令牌，久未使用的账号因此不会在下一趟对话上撞到已过期的令牌。有效期还长的令牌不发请求。",
   "auto.badHours": "时间请填 0–23 的整数小时，例如 9 或 9,21。",
   "check.title": "连接检查",
   "check.empty": "运行检查可以看到对话能否连上 WorkBuddy、Trae 或 Qoder。",
@@ -591,7 +706,9 @@ function tagOf(model) {
 function clockHour(hour) {
   var value = Math.round(Number(hour));
   if (!Number.isFinite(value)) return "";
-  value = Math.max(0, Math.min(23, value));
+  // 24 is a real edge: the promo module reports it for "free until the end of
+  // the day". Clamping it to 23 told the user the discount stops an hour early.
+  value = Math.max(0, Math.min(24, value));
   return (value < 10 ? "0" : "") + value + ":00";
 }
 
@@ -644,10 +761,57 @@ function setActiveRegion(source, region) {
  * Unsaved model edits, one per page (source + region).
  *
  * A single slot threw the edits away the moment the user looked at another page:
- * the draft is rebuilt from the saved selection whenever the key changes, so the
- * ticks were gone on the way back and nothing said so. Inside a slot the key is
- * still the id set the draft was built from, so a catalog that gains or loses a
- * model rebuilds it rather than reusing a shape it knows nothing about.
+/**
+ * The growth centre's last read, and whether one is in flight.
+ *
+ * The host keeps the result and hands it back with the status document, so a
+ * repaint or a fresh panel paints the figures it already has; a *read* is only
+ * issued when those figures are gone or old. Holding the read only here meant
+ * every panel reload asked the user to go press a button to see what had just
+ * been on screen.
+ */
+var growthState = null;
+var growthReading = false;
+/** The account whose delete button is armed, and the timer that disarms it. */
+var pendingDelete = null;
+var deleteTimer = 0;
+/**
+ * How many times the host has dropped the read, so a read already in flight can
+ * tell that its own answer is about a pool that no longer exists.
+ */
+var growthDropped = 0;
+/** How long a read stays current before entering the page refreshes it. */
+var GROWTH_STALE_MS = 2 * 60 * 1000;
+
+/** True when the figures on this card are gone, old, or older than the last run. */
+function growthStale() {
+  if (growthState === null) return true;
+  var readAt = typeof growthState.readAt === "number" ? growthState.readAt : null;
+  if (readAt === null) return true;
+  // A run since the read spent what the rows describe, so they are stale even
+  // when they are only a moment old. The scheduled pass records its growth half
+  // inside `autoCheckin.last.growth`, so the run time comes from the same place
+  // the log line does - reading only `growth.last` missed it and kept showing
+  // the figures from before the pass that just spent them.
+  var last = growthLastRun();
+  var ranAt = last ? Date.parse(last.at) : NaN;
+  if (Number.isFinite(ranAt) && ranAt > readAt) return true;
+  // A read stamped in the future is a clock that moved, not a fresh read: it
+  // would otherwise never age, and the card would keep a stale figure forever.
+  if (readAt > Date.now() + GROWTH_STALE_MS) return true;
+  return Date.now() - readAt > GROWTH_STALE_MS;
+}
+/** Which growth rows are expanded, keyed by account id. */
+var openGrowth = {};
+
+/**
+ * The model sheet's draft: the edits of the models ticked on the roster.
+ *
+ * Held in a slot rather than in one object, because the draft is rebuilt from
+ * the saved selection whenever the key changes, so the ticks were gone on the
+ * way back and nothing said so. Inside a slot the key is still the id set the
+ * draft was built from, so a catalog that gains or loses a model rebuilds it
+ * rather than reusing a shape it knows nothing about.
  */
 var drafts = {};
 /** model id -> { enabled, alias, window, output, images, levels, defaultLevel, open } */
@@ -656,6 +820,12 @@ var draft = null;
 var draftSlot = null;
 var busy = null;           // id of the control awaiting a response
 var checkinBusy = null;
+/** Set while a panel login is waiting on the browser, so its button reads as busy. */
+var loginBusy = false;
+/** The URL of the login in flight, so the button can offer it again. */
+var loginUrl = "";
+/** Timer id of the poll loop; cleared when a login ends or the page goes away. */
+var loginTimer = 0;
 var doctorResult = null;
 /** Hours text typed but not yet saved, so a poll cannot overwrite it. */
 var autoHoursDraft = null;
@@ -738,6 +908,8 @@ function sourceOn(source) {
 }
 /** The selected source: the top-level tab, one page of every view at a time. */
 var activeSource = "workbuddy";
+/** Which view page is on screen; the growth tab is hidden off WorkBuddy. */
+var activeTab = "pool";
 
 /**
  * Mirror the source tabs onto everything that is per source: the pool's three
@@ -761,6 +933,11 @@ function renderSourceTabs() {
   renderModelRegionTabs();
   renderModels();
   renderFooter();
+  // The growth page is WorkBuddy's, so leaving that source has to take its tab
+  // with it and drop back to the pool rather than leave a selected tab whose
+  // view is the one just hidden.
+  labelTabs();
+  if (activeSource !== "workbuddy" && activeTab === "growth") selectTab("pool");
 }
 
 /**
@@ -802,9 +979,15 @@ function regionToggle(source, region) {
   return button;
 }
 
-/** What a parked region shows instead of its accounts and models. */
-function parkedRegionBlock(source, region) {
-  var block = el("div", "empty");
+/**
+ * A parked region's notice and its switch.
+ *
+ * The tag is a parameter rather than fixed because this block lands in two kinds
+ * of container: the accounts column is a `div`, while the model roster is a
+ * `ul` and only accepts list items.
+ */
+function parkedRegionBlock(source, region, tag) {
+  var block = el(tag || "div", "empty");
   block.appendChild(el("p", null, t("region.parked", { region: sourceRegionLabel(region) })));
   block.appendChild(regionToggle(source, region));
   return block;
@@ -841,6 +1024,9 @@ function fillRegionNav(nav, source, regions, accounts, active) {
     button.type = "button";
     button.disabled = busy !== null;
     button.setAttribute("role", "tab");
+    // A `tab` without `aria-selected` is invalid ARIA, and it is what a screen
+    // reader reads to say which one is current.
+    button.setAttribute("aria-selected", on ? "true" : "false");
     button.textContent = sourceRegionLabel(region);
     if (regionParked(source, region)) button.appendChild(el("span", "muted", " " + t("region.parkedShort")));
     var count = accounts.filter(function (account) { return account.region === region; }).length;
@@ -880,6 +1066,12 @@ function sourcePreferredPicker(source, region, accounts) {
   accounts.forEach(function (account) {
     var option = el("option", null, account.label);
     option.value = account.label;
+    // Listed but not selectable: the host refuses an expired account as the
+    // preferred one, so offering it turned a click into an error.
+    if (account.expired === true) {
+      option.disabled = true;
+      option.textContent = account.label + " · " + t("acct.expired");
+    }
     picker.appendChild(option);
   });
   var preferred = ((state[source] || {}).preferred || {})[region] || "";
@@ -956,6 +1148,21 @@ function renderWorkbuddyHead() {
   allButton.addEventListener("click", claimAllCheckins);
   host.appendChild(allButton);
 
+  // Adding an account from here, rather than only from the desktop app: a user
+  // with no WorkBuddy install on this machine had no way into the pool at all.
+  // It sits beside the check-in button because it is the other action that
+  // concerns every account rather than one. While a login is waiting it offers
+  // the link again — the browser tab is the easiest thing to lose, and a login
+  // whose URL is gone looks broken rather than unfinished.
+  var addButton = el("button", "ghost small ic-plus" + (loginBusy ? " is-busy" : ""),
+    loginBusy ? t("login.openAgain") : t("login.add"));
+  addButton.type = "button";
+  addButton.id = "loginAddBtn";
+  addButton.title = t("login.addHint");
+  addButton.disabled = busy !== null || checkinBusy !== null;
+  addButton.addEventListener("click", loginBusy ? reopenLogin : startLogin);
+  host.appendChild(addButton);
+
   if (off > 0) host.appendChild(el("span", "muted", t("pool.switchedOff", { count: off })));
 }
 
@@ -964,7 +1171,7 @@ function renderPoolStrip() {
   var strip = $("poolStrip");
   clear(strip);
   var accounts = accountsOf(activeRegion);
-  var cooling = accounts.filter(function (a) { return a.cooling; }).length;
+  var cooling = accounts.filter(function (a) { return a.disabled !== true && a.cooling; }).length;
   var off = accounts.filter(function (a) { return a.disabled === true; }).length;
   // Only the accounts that can serve are counted: a switched-off account is not
   // rate-limited, so counting it here would read "every account is rate-limited"
@@ -1252,7 +1459,7 @@ function renderSourceStrip(source) {
     shown.forEach(function (gateway) {
       var parts = [t(section.gateway, { region: sourceRegionLabel(gateway.region), port: gateway.port }),
         gateway.models > 0 ? t(section.models, { count: gateway.models }) : t(section.noModels)];
-      if (gateway.portFallback) parts.push(t(section.fallback, { port: gateway.port }));
+      if (gateway.portFallback) parts.push(t(section.fallback, { port: gateway.preferredPort || gateway.port }));
       if (gateway.lastError) parts.push(gateway.lastError);
       foot.appendChild(el("span", "muted", parts.join(" · ")));
     });
@@ -1275,7 +1482,7 @@ function claimSourceCheckins(source) {
     render();
     if (payload && payload.running === true) {
       // The pass outlived the plugin's answer and is still collecting: the
-      // command palette reports it when it lands.
+      // the panel reports it when it lands.
       announce(t("pool.checkinAllBusy"));
       return;
     }
@@ -1295,6 +1502,88 @@ function claimSourceCheckins(source) {
     note(String(error && error.message ? error.message : error));
     render();
   });
+}
+
+/** How often a started login is polled while the browser has not finished. */
+var LOGIN_POLL_MS = 3000;
+/** How long the panel keeps polling before it tells the user to start again. */
+var LOGIN_GIVE_UP_MS = 15 * 60 * 1000;
+
+/**
+ * Add a WorkBuddy account by signing in through the browser.
+ *
+ * The region is the one on screen: the pool is split by gateway, so an account
+ * added here belongs to the region the user is looking at rather than to
+ * whichever one the login page happens to default to.
+ */
+function startLogin() {
+  if (busy !== null || checkinBusy !== null || loginBusy) return;
+  var realm = activeRegion === "global" ? "global" : "cn";
+  loginBusy = true;
+  render();
+  invoke("xd.startLogin", { realm: realm }).then(function (answer) {
+    loginUrl = answer && typeof answer.authUrl === "string" ? answer.authUrl : "";
+    if (loginUrl === "") throw new Error("the plugin did not return a login link");
+    // This page is a real browser tab, so the link opens the way its own footer
+    // links do: a new tab, leaving the panel where it is.
+    window.open(loginUrl, "_blank", "noopener,noreferrer");
+  }).then(function () {
+    note(t("login.waiting"));
+    pollLogin(realm, Date.now() + LOGIN_GIVE_UP_MS);
+  }).catch(function (error) {
+    loginBusy = false;
+    note(String(error && error.message ? error.message : error));
+    render();
+  });
+}
+
+/**
+ * Ask the plugin whether the browser has finished, and again shortly if not.
+ *
+ * The loop is the panel's own: the plugin holds no timer, so a page that is
+ * closed stops asking instead of leaving a poll running against a state nobody
+ * is watching.
+ */
+function pollLogin(realm, giveUpAt) {
+  window.clearTimeout(loginTimer);
+  loginTimer = window.setTimeout(function () {
+    if (!loginBusy) return;
+    if (Date.now() > giveUpAt) {
+      loginBusy = false;
+      note(t("login.timeout"));
+      render();
+      return;
+    }
+    invoke("xd.pollLogin", { realm: realm }).then(function (answer) {
+      if (!loginBusy) return;
+      if (answer && answer.status === "ok") {
+        loginBusy = false;
+        note(null);
+        adopt(answer.state);
+        render();
+        announce(answer.nickname
+          ? t("login.added", { name: answer.nickname })
+          : t("login.addedNoName"));
+        return;
+      }
+      pollLogin(realm, giveUpAt);
+    }).catch(function (error) {
+      loginBusy = false;
+      note(String(error && error.message ? error.message : error));
+      render();
+    });
+  }, LOGIN_POLL_MS);
+}
+
+/**
+ * Offer the login link again.
+ *
+ * The browser tab is the easiest thing to lose — closed, or the click never
+ * landed — and a login whose URL is gone looks broken rather than unfinished.
+ */
+function reopenLogin() {
+  if (loginUrl === "") return;
+  window.open(loginUrl, "_blank", "noopener,noreferrer");
 }
 
 /**
@@ -1434,8 +1723,18 @@ function renderAutoCheckin() {
   run.textContent = busy === "checkin" ? t("auto.running") : t("auto.runNow");
   run.title = t("auto.runNowHint");
   run.disabled = busy !== null;
+
+  // The keep-alive row: one button, run by hand. It is a static node, so the
+  // handler lives in `bind`.
+  var keepAliveRun = $("tokenKeepAliveRun");
+  keepAliveRun.textContent = busy === "keepAlive" ? t("keepAlive.running") : t("keepAlive.runNow");
+  keepAliveRun.disabled = busy !== null;
+  $("keepAliveText").textContent = t("keepAlive.label");
+  $("keepAliveHint").textContent = t("keepAlive.hint");
   $("autoHint").textContent = t("auto.hint");
-  paintAutoNote($("autoNote"), auto);
+  // The keep-alive is a sibling of the schedule in the document rather than a
+  // field of it, so the log's reader is handed the two halves it needs.
+  paintAutoNote($("autoNote"), { last: auto.last, keepAlive: state && state.keepAlive });
 }
 
 /**
@@ -1463,6 +1762,26 @@ function renderComposerPoints() {
 }
 
 /**
+ * The client-name switch.
+ *
+ * Same shape as the credits switch above, and for the same reason: the label says
+ * what pressing it will do and which way it currently stands. Off by default -
+ * turning it on is the user's decision, because it changes what the prompt tells
+ * the upstream about the client.
+ */
+function renderRewriteClientName() {
+  var renamed = state !== null && typeof state.replacedClientName === "string";
+  $("rewriteTitle").textContent = t("rewrite.title");
+  $("rewriteState").textContent = renamed ? t("rewrite.on") : t("rewrite.off");
+  var button = $("rewriteClientName");
+  button.textContent = t(renamed ? "rewrite.hide" : "rewrite.show");
+  button.className = "small" + (renamed ? " on" : "");
+  button.disabled = busy !== null;
+  $("rewriteText").textContent = t("rewrite.label");
+  $("rewriteHint").textContent = t("rewrite.hint");
+}
+
+/**
  * The check-in log: one row per source, each with a state dot.
  *
  * A single line with separators was unreadable once three sources reported, so
@@ -1475,14 +1794,38 @@ function renderComposerPoints() {
  */
 function autoNoteRows(auto) {
   var last = auto.last;
-  if (!last) return [{ text: t("auto.neverRun"), tone: "" }];
+  // The keep-alive is a duty of its own rather than a stage of the pass, so it
+  // reports on its own line and says when it last ran - on every path, including
+  // the ones that have nothing to say about a check-in pass. Its record is the
+  // only proof the button did anything, and a restart clears the pass log without
+  // touching it.
+  var keepAliveRow = null;
+  if (auto.keepAlive) {
+    keepAliveRow = {
+      text: t("auto.rowKeepAlive", {
+        when: formatStamp(auto.keepAlive.at),
+        refreshed: Number(auto.keepAlive.refreshed) || 0,
+        fresh: Number(auto.keepAlive.fresh) || 0,
+        failed: Number(auto.keepAlive.failed) || 0,
+        noToken: Number(auto.keepAlive.noToken) || 0,
+      }),
+      tone: Number(auto.keepAlive.failed) > 0 || Number(auto.keepAlive.noToken) > 0 ? "fail"
+        : Number(auto.keepAlive.refreshed) > 0 ? "ok" : "",
+    };
+  }
+  // What the pass log has to say, with the keep-alive line kept on the end.
+  var finish = function (rows) {
+    if (keepAliveRow !== null) rows.push(keepAliveRow);
+    return rows;
+  };
+  if (!last) return finish([{ text: t("auto.neverRun"), tone: "" }]);
   // Opening stub: sources have not answered yet. A finished "0 accounts" row
   // here is what "run now" painted and then never replaced.
   if (last.pending === true && last.travel == null && last.qoder == null && last.trae == null) {
-    return [{ text: t("auto.running"), tone: "" }];
+    return finish([{ text: t("auto.running"), tone: "" }]);
   }
   var slot = String(last.slot).replace("T", " ");
-  if (last.error) return [{ text: t("auto.lastFailedAt", { slot: slot, message: last.error }), tone: "fail" }];
+  if (last.error) return finish([{ text: t("auto.lastFailedAt", { slot: slot, message: last.error }), tone: "fail" }]);
   var rows = [];
   if (last.pending === true) rows.push({ text: t("auto.running"), tone: "" });
   // The head count is every source's claimed accounts, matching the rows
@@ -1529,20 +1872,18 @@ function autoNoteRows(auto) {
   if (last.growth) {
     var growth = last.growth;
     var streakTiers = Number(growth.streak) || 0;
-    var taskCount = Number(growth.tasks) || 0;
     rows.push({
       text: t("auto.rowGrowth", {
         streak: streakTiers,
-        tasks: taskCount,
         credit: Number(growth.credit) || 0,
         failed: Number(growth.failed) || 0,
       }),
-      tone: Number(growth.failed) > 0 ? "fail" : streakTiers > 0 || taskCount > 0 ? "ok" : "",
+      tone: Number(growth.failed) > 0 ? "fail" : streakTiers > 0 ? "ok" : "",
     });
   }
   push(t("auto.rowQoder"), last.qoder);
   push(t("auto.rowTrae"), last.trae);
-  return rows;
+  return finish(rows);
 }
 
 /** Paint the check-in log as rows, so the caller does not build markup inline. */
@@ -1561,6 +1902,286 @@ function paintAutoNote(host, auto) {
   });
   if (host.childElementCount !== rowCount || atBottom) host.scrollTop = host.scrollHeight;
 }
+
+/** The tier status word, from the flat field the upstream reports it in. */
+var STATUS_KEY = { unlocked: "growth.tierUnlocked", claimed: "growth.tierClaimed", locked: "growth.tierLocked" };
+
+/**
+ * The growth centre, on its own page beside the pool and the models.
+ *
+ * Two buttons, because the two halves answer different questions: what the
+ * centre holds right now (a read, safe to press any time) and what a pass
+ * would collect (which spends a make-up card and a draw). Collapsing them into
+ * one button would spend those two without showing them first.
+ */
+function renderGrowth() {
+  $("growthTitle").textContent = t("growth.title");
+  var growth = (state && state.growth) || {};
+  var running = growth.running === true;
+  $("growthState").textContent = running ? t("growth.running") : t("growth.ready");
+  var read = $("growthRead");
+  read.textContent = growthReading ? t("growth.reading") : t("growth.read");
+  read.title = t("growth.readHint");
+  read.disabled = busy !== null || running || growthReading;
+  var run = $("growthRun");
+  run.textContent = busy === "growth" ? t("growth.running") : t("growth.run");
+  run.title = t("growth.runHint");
+  run.disabled = busy !== null || running;
+  $("growthText").textContent = growthStateText();
+  paintGrowthAccounts($("growthAccounts"));
+  $("growthHint").textContent = t("growth.hint");
+  paintGrowthNote($("growthNote"));
+}
+
+/** The totals line above the rows, summed from the rows the read returned. */
+function growthStateText() {
+  // A run since the last read leaves the rows holding figures from before it, so
+  // the stale wording names what to do rather than claiming nothing was read.
+  if (growthState === null) {
+    var last = state && state.growth ? state.growth.last : null;
+    return t(last ? "growth.stateStale" : "growth.stateNone");
+  }
+  // The scheduled pass records its growth half inside the pass it belongs to, so
+  // the run time comes from the same place the log line does. Requiring
+  // `state.growth.last` as well kept the stale wording off exactly that case: a
+  // scheduled pass leaves no `growth.last` behind, so the card kept presenting
+  // figures the pass had already spent as current.
+  if (growthStale() && growthLastRun() !== null) return t("growth.stateStale");
+  var rows = (growthState.rows || []).filter(function (row) { return row.failed !== true; });
+  var sum = function (key) {
+    return rows.reduce(function (total, row) { return total + num(row[key], 0); }, 0);
+  };
+  var parts = [t("growth.stateSummary", {
+    accounts: num(growthState.accounts, 0),
+    tiers: sum("tiers"),
+    cards: sum("makeupCards"),
+    chances: sum("lottery"),
+  })];
+  if (num(growthState.failed, 0) > 0) {
+    parts.push(t("growth.stateFailed", { failed: num(growthState.failed, 0) }));
+  }
+  return parts.join(" · ");
+}
+/**
+ * One account's row: a head carrying the account's own state and what it
+ * holds, and a body with the tiers a run would collect.
+ *
+ * The expand/collapse is the credits block's own shape, reused rather than
+ * restyled: a head button, a caret, and a body shown in place. Toggling in
+ * place matters here too — a rebuild would drop the button that was clicked
+ * and forget where the page was scrolled to.
+ */
+function growthRow(row) {
+  var key = "growth:" + row.id;
+  var open = openGrowth[key] === true;
+  var wrap = el("div", "credits" + (open ? " open" : ""));
+
+  var head = el("button", "credits-head");
+  head.type = "button";
+  head.setAttribute("aria-expanded", open ? "true" : "false");
+  head.title = open ? t("credits.collapse") : t("credits.expand");
+  // The realm is the group heading above the row, so the head opens with the
+  // account's own state instead: unread, holding something a run would
+  // collect, or holding nothing left.
+  head.appendChild(el("span", "growth-dot" + growthRowTone(row)));
+  head.appendChild(el("span", "card-title", row.label));
+  head.appendChild(el("span", "count-chip", t("growth.rowHold", {
+    tiers: num(row.tiers, 0),
+    cards: num(row.makeupCards, 0),
+    chances: num(row.lottery, 0),
+  })));
+  head.appendChild(el("span", "caret", "›"));
+  wrap.appendChild(head);
+
+  var body = el("div", "credits-body");
+  body.hidden = !open;
+  if (row.failed === true) {
+    body.appendChild(el("p", "hint warn", t("growth.rowFailed")));
+  } else {
+    if (num(row.days, 0) > 0 || row.nextTier) {
+      body.appendChild(el("p", "hint", t("growth.rowSummary", {
+        days: num(row.days, 0),
+        tier: row.nextTier || "-",
+        remaining: num(row.nextTierRemaining, 0),
+      })));
+    }
+    body.appendChild(el("p", "field-label", t("growth.rowTiers")));
+    var tiers = row.tierList || [];
+    if (tiers.length === 0) {
+      body.appendChild(el("p", "hint", t("growth.rowNothing")));
+    }
+    tiers.forEach(function (tier) {
+      // A tier that can be redeemed now is the one line worth reading at a
+      // glance, so it takes the log line's own dot and full-strength text.
+      var ready = tier.status === "unlocked";
+      var line = el("p", "log-line" + (ready ? " ok" : ""));
+      line.appendChild(el("span", "growth-dot" + (ready ? " ok" : "")));
+      line.appendChild(el("span", "log-text", t("growth.rowTier", {
+        tier: tier.tier,
+        days: num(tier.days, 0),
+        credit: num(tier.credit, 0),
+        energy: num(tier.energy, 0),
+        status: t(STATUS_KEY[tier.status] || "growth.tierLocked"),
+      })));
+      body.appendChild(line);
+    });
+  }
+  wrap.appendChild(body);
+
+  head.addEventListener("click", function () {
+    var shown = openGrowth[key] !== true;
+    openGrowth[key] = shown;
+    wrap.className = "credits" + (shown ? " open" : "");
+    head.setAttribute("aria-expanded", shown ? "true" : "false");
+    head.title = shown ? t("credits.collapse") : t("credits.expand");
+    body.hidden = !shown;
+  });
+  return wrap;
+}
+
+/**
+ * The row head's state, as a class suffix: a read that failed, a holding a
+ * run would collect something from, or nothing left to collect.
+ */
+function growthRowTone(row) {
+  if (row.failed === true) return " fail";
+  var held = num(row.tiers, 0) + num(row.makeupCards, 0) + num(row.lottery, 0);
+  return held > 0 ? " ok" : "";
+}
+
+/**
+ * The account rows, grouped by realm, or the note that says the centre is not
+ * this source's.
+ *
+ * The two editions claim on different schedules and hold different cards, so
+ * they are split under their own heading rather than mixed into one list
+ * where the realm was a badge on each row.
+ */
+function paintGrowthAccounts(host) {
+  clear(host);
+  if (activeSource !== "workbuddy") {
+    host.appendChild(el("p", "hint", t("growth.onlyWorkbuddy")));
+    return;
+  }
+  if (growthState === null) return;
+  var rows = growthState.rows || [];
+  if (rows.length === 0) {
+    host.appendChild(el("p", "hint", t("source.noAccounts")));
+    return;
+  }
+  var order = SOURCE_REGIONS.workbuddy.slice();
+  rows.forEach(function (row) {
+    if (order.indexOf(row.region) < 0) order.push(row.region);
+  });
+  order.forEach(function (region) {
+    var group = rows.filter(function (row) { return row.region === region; });
+    if (group.length === 0) return;
+    var head = el("p", "growth-group", regionLabel(region));
+    head.appendChild(el("span", "muted", t("growth.groupCount", { count: group.length })));
+    host.appendChild(head);
+    group.forEach(function (row) { host.appendChild(growthRow(row)); });
+  });
+}
+
+/** The last growth run, whichever entry point started it. */
+function growthLastRun() {
+  var growth = (state && state.growth) || {};
+  if (growth.last) return growth.last;
+  var auto = (state && state.autoCheckin) || {};
+  if (auto.last && auto.last.growth) {
+    // The scheduled pass records its growth half inside the pass it belongs to,
+    // so the time to show is the pass's own.
+    return { at: auto.last.at, ...auto.last.growth };
+  }
+  return null;
+}
+
+/** Paint the growth log as rows, the way the check-in log above it is painted. */
+function paintGrowthNote(host) {
+  var atBottom = host.scrollTop + host.clientHeight >= host.scrollHeight - 4;
+  var rowCount = host.childElementCount;
+  clear(host);
+  var run = growthLastRun();
+  if (run === null) return;
+  var detail = run.detail || {};
+  var when = formatStamp(run.at);
+  var anything = num(detail.makeup, 0) + num(detail.gift, 0) + num(detail.compensation, 0)
+    + num(detail.activity, 0) + num(detail.streak, 0) + num(detail.lottery, 0) > 0;
+  var rows = [{
+    text: anything
+      ? t("growth.runLine", {
+        when: when,
+        makeup: num(detail.makeup, 0),
+        gift: num(detail.gift, 0),
+        compensation: num(detail.compensation, 0),
+        activity: num(detail.activity, 0),
+        streak: num(detail.streak, 0),
+        lottery: num(detail.lottery, 0),
+        credit: num(run.credit, 0),
+      })
+      : t("growth.runNone"),
+    tone: anything ? "ok" : "",
+  }];
+  var failed = num(detail.failed, 0) > 0 ? num(detail.failed, 0) : num(run.failed, 0);
+  if (failed > 0) {
+    rows.push({ text: t("growth.runFailed", { when: when, failed: failed }), tone: "fail" });
+  }
+  rows.forEach(function (row) {
+    var line = el("div", "log-line" + (row.tone ? " " + row.tone : ""));
+    line.appendChild(el("span", "log-dot"));
+    line.appendChild(el("span", "log-text", row.text));
+    host.appendChild(line);
+  });
+  if (host.childElementCount !== rowCount || atBottom) host.scrollTop = host.scrollHeight;
+}
+
+/** Ask the host what the growth centre holds, claiming nothing. */
+function readGrowth() {
+  // `growthReading` alone, not the panel-wide `busy`: a finished run re-reads
+  // its own rows from inside `runBusy`, while `busy` still says "growth".
+  if (growthReading) return Promise.resolve();
+  growthReading = true;
+  var epoch = growthDropped;
+  render();
+  return invoke("xd.growthState").then(function (answer) {
+    growthReading = false;
+    // Dropped while this read ran: what came back describes the pool as it was,
+    // and adopting it would put the dropped rows back with a stamp that says they
+    // are fresh.
+    growthState = epoch === growthDropped && answer && answer.growth ? answer.growth : null;
+    render();
+  }).catch(function (error) {
+    growthReading = false;
+    note(String(error && error.message ? error.message : error));
+    render();
+  });
+}
+
+/** Run the growth centre on its own. */
+function runGrowth() {
+  if (busy !== null) return Promise.resolve();
+  return runBusy("growth", function () {
+    return invoke("xd.growthRun").then(function (payload) {
+      // The run answers with the document beside its own counts, and this card
+      // is its only reader: `runBusy` adopts a bare document, which this answer
+      // is not. Adopting it here keeps the pool, the models and the check-in
+      // card following the pass like every other run.
+      if (payload && payload.state) adopt(payload.state);
+      if (payload && payload.running === true) {
+        // The pass outran the answer and is still going: the card follows it
+        // through the document, exactly like the check-in pass.
+        announce(t("growth.running"));
+        return payload;
+      }
+      // The pass just spent whatever the state line was describing, so the
+      // rows are read again rather than left showing what is now collected.
+      return readGrowth();
+    });
+  }).catch(function (error) {
+    var message = String(error && error.message ? error.message : error);
+    note(/BUSY/.test(message) ? t("growth.busy") : message);
+  });
+}
 function renderAccounts() {
   var host = $("accounts");
   // Every control in here repaints this column, and the column has no scroller
@@ -1574,7 +2195,13 @@ function renderAccounts() {
 
 function paintAccounts(host) {
   clear(host);
-  if (state === null) return;
+  // The first paint has no document yet. Answering with nothing left the column
+  // blank below the header, which read the same as a source with no accounts.
+  if (state === null) {
+    host.appendChild(el("div", "empty", t("state.loading")));
+    host.firstChild.setAttribute("aria-busy", "true");
+    return;
+  }
   var accounts = accountsOf(activeRegion);
   // A parked region has no accounts to show: it says so, and offers its switch.
   if (activeRegion !== "" && regionParked("workbuddy", activeRegion)) {
@@ -1670,6 +2297,10 @@ function renderRemoved(host) {
 
 function accountCard(account) {
   var off = account.disabled === true;
+
+  // Listed but out of rotation: the app overwrote this account's sign-in with
+  // the next one, so the card stays readable but says why it is not picked.
+  var archived = account.archived === true;
   var card = el("div", "card account" + (off ? " card-off" : ""));
 
   var head = el("div", "card-head");
@@ -1679,32 +2310,111 @@ function accountCard(account) {
     head.appendChild(el("span", "badge next", t("badge.next")));
   }
   if (account.preferred) head.appendChild(el("span", "badge next", t("badge.preferred")));
+  // An archived account keeps serving, so its badge reports the same health as
+  // any other; the note below the head says where its sign-in now comes from.
   head.appendChild(el("span", "badge " + (off ? "off" : account.cooling ? "cool" : "ok"),
     off ? t("acct.off") : account.cooling ? t("badge.cooling") : t("badge.healthy")));
 
   // "Not right now" and "not mine any more" are different decisions, so they
   // stay separate controls: a switch the user flips, and a plain remove button.
   var controls = el("div", "acct-controls");
+  // Greys only while an action is actually touching an account. These used to
+  // follow the whole-panel `busy`, so a refresh or a doctor pass greyed every
+  // row and dropped the labels to a contrast the muted text could not carry.
+  // Any action in flight, not just the account ones: `setAccountState` answers a
+  // press made while another control is busy with "nothing" - it returns without
+  // even raising the busy banner - so a row that stayed enabled was a press that
+  // did nothing and said nothing, on the delete button of all places.
+  var rowBusy = busy !== null;
+  // A row control carries its own id because the focus hand-back has nothing else
+  // to go on: the labels are the same on every row ("remove" four times over),
+  // and the fallback that matches by label put the ring on the first row's button
+  // when the user had pressed the fifth. See `locateControl`.
+  var rowKey = "acct-" + account.id;
   var toggle = el("button", "acct-toggle" + (off ? "" : " on"));
+  toggle.id = rowKey + "-toggle";
   toggle.type = "button";
   toggle.setAttribute("role", "switch");
   toggle.setAttribute("aria-checked", off ? "false" : "true");
+  // The name a switch carries is the property it controls and does not change
+  // with its state; the visible label already says which state it is in.
+  toggle.setAttribute("aria-label", t("acct.inPool"));
   toggle.title = off ? t("acct.switchOn") : t("acct.switchOff");
-  toggle.disabled = busy !== null;
+  toggle.disabled = rowBusy;
   toggle.appendChild(el("span", "acct-toggle-dot"));
   toggle.appendChild(el("span", null, off ? t("acct.off") : t("acct.on")));
   toggle.addEventListener("click", function () { setAccountState(account.id, off ? "enabled" : "disabled"); });
   controls.appendChild(toggle);
 
   var removeBtn = el("button", "acct-remove", t("acct.remove"));
+  removeBtn.id = rowKey + "-remove";
   removeBtn.type = "button";
   removeBtn.title = t("acct.removeHint");
-  removeBtn.disabled = busy !== null;
+  removeBtn.disabled = rowBusy;
   removeBtn.addEventListener("click", function () { setAccountState(account.id, "removed"); });
   controls.appendChild(removeBtn);
+  // Only a sign-in this plugin wrote can be deleted. A desktop app's own file
+  // is never offered this: removing it would sign the user out of that app, so
+  // the pool-level "remove" above is as far as it goes.
+  if (account.own === true) {
+    // Irreversible, and unlike "remove" there is no list to restore from, so the
+    // second press is what confirms it. `window.confirm` cannot be used here: the
+    // panel runs in a sandboxed page, where Electron answers a script dialog by
+    // returning false without showing anything - the button looked live and
+    // deleted nothing, every time.
+    //
+    // The armed state lives here rather than on the button: a poll repaint rebuilds
+    // the row every 1.2-2 s, and a flag written onto the node was gone before the
+    // second press arrived, so every press re-armed instead of deleting.
+    var armed = pendingDelete === account.id;
+    var deleteBtn = el("button", armed ? "acct-delete confirming" : "acct-delete", t(armed ? "acct.deleteConfirmAgain" : "acct.delete"));
+    deleteBtn.id = rowKey + "-delete";
+    deleteBtn.type = "button";
+    deleteBtn.title = t("acct.deleteHint");
+    deleteBtn.disabled = rowBusy;
+    deleteBtn.setAttribute("aria-pressed", armed ? "true" : "false");
+    deleteBtn.addEventListener("click", function () {
+      if (pendingDelete !== account.id) {
+        pendingDelete = account.id;
+        note(t("acct.deleteConfirm", { name: account.label }), "warn");
+        // Repaint the list, not just the account picker: the label has to change
+        // to say what the next press does, or the second press looks like the
+        // first one failing.
+        renderAccounts();
+        // A press that is never followed up must not arm the row forever.
+        if (deleteTimer !== 0) clearTimeout(deleteTimer);
+        deleteTimer = setTimeout(function () {
+          deleteTimer = 0;
+          if (pendingDelete !== account.id) return;
+          pendingDelete = null;
+          // The banner still names the account that is no longer armed, so it
+          // reads as "the next press deletes this" beside a button that has gone
+          // back to its first-press label. Cleared only while it is still that
+          // prompt: anything the user has done since is not this timer's to erase.
+          if (bannerText === t("acct.deleteConfirm", { name: account.label })) note("");
+          renderAccounts();
+        }, 8000);
+        return;
+      }
+      // Checked before the arming is consumed: `setAccountState` answers a busy
+      // panel by returning without a word, so clearing the arming first would turn
+      // this press into "did nothing, said nothing" - the exact symptom the two-press
+      // shape exists to remove. The row is disabled while busy anyway; this is the
+      // press that slips in between the click and the repaint.
+      if (busy !== null) {
+        note(t("err.busy"), "warn");
+        return;
+      }
+      if (deleteTimer !== 0) { clearTimeout(deleteTimer); deleteTimer = 0; }
+      pendingDelete = null;
+      setAccountState(account.id, "deleted");
+    });
+    controls.appendChild(deleteBtn);
+  }
   head.appendChild(controls);
   card.appendChild(head);
 
+  if (archived) card.appendChild(el("div", "hint muted", t("acct.archivedHint")));
   if (off) card.appendChild(el("div", "hint muted", t("acct.offHint")));
 
   var meta = el("div", "model-meta");
@@ -1727,7 +2437,7 @@ function accountCard(account) {
   if (account.probePending === true) {
     card.appendChild(el("div", "hint muted", t("probe.pending")));
   } else if (account.creditsError) {
-    card.appendChild(el("div", "hint finding-fail", t("credits.unavailable") + " — " + account.creditsError));
+    card.appendChild(el("div", "hint finding-fail", t("credits.unavailable") + ": " + account.creditsError));
   } else if (account.credits) {
     card.appendChild(creditsBlock(account.credits, account.id, { floor: account }));
   }
@@ -2119,12 +2829,22 @@ function renderModels() {
   }
   draft = drafts[slot].draft;
   draftSlot = slot;
+  // Every render, not only a key change: the ceilings can shrink while the model
+  // ids stay the same - one directory function failing is enough - and a draft is
+  // allowed to outlive that. Idempotent, and it keeps what the field shows equal to
+  // what the host would accept.
+  list.forEach(function (model) {
+    if (draft[model.id] !== undefined) reclampEntry(draft[model.id], model);
+  });
 
   $("modelListTitle").textContent = page.label;
   show($("modelFetchBtn"), page.source === "workbuddy");
   $("modelFetchBtn").textContent = busy === "fetch" ? t("models.modelsLoading") : t("models.fetchModelList");
   $("modelFetchBtn").disabled = busy !== null;
   $("modelSearch").placeholder = t("models.searchModel");
+  // A placeholder is not an accessible name: it disappears as soon as the box
+  // has text in it, so the field announced itself as an unlabelled search.
+  $("modelSearch").setAttribute("aria-label", t("models.searchModel"));
   var filter = $("modelSearch").value.trim().toLowerCase();
   var host = $("models");
   var keep = placeOf(host);
@@ -2133,9 +2853,12 @@ function renderModels() {
   paintPageHint(page, published);
 
   if (list.length === 0) {
+    // A <ul> whose only child is a <div> is an empty list to a screen reader,
+    // and the empty state sits 40px in because the list indentation applies to
+    // it too. The roster's own rows are list items, so this is one as well.
     host.appendChild(regionParked(page.source, page.region)
-      ? parkedRegionBlock(page.source, page.region)
-      : el("div", "empty", emptyRosterText(page)));
+      ? parkedRegionBlock(page.source, page.region, "li")
+      : el("li", "empty", state === null ? t("state.loading") : emptyRosterText(page)));
     $("modelSelectAll").checked = false;
     $("modelSelectAll").indeterminate = false;
     $("modelSelectAll").disabled = true;
@@ -2150,7 +2873,7 @@ function renderModels() {
       || String(model.name).toLowerCase().indexOf(filter) >= 0
       || String(model.alias || "").toLowerCase().indexOf(filter) >= 0;
   });
-  if (shown.length === 0) host.appendChild(el("div", "empty", t("models.noMatch")));
+  if (shown.length === 0) host.appendChild(el("li", "empty", t("models.noMatch")));
 
   // The header box reflects the visible rows, matching the host: clearing the
   // search and ticking the box selects everything, filtering narrows it.
@@ -2215,6 +2938,14 @@ function publishedModels(list, cap) {
 function modelListRow(model, published) {
   var entry = draft[model.id];
   var row = el("li", "row");
+  // The sheet opens on the right-hand column, and nothing on the roster said
+  // which model it belonged to: the row washes only for "ticked", so the one
+  // being edited looked like every other. The marker reads the same `entry.open`
+  // the right column expands on, so the two cannot disagree. This paints it on
+  // the rebuild; `paintEditingRow` repaints it in place when the sheet is toggled
+  // from the right column, which needs the id on the element.
+  row.setAttribute("data-model-id", model.id);
+  if (entry && entry.open === true) row.classList.add("is-editing");
   var label = el("label", "row-label");
 
   var box = document.createElement("input");
@@ -2224,6 +2955,11 @@ function modelListRow(model, published) {
   box.disabled = busy !== null;
   box.addEventListener("change", function () {
     entry.enabled = box.checked;
+    // An unticked model has no sheet, so the open state goes with the tick, the
+    // way the × control drops both: left behind, the roster kept marking a row
+    // that had nothing open, and a rebuild put the sheet back on a model the user
+    // had just taken out of the selection.
+    if (!entry.enabled) closeSheetOf(model.id);
     renderModels();
   });
   label.appendChild(box);
@@ -2257,7 +2993,6 @@ function modelListRow(model, published) {
   // Only an enabled model has a sheet to open, which is what the second view is.
   if (entry.enabled) {
     label.appendChild(el("span", "row-open-hint", "›"));
-    label.classList.add("is-openable");
     label.addEventListener("click", function (event) {
       if (event.target instanceof HTMLInputElement) return;
       // The row is a <label>, whose default activation would also flip the
@@ -2272,6 +3007,68 @@ function modelListRow(model, published) {
 }
 
 /**
+ * Take one model out of the open state, leaving any other sheet alone.
+ *
+ * The roster's mark is read from `entry.open` and the record a rebuilt draft
+ * restores from is `selectedSheet`, so the two are always written together: a
+ * gesture that cleared one and not the other left a row marked as being edited
+ * while its sheet was already gone.
+ */
+function closeSheetOf(id) {
+  var entry = draft[id];
+  if (!entry) return;
+  entry.open = false;
+  if (sheetIsOpen(id)) selectedSheet = null;
+}
+
+/**
+ * Open one model's sheet and close the rest.
+ *
+ * One at a time: the roster's mark means "this is the model whose editor is open",
+ * and two marked rows cannot both be that.
+ */
+function openSheetOf(id) {
+  var entry = draft[id];
+  if (!entry) return;
+  Object.keys(draft).forEach(closeSheetOf);
+  entry.open = true;
+  selectedSheet = { key: currentModelKey(), id: id };
+}
+
+/**
+ * Open or close one model's sheet from the right-hand column.
+ *
+ * The roster marker is repainted in place rather than by rebuilding the list: a
+ * rebuild is what `openModelSheet` costs from the left, and doing that here would
+ * throw away the roster's scroll offset and the focus inside the sheet every time
+ * the sheet is collapsed.
+ */
+function toggleModelSheet(id) {
+  var entry = draft[id];
+  if (!entry) return;
+  if (entry.open === true) closeSheetOf(id);
+  else openSheetOf(id);
+  renderChosen();
+  paintEditingRow();
+}
+
+/**
+ * Bring the roster's editing marker in step with the draft.
+ *
+ * One model has a sheet open, and that id can change from either column, so the
+ * mark is repainted for every row rather than added to one: a row left marked
+ * after the sheet moved read as the model being edited when it was not.
+ */
+function paintEditingRow() {
+  var rows = $("models").querySelectorAll("[data-model-id]");
+  for (var index = 0; index < rows.length; index += 1) {
+    var entry = draft[rows[index].getAttribute("data-model-id")];
+    if (entry && entry.open === true) rows[index].classList.add("is-editing");
+    else rows[index].classList.remove("is-editing");
+  }
+}
+
+/**
  * Open one model's sheet.
  *
  * Both columns stay on screen, so this only marks which model is expanded and
@@ -2280,17 +3077,27 @@ function modelListRow(model, published) {
 function openModelSheet(id) {
   var entry = draft[id];
   if (!entry || !entry.enabled) return;
-  entry.open = true;
-  selectedModelId = id;
-  renderChosen();
-  var node = $("chosen");
-  if (node && node.scrollIntoView) node.scrollIntoView({ block: "nearest" });
+  openSheetOf(id);
+  // Both columns: the left one is what draws the editing marker.
+  renderModels();
+  // The expanded row, not `#chosen`: that element is the scroller itself, and
+  // `scrollIntoView` on it moves its ancestors, so a sheet below the fold opened
+  // without coming into view. The rows sit inside the list, and are matched
+  // through the attribute rather than a selector because a model id is not a CSS
+  // identifier.
+  var rows = $("chosen").querySelectorAll("[data-model-id]");
+  for (var index = 0; index < rows.length; index += 1) {
+    if (rows[index].getAttribute("data-model-id") !== id) continue;
+    if (rows[index].scrollIntoView) rows[index].scrollIntoView({ block: "nearest" });
+    break;
+  }
 }
 
 /** The sheet view: every enabled model's editor, the selected one expanded. */
 function renderChosen() {
   $("modelEditTitle").textContent = t("models.modelConfigurations");
   $("chosenSearch").placeholder = t("models.searchChosen");
+  $("chosenSearch").setAttribute("aria-label", t("models.searchChosen"));
 
   var page = modelPage();
   var list = page.list;
@@ -2339,6 +3146,7 @@ function modelSheetRow(model) {
   var entry = draft[model.id];
   var expanded = entry.open === true;
   var row = el("li", "chosen-row");
+  row.setAttribute("data-model-id", model.id);
 
   var head = el("div", "chosen-head");
   // The name, the same as the roster row: the id it is filed under is not shown
@@ -2354,8 +3162,7 @@ function modelSheetRow(model) {
   advanced.type = "button";
   advanced.setAttribute("aria-expanded", expanded ? "true" : "false");
   advanced.addEventListener("click", function () {
-    entry.open = !entry.open;
-    renderChosen();
+    toggleModelSheet(model.id);
   });
   head.appendChild(advanced);
 
@@ -2365,9 +3172,8 @@ function modelSheetRow(model) {
   remove.setAttribute("aria-label", t("models.removeModel"));
   remove.addEventListener("click", function () {
     entry.enabled = false;
-    entry.open = false;
     // Removing the model being edited returns to the roster.
-    if (selectedModelId === model.id) selectedModelId = null;
+    closeSheetOf(model.id);
     renderModels();
   });
   head.appendChild(remove);
@@ -2378,8 +3184,24 @@ function modelSheetRow(model) {
   return row;
 }
 
-/** The model whose sheet is open, or null while the roster is showing. */
-var selectedModelId = null;
+/**
+ * The open model sheet: the gateway key it belongs to and the model id.
+ *
+ * Both, because model ids repeat across providers - `deepseek-v4.1-flash` is in
+ * all three rosters - so an id alone carried the open sheet from WorkBuddy into
+ * Trae's roster of the same name, pre-expanding a model the user never opened.
+ */
+var selectedSheet = null;
+
+/** Whether the sheet for this gateway key and model id is the open one. */
+function sheetIsOpen(modelId) {
+  return selectedSheet !== null && selectedSheet.key === currentModelKey() && selectedSheet.id === modelId;
+}
+
+/** The gateway a model edit applies to: the source and the region it is showing. */
+function currentModelKey() {
+  return activeSource + ":" + activeRegionOf(activeSource);
+}
 
 /**
  * The presets the host's own model editor offers, so a value picked here lands
@@ -2403,6 +3225,23 @@ var MAX_OUTPUT_PRESETS = [
 var THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /** A fresh editable draft built from the server's document for one region. */
+/**
+ * A saved limit, kept inside the ceiling the row shows.
+ *
+ * The host sizes its budget from what the declaration says, and `src/host.ts`
+ * clamps an override to the catalog's figure before publishing — so an override
+ * stored above it (the catalog shrank after it was saved) is not what the model
+ * runs at. Showing it verbatim put a number in the field that the field's own
+ * `max` then refused to accept, and the panel read as if the model had more room
+ * than it has.
+ */
+function withinCeiling(saved, ceiling) {
+  if (typeof saved !== "number") return null;
+  if (typeof ceiling !== "number" || ceiling <= 0) return saved;
+  return Math.min(saved, ceiling);
+}
+
+/** A fresh editable draft built from the server's document for one region. */
 function draftFor(list, selection) {
   var enabled = selection.enabledModelIds;
   var overrides = selection.overrides || {};
@@ -2414,17 +3253,131 @@ function draftFor(list, selection) {
       // An absent field means "follow the catalog", which the editor shows as
       // the untouched state rather than a value of its own.
       alias: typeof saved.alias === "string" ? saved.alias : "",
-      window: typeof saved.contextWindow === "number" ? saved.contextWindow : null,
-      output: typeof saved.maxOutputTokens === "number" ? saved.maxOutputTokens : null,
+      window: withinCeiling(saved.contextWindow, windowCeiling(model)),
+      output: withinCeiling(saved.maxOutputTokens, outputCeilingFor(model, withinCeiling(saved.contextWindow, windowCeiling(model)))),
+      // Nothing is on hold in a draft built from what is stored: the stored figure
+      // is already the ceiling the host kept, so there is no wider number to
+      // replay.
+      windowHeld: null,
+      outputHeld: null,
       images: typeof saved.supportsImages === "boolean" ? saved.supportsImages : null,
       levels: Array.isArray(saved.thinkingLevels) ? saved.thinkingLevels.slice() : null,
       defaultLevel: typeof saved.defaultThinkingLevel === "string" ? saved.defaultThinkingLevel : null,
       open: false,
     };
   });
-  // The sheet reopens on whatever it was showing, when that model still exists.
-  if (selectedModelId && out[selectedModelId]) out[selectedModelId].open = true;
+  // The sheet reopens on whatever it was showing, when that model still exists
+  // and still belongs to this gateway.
+  if (selectedSheet !== null && selectedSheet.key === currentModelKey() && out[selectedSheet.id]) {
+    out[selectedSheet.id].open = true;
+  }
   return out;
+}
+
+/**
+ * Bring one draft entry back inside the ceilings its model states now.
+ *
+ * A draft outlives a roster refresh, and a refresh is allowed to lose a Max tier:
+ * a window that was legal when the user typed it is then above the field's own
+ * `max`, which reads as an edit nobody made and lights the save bar.
+ */
+function reclampEntry(entry, model) {
+  var ceiling = windowCeiling(model);
+  // A window the ceiling no longer reaches is set aside rather than dropped, for
+  // the same reason `clampOutput` holds the output: a directory read that loses a
+  // Max tier is ordinary, and the window coming back must not need the user to
+  // retype it. The held figure is only replayed while the ceiling still allows it.
+  var windowBefore = entry.window;
+  entry.window = withinCeiling(entry.window, ceiling);
+  if (entry.window !== windowBefore) {
+    if (typeof entry.windowHeld !== "number") entry.windowHeld = windowBefore;
+  } else if (typeof entry.windowHeld === "number" && entry.windowHeld <= ceiling) {
+    entry.window = entry.windowHeld;
+    entry.windowHeld = null;
+  }
+  // `null` means "follow the catalog", which is the model's DEFAULT window - not
+  // the ceiling. Handing the ceiling over would clamp the output to the Max tier's
+  // smaller budget while the field is still showing the default window.
+  //
+  // Through `clampOutput` rather than a bare `withinCeiling`, so the output is held
+  // the same way: a refresh that lowers the ceiling used to cut the draft's budget
+  // with no user action, which then read as an unsaved edit against the stored
+  // figure and let one unrelated save write the smaller number down.
+  clampOutput(model, entry);
+  // Half-typed text does not survive a ceiling that no longer admits it. Left in
+  // place it became the field's value beside a `max` that now refuses it - the one
+  // state the clamp above exists to prevent.
+  var outputLimit = outputCeilingFor(model, entry.window);
+  if (entry.windowText != null && !(Number(entry.windowText) > 0 && Number(entry.windowText) <= ceiling)) entry.windowText = null;
+  if (entry.outputText != null && !(Number(entry.outputText) > 0 && Number(entry.outputText) <= outputLimit)) entry.outputText = null;
+  return entry;
+}
+
+/** Say why a token figure was refused, naming the ceiling that applied. */
+function overCeilingNotice(limit) {
+  note(t("models.overCeiling", { limit: String(limit) }));
+}
+
+/**
+ * The highest window a model accepts.
+ *
+ * Trae sells Max as a second, larger tier, so a model's default window is not its
+ * ceiling. The Max figure is published beside the default; a model without one has
+ * only the default, which is then its ceiling.
+ */
+function windowCeiling(model) {
+  var max = model.maxContextWindow;
+  var dev = model.nativeContextWindow;
+  return typeof max === "number" && max > 0 && (typeof dev !== "number" || max > dev) ? max : dev;
+}
+
+/** The highest output budget the model grants at the window the draft is using. */
+function outputCeilingFor(model, window) {
+  // A model that states a smaller budget through the function serving its Max
+  // tier only grants it there, so a draft reaching above the default window has
+  // to measure against that one instead of the default tier's figure.
+  var at = model.maxOutputAtCeiling;
+  var dev = model.nativeContextWindow;
+  var ceiling = windowCeiling(model);
+  var wanted = typeof window === "number" ? window : dev;
+  if (typeof at === "number" && at > 0 && typeof dev === "number" && typeof ceiling === "number" && wanted > dev) {
+    return Math.min(at, model.nativeMaxOutputTokens);
+  }
+  return model.nativeMaxOutputTokens;
+}
+
+function outputCeiling(model, entry) {
+  return outputCeilingFor(model, effectiveWindow(model, entry));
+}
+
+/**
+ * Keep the draft's output inside the ceiling its window allows.
+ *
+ * A window change can lower that ceiling (the Max-tier function states a smaller
+ * budget), and a field left holding a bigger number would show a value its own
+ * `max` refuses - the declaration would then be clamped silently instead of the
+ * editor saying so.
+ *
+ * The figure the clamp replaced is held rather than dropped. Reaching for the Max
+ * tier and coming back is one gesture each way, and without the hold the return
+ * leg kept the narrower figure: saving then wrote it down, permanently cutting the
+ * model's default budget in half over a trip the user had undone. `outputHeld` is
+ * cleared the moment the user states an output of their own, which is what makes
+ * the restore safe - it only ever replays a number the user chose at a window that
+ * still grants it.
+ */
+function clampOutput(model, entry) {
+  var ceiling = outputCeilingFor(model, entry.window === null ? model.nativeContextWindow : entry.window);
+  if (typeof entry.output === "number") {
+    if (entry.output > ceiling) {
+      if (typeof entry.outputHeld !== "number") entry.outputHeld = entry.output;
+      entry.output = ceiling;
+    } else if (typeof entry.outputHeld === "number" && entry.outputHeld <= ceiling) {
+      entry.output = entry.outputHeld;
+      entry.outputHeld = null;
+    }
+  }
+  return ceiling;
 }
 
 /** The window a model currently advertises, override first. */
@@ -2432,7 +3385,11 @@ function effectiveWindow(model, entry) {
   return entry.window === null ? model.nativeContextWindow : entry.window;
 }
 function effectiveOutput(model, entry) {
-  return entry.output === null ? model.nativeMaxOutputTokens : entry.output;
+  // Never above the ceiling the chosen window allows: a model whose Max-tier
+  // function states a smaller budget must not show the default tier's figure in
+  // a field whose own `max` is already that smaller one.
+  var value = entry.output === null ? model.nativeMaxOutputTokens : entry.output;
+  return Math.min(value, outputCeilingFor(model, effectiveWindow(model, entry)));
 }
 function effectiveImages(model, entry) {
   return entry.images === null ? model.nativeSupportsImages === true : entry.images;
@@ -2454,8 +3411,11 @@ function isDirty(list, selection) {
     if (entry.enabled !== (enabled === undefined || enabled.indexOf(model.id) >= 0)) return true;
     var saved = overrides[model.id] || {};
     if (entry.alias !== (typeof saved.alias === "string" ? saved.alias : "")) return true;
-    if (entry.window !== (typeof saved.contextWindow === "number" ? saved.contextWindow : null)) return true;
-    if (entry.output !== (typeof saved.maxOutputTokens === "number" ? saved.maxOutputTokens : null)) return true;
+    // Compared through the same clamp the draft was built with: a stored figure
+    // above the catalog's is not something the editor can show, so it must not
+    // read as an edit waiting to be saved either.
+    if (entry.window !== withinCeiling(saved.contextWindow, windowCeiling(model))) return true;
+    if (entry.output !== withinCeiling(saved.maxOutputTokens, outputCeilingFor(model, entry.window === null ? model.nativeContextWindow : entry.window))) return true;
     if (entry.images !== (typeof saved.supportsImages === "boolean" ? saved.supportsImages : null)) return true;
     if ((entry.levels === null ? null : entry.levels.join(","))
       !== (Array.isArray(saved.thinkingLevels) ? saved.thinkingLevels.join(",") : null)) return true;
@@ -2464,10 +3424,30 @@ function isDirty(list, selection) {
   return false;
 }
 
-/** A preset chip row: the chip matching the current value is highlighted. */
-function presetRow(presets, value, onPick) {
+/**
+ * A preset chip row: the chip matching the current value is highlighted.
+ *
+ * `ceiling` drops the presets the model cannot take, so a chip can never offer a
+ * figure the input beside it would reject. `defaultWindow` is the model's own
+ * default tier, added alongside the ceiling: the fixed ladder has no rung at 200k
+ * or 116k, so without these a model whose window sits between two rungs showed a
+ * single chip well under what it accepts, which read as the pool holding the
+ * model back. Both of a Max-capable model's windows end up offered.
+ */
+function presetRow(presets, value, onPick, ceiling, defaultWindow) {
   var wrap = el("div", "preset-row");
-  presets.forEach(function (preset) {
+  var limit = typeof ceiling === "number" && ceiling > 0 ? ceiling : Infinity;
+  var chips = presets.filter(function (preset) { return preset.tokens <= limit; });
+  var has = function (tokens) { return chips.some(function (chip) { return chip.tokens === tokens; }); };
+  // Lowercase the K to sit with the ladder's own labels; the M stays as is.
+  var label = function (tokens) { return formatTokens(tokens).replace(/K$/, "k"); };
+  // The model's own windows come first: its default tier, then its Max tier.
+  [defaultWindow, limit].forEach(function (tokens) {
+    if (!Number.isFinite(tokens) || tokens <= 0 || has(tokens)) return;
+    chips.push({ label: label(tokens), tokens: tokens });
+  });
+  chips.sort(function (a, b) { return a.tokens - b.tokens; });
+  chips.forEach(function (preset) {
     var chip = el("button", preset.tokens === value ? "preset active" : "preset", preset.label);
     chip.type = "button";
     chip.setAttribute("aria-pressed", preset.tokens === value ? "true" : "false");
@@ -2535,27 +3515,65 @@ function modelSheetBody(model, entry) {
   body.appendChild(field("models.alias", "models.aliasHelp", aliasInput));
 
   // Context window and max output, side by side on a wide enough panel.
-  var windowInput = numberInput(effectiveWindow(model, entry), function (next) {
+  // The ceiling is the model's own figure: the host sizes its context budget
+  // from whatever is declared, so a larger window claimed room the upstream does
+  // not have and the reply was compacted early.
+  var windowInput = numberInput(entry.windowText == null ? effectiveWindow(model, entry) : entry.windowText, function (next) {
     // A value equal to the catalog's is stored as "no override", so the row
     // keeps following the catalog instead of pinning today's number.
     entry.window = next === model.nativeContextWindow ? null : next;
+    entry.windowText = null;
+    // The hold is what a clamp set aside; a number the user typed is the choice to
+    // keep, so replaying the hold on the next catalog refresh would replace it.
+    entry.windowHeld = null;
+    // Reaching for a wider window can lower the output ceiling, so a half-typed
+    // output is dropped rather than left showing a figure the new window refuses.
+    entry.outputText = null;
+    clampOutput(model, entry);
     renderChosen();
-  });
+  }, windowCeiling(model), overCeilingNotice, function (text) { entry.windowText = text; }, effectiveWindow(model, entry));
   var windowCol = field("models.window", "models.windowFollows", windowInput);
-  windowCol.insertBefore(presetRow(CONTEXT_WINDOW_PRESETS, effectiveWindow(model, entry), function (tokens) {
-    entry.window = tokens === model.nativeContextWindow ? null : tokens;
-    renderChosen();
-  }), windowInput);
+  windowCol.insertBefore(presetRow(
+    CONTEXT_WINDOW_PRESETS,
+    effectiveWindow(model, entry),
+    function (tokens) {
+      entry.window = tokens === model.nativeContextWindow ? null : tokens;
+      entry.windowText = null;
+      entry.outputText = null;
+      // A number the user picked is the one to keep: replaying a hold from an
+      // earlier clamp would replace it on the next catalog refresh.
+      entry.windowHeld = null;
+      clampOutput(model, entry);
+      renderChosen();
+    },
+    windowCeiling(model),
+    model.nativeContextWindow,
+  ), windowInput);
 
-  var outputInput = numberInput(effectiveOutput(model, entry), function (next) {
-    entry.output = next === model.nativeMaxOutputTokens ? null : next;
+  // The output field's ceiling follows the window this draft asks for: a model
+  // whose Max function states a smaller budget only grants it above the default.
+  var outputCap = outputCeiling(model, entry);
+  var outputInput = numberInput(entry.outputText == null ? effectiveOutput(model, entry) : entry.outputText, function (next) {
+    // Matching the ceiling at this window is stored as "no override", the same
+    // rule the window field follows, so the row keeps tracking the catalog. A
+    // number of the user's own also ends any hold from an earlier clamp: this is
+    // the choice to replay, not the one the clamp set aside.
+    entry.outputHeld = null;
+    entry.output = next === outputCap ? null : next;
     renderChosen();
-  });
+  }, outputCap, overCeilingNotice, function (text) { entry.outputText = text; }, effectiveOutput(model, entry));
   var outputCol = field("models.maxOutput", "models.outputHelp", outputInput);
-  outputCol.insertBefore(presetRow(MAX_OUTPUT_PRESETS, effectiveOutput(model, entry), function (tokens) {
-    entry.output = tokens === model.nativeMaxOutputTokens ? null : tokens;
-    renderChosen();
-  }), outputInput);
+  outputCol.insertBefore(presetRow(
+    MAX_OUTPUT_PRESETS,
+    effectiveOutput(model, entry),
+    function (tokens) {
+      entry.outputHeld = null;
+      entry.outputText = null;
+      entry.output = tokens === outputCap ? null : tokens;
+      renderChosen();
+    },
+    outputCap,
+  ), outputInput);
 
   var pair = el("div", "field-pair");
   pair.appendChild(windowCol);
@@ -2646,18 +3664,64 @@ function modelSheetBody(model, entry) {
  * bound in the browser means the field itself refuses the value.
  */
 var MAX_TOKEN_BUDGET = 0xffffffff;
-function numberInput(value, onChange) {
+/**
+ * A token-budget field, capped at `ceiling` when the caller has one.
+ *
+ * `MAX_TOKEN_BUDGET` is the host's own limit on any token figure: a number past
+ * it makes the whole selection payload invalid there, so the save would drop
+ * every edit in this pass rather than clamp one field. `ceiling` is narrower:
+ * it is what the model really accepts, and the host sizes its context budget and
+ * compaction threshold from whatever is declared, so a larger figure made it
+ * believe there was room the upstream does not have.
+ *
+ * A refused value goes back to `committed` - the number the draft actually holds -
+ * rather than to `value`, which may be a half-typed string. Restoring the string
+ * left the field showing neither the stored figure nor what the user meant: type
+ * `500000` past a `200000` ceiling and the box was refilled with the `50000` that
+ * happened to be there when the last repaint rebuilt it, so pressing enter again
+ * saved a number nobody had ever typed. `onRefused` says why, and the field itself
+ * stays free of the banner: the same control is driven without one in the tests,
+ * and a silent snap-back read as the field ignoring the edit.
+ */
+function numberInput(value, onChange, ceiling, onRefused, onText, committed) {
+  var limit = typeof ceiling === "number" && ceiling > 0
+    ? Math.min(Math.round(ceiling), MAX_TOKEN_BUDGET)
+    : MAX_TOKEN_BUDGET;
+  var stored = typeof committed === "number" ? committed : value;
   var input = document.createElement("input");
   input.type = "number";
   input.className = "num-input";
-  input.max = String(MAX_TOKEN_BUDGET);
+  input.max = String(limit);
   input.min = "1";
   input.step = "1000";
   input.value = String(value);
+  // The whole sheet is rebuilt on every repaint, and a repaint really does land
+  // between two keystrokes: the panel polls every 1.2 s while a refresh runs and
+  // every 2 s for the check-in log. Only the committed value used to survive, so
+  // a half-typed number was replaced mid-entry and the edit was silently lost.
+  // Holding the raw text lets the rebuilt field show what the user is typing.
+  input.addEventListener("input", function () {
+    if (typeof onText === "function") onText(input.value);
+  });
   input.addEventListener("change", function () {
+    if (typeof onText === "function") onText(null);
+    // Cleared means "follow the catalog": both call sites read an absent value as
+    // the row tracking the directory again, and the sheet's own comment promises
+    // exactly that. Reading the empty string as a number turned it into 0, which
+    // the guard below then refused, so the field snapped back and the only way
+    // back to the catalog was to type the directory's number by hand.
+    if (input.value.trim() === "") {
+      onChange(null);
+      return;
+    }
     var next = Number(input.value);
-    if (!Number.isFinite(next) || next <= 0 || next > MAX_TOKEN_BUDGET) {
-      input.value = String(value);
+    if (!Number.isFinite(next) || next <= 0) {
+      input.value = String(stored);
+      return;
+    }
+    if (next > limit) {
+      input.value = String(stored);
+      if (typeof onRefused === "function") onRefused(limit);
       return;
     }
     onChange(Math.round(next));
@@ -2808,7 +3872,9 @@ function render() {
   var keep = placeOf(document.body);
   renderHeader();
   renderAutoCheckin();
+  renderGrowth();
   renderComposerPoints();
+  renderRewriteClientName();
   renderHostHint();
   renderRegionTabs();
   renderModelRegionTabs();
@@ -2851,6 +3917,32 @@ function adopt(next) {
   if (next && typeof next === "object") {
     state = next;
     stateRevision += 1;
+    // The host keeps the growth centre's last read, so a panel reload paints the
+    // figures instead of claiming nothing was read. A result the panel already
+    // holds is newer than the one the document carries, so it is not replaced.
+    //
+    // The host is also the one that decides a read no longer describes the pool:
+    // parking a region, switching the source off, or dropping an account all
+    // invalidate it there. Without the `else` that drop never reached the panel,
+    // which kept painting rows for accounts the user had just switched off.
+    //
+    // `read: null` is that drop. The key is always published, so its absence means
+    // this document says nothing about the growth centre and the rows on screen
+    // stay - a pass in flight publishes no read on purpose, and clearing on
+    // absence took away the figures the user was watching.
+    if (next.growth && Object.prototype.hasOwnProperty.call(next.growth, "read")) {
+      if (next.growth.read) {
+        if (growthState === null) growthState = next.growth.read;
+      } else {
+        // Taken even while a read is in flight. The read that is running was
+        // computed against the pool as it was, so its answer describes rows the
+        // host has just dropped - and the answer carries a fresh timestamp, which
+        // would then read as current for the whole throttle window and never be
+        // refreshed. `growthDropped` is what tells that read to discard itself.
+        growthState = null;
+        growthDropped += 1;
+      }
+    }
   }
 }
 
@@ -2920,6 +4012,9 @@ function adoptAndMaybePoll(next, attempts) {
   stopPolling();
   refreshPoll = window.setTimeout(function () {
     refreshPoll = null;
+    // Hidden pages keep no watch: the pass behind this poll belongs to the
+    // plugin, and a page nobody is looking at does not need the document.
+    if (!pageIsVisible()) { stopPolling(); return; }
     var revision = stateRevision;
     invoke("xd.state").then(function (again) {
       if (revision !== stateRevision) {
@@ -2927,7 +4022,16 @@ function adoptAndMaybePoll(next, attempts) {
         return;
       }
       adoptAndMaybePoll(again, attempts + 1);
-    }).catch(function () { stopPolling(); });
+    }).catch(function () {
+      // The document's own flag is what these two loops watch, and a failing
+      // channel leaves it set: stopping the timer here alone left the header
+      // saying "detecting…" for good, with nothing left to clear it. The same
+      // repair the check-in watch does, one line up.
+      stopPolling();
+      if (!state) return;
+      adopt(Object.assign({}, state, { refreshing: false }));
+      render();
+    });
   }, REFRESH_POLL_MS);
 }
 
@@ -2935,8 +4039,19 @@ var checkinPoll = null;
 var CHECKIN_POLL_MS = 2000;
 var CHECKIN_POLL_LIMIT = 90;
 var CHECKIN_POLL_SLOW_MS = 10000;
+/**
+ * How many intermittent polls in a row may fail before the watch gives up.
+ *
+ * The watch exists to keep a long pass's row from reading "running" all day,
+ * but it re-armed itself on every failure without ever clearing the flag it was
+ * watching, so a plugin that had stopped answering left a 10 s poll running for
+ * the life of the page. Three failures in a row is a dead channel, not a slow
+ * pass.
+ */
+var CHECKIN_POLL_MAX_FAILURES = 3;
 var checkinPollAttempts = 0;
 var checkinPollAt = null;
+var checkinPollFailures = 0;
 
 function stopCheckinPoll() {
   if (checkinPoll !== null) {
@@ -2945,13 +4060,25 @@ function stopCheckinPoll() {
   }
 }
 
+/**
+ * Whether this page is worth polling for.
+ *
+ * The panel is a page in the host's window, not a background service: when it is
+ * hidden nobody is watching what a poll would bring back, so both loops stop and
+ * the next render re-arms whatever is still running.
+ */
+function pageIsVisible() {
+  return document.hidden !== true;
+}
+
 /** Keep reading the log while a check-in pass is still marked pending. */
 function pollCheckinLog(attempts) {
   var last = state && state.autoCheckin && state.autoCheckin.last;
-  if (!last || last.pending !== true) { stopCheckinPoll(); return; }
-  // Progress is counted per pass: a new `at` starts a fresh fast window.
+  if (!last || last.pending !== true || !pageIsVisible()) { stopCheckinPoll(); return; }
+  // Progress is counted per pass: a new `at` starts a fresh fast window, and a
+  // failure count from the previous pass would otherwise cut the new one short.
   var stamp = typeof last.at === "string" ? last.at : "";
-  if (stamp !== checkinPollAt) { checkinPollAt = stamp; attempts = 0; }
+  if (stamp !== checkinPollAt) { checkinPollAt = stamp; attempts = 0; checkinPollFailures = 0; }
   checkinPollAttempts = attempts;
   // A pass running beside another action is not a reason to stop watching it,
   // but the poll must not run while that action re-renders. `runBusy` calls
@@ -2969,9 +4096,29 @@ function pollCheckinLog(attempts) {
       // Another action adopted the state; its own render re-arms the watch.
       if (busy !== null && busy !== "checkin") { stopCheckinPoll(); return; }
       adopt(again);
+      // Set before `render()`: its tail re-arms this loop with whatever
+      // `checkinPollAttempts` holds, and `checkinPoll !== null` from there made
+      // the recursive call below return without doing anything - so the count
+      // never advanced and the slow window was never reached.
+      checkinPollAttempts = attempts + 1;
+      checkinPollFailures = 0;
       render();
-      pollCheckinLog(attempts + 1);
-    }).catch(function () { pollCheckinLog(attempts + 1); });
+    }).catch(function () {
+      // A failing channel leaves the flag set, so re-arming here without a bound
+      // polled forever. The watch gives up and clears what it was watching, the
+      // same way `adoptAndMaybePoll` does.
+      checkinPollFailures += 1;
+      if (checkinPollFailures < CHECKIN_POLL_MAX_FAILURES) { pollCheckinLog(attempts + 1); return; }
+      stopCheckinPoll();
+      if (state && state.autoCheckin && state.autoCheckin.last) {
+        adopt(Object.assign({}, state, {
+          autoCheckin: Object.assign({}, state.autoCheckin, {
+            last: Object.assign({}, state.autoCheckin.last, { pending: false }),
+          }),
+        }));
+        render();
+      }
+    });
   }, delay);
 }
 
@@ -3046,6 +4193,12 @@ function setComposerPoints(enabled) {
   }).catch(function () {});
 }
 
+function setRewriteClientName(enabled) {
+  return runBusy("rewrite", function () {
+    return invoke("xd.setRewriteClientName", { enabled: enabled === true });
+  }).catch(function () {});
+}
+
 /** Switch one source (workbuddy / trae / qoder) on or off; the answer is the refreshed document. */
 function setSource(source, enabled) {
   return runBusy("source", function () {
@@ -3094,6 +4247,14 @@ function setAutoCheckin(enabled, hours) {
     return result;
   }).catch(function () {});
 }
+
+/** Run one keep-alive pass by hand. */
+function runKeepAliveNow() {
+  return runBusy("keepAlive", function () {
+    return invoke("xd.keepAlive", {});
+  }).catch(function () {});
+}
+
 function claimCheckin(accountId) {
   // The same guard the other three claim paths carry: a claim started on top of
   // a rescan or a refresh is two passes writing the same document.
@@ -3159,7 +4320,11 @@ function toggleAllVisible() {
       if (!hit) return;
     }
     var entry = draft[model.id];
-    if (entry) entry.enabled = wanted;
+    if (!entry) return;
+    entry.enabled = wanted;
+    // Unticking through the header drops the sheet exactly as the row's own tick
+    // does, or the roster keeps marking a model the header just took out.
+    if (!wanted) closeSheetOf(model.id);
   });
   renderModels();
 }
@@ -3207,6 +4372,10 @@ function discardDraft() {
   if (draftSlot !== null) delete drafts[draftSlot];
   draft = null;
   draftSlot = null;
+  // The session this page's sheet belonged to is over, so it does not reopen on
+  // the rebuild below and the roster stops marking the row. Another page's record
+  // is not this button's to throw away either.
+  if (selectedSheet !== null && selectedSheet.key === currentModelKey()) selectedSheet = null;
   renderModels();
   note(null);
 }
@@ -3251,6 +4420,9 @@ function saveModels() {
     if (submittedSlot !== null) delete drafts[submittedSlot];
     draft = null;
     draftSlot = null;
+    // The edit is done: the sheet collapses with the draft it belonged to
+    // instead of reopening on the rebuild and leaving the row marked as edited.
+    if (selectedSheet !== null && selectedSheet.key === currentModelKey()) selectedSheet = null;
     render();
     announce(t("models.saved"));
   }).catch(function (error) {
@@ -3312,7 +4484,8 @@ function copyReport() {
 // -------------------------------------------------------------------- tabs
 
 function selectTab(name) {
-  var views = { pool: "poolView", models: "modelsView", check: "checkView" };
+  activeTab = name;
+  var views = { pool: "poolView", models: "modelsView", check: "checkView", growth: "growthView" };
   Object.keys(views).forEach(function (key) {
     show($(views[key]), key === name);
   });
@@ -3322,12 +4495,24 @@ function selectTab(name) {
     tabs[i].className = isActive ? "subtab active" : "subtab";
     tabs[i].setAttribute("aria-selected", isActive ? "true" : "false");
   }
+  // Each page starts at its own top. Carrying the previous page's offset over
+  // landed the user mid-roster after leaving the pool scrolled to its third
+  // account.
+  pageScrollTo(0);
   // Entering the tab while another action runs would raise the busy banner and
   // silently skip the doctor; the next entry retries.
   if (name === "check" && doctorResult === null && busy === null) runDoctor();
   // The model page shows a roster, so entering it is the moment to make sure
   // that roster is the vendor's and not this plugin's own fallback.
   if (name === "models") requestModelRoster();
+  // Entering the growth page is a refresh, not a prompt to go press a button: the
+  // figures the card shows are read on entry, and the cached ones are shown while
+  // that read is in flight. A read costs one request per account and claims
+  // nothing, so the throttle is what keeps tab-hopping from becoming a burst.
+  // A pass already walking those accounts is waited out: a check-in pass runs the
+  // growth half itself, and a read beside it would double the requests.
+  if (name === "growth" && busy === null && !growthReading && growthStale()
+    && !(state && state.growth && state.growth.running === true)) readGrowth();
 }
 
 function labelTabs() {
@@ -3335,7 +4520,12 @@ function labelTabs() {
   for (var i = 0; i < tabs.length; i += 1) {
     var key = tabs[i].getAttribute("data-tab");
     tabs[i].textContent = t("tab." + key);
+    // The growth centre is WorkBuddy's alone: a tab that leads to a page
+    // reading "not this source" is worse than no tab at all.
+    tabs[i].hidden = key === "growth" && activeSource !== "workbuddy";
   }
+  // The risk note is static markup too, on the line with the source tabs.
+  $("riskNote").textContent = t("risk.note");
   // The footer links are static markup, so their labels follow the locale here
   // rather than through the render pass.
   var labels = document.querySelectorAll(".foot-links [data-foot-label]");
@@ -3347,6 +4537,16 @@ function labelTabs() {
 // -------------------------------------------------------------------- init
 
 function bind() {
+  // A hidden page stops polling; showing it again re-arms whatever the current
+  // document says is still running.
+  document.addEventListener("visibilitychange", function () {
+    if (!pageIsVisible()) { stopPolling(); stopCheckinPoll(); return; }
+    if (state && state.refreshing === true) adoptAndMaybePoll(state, 0);
+    else if (state && state.autoCheckin && state.autoCheckin.last && state.autoCheckin.last.pending === true) {
+      checkinPollFailures = 0;
+      pollCheckinLog(0);
+    }
+  });
   $("refreshBtn").addEventListener("click", refresh);
   $("rescanBtn").addEventListener("click", rescan);
   $("resetBtn").addEventListener("click", clearCooldowns);
@@ -3366,6 +4566,14 @@ function bind() {
       setComposerPoints(state === null || state.showComposerPoints !== true);
     });
   }
+  // Same shape: a static node, so the listener is bound once and the state is
+  // read at click time rather than captured from the render that drew the label.
+  var rewriteToggle = $("rewriteClientName");
+  if (rewriteToggle) {
+    rewriteToggle.addEventListener("click", function () {
+      setRewriteClientName(state === null || typeof state.replacedClientName !== "string");
+    });
+  }
   // Bound once, with the state read at click time: this is a static node, so the
   // handler cannot live in the render pass that redraws it.
   $("autoHours").addEventListener("input", function () {
@@ -3373,7 +4581,15 @@ function bind() {
   });
   $("autoHoursSave").addEventListener("click", function () {
     var auto = (state && state.autoCheckin) || { enabled: false };
-    setAutoCheckin(auto.enabled === true, parseCheckinHours($("autoHours").value));
+    // Saving the box is explicit, so unreadable text is reported even while the
+    // switch is off. Turning the switch off still ignores a bad box: that path
+    // has to stop the timer.
+    var hours = parseCheckinHours($("autoHours").value);
+    if (hours === null) {
+      note(t("auto.badHours"));
+      return;
+    }
+    setAutoCheckin(auto.enabled === true, hours);
   });
   // The manual pass runs the same work the scheduled hour runs, so it is busy for
   // as long as that takes — the button reports it rather than sitting idle.
@@ -3382,6 +4598,15 @@ function bind() {
       .then(function () { pollCheckinLog(0); })
       .catch(function () {});
   });
+  // The keep-alive's one control, bound once for the same reason. There is no
+  // schedule behind it, so the button is the only thing that runs a pass.
+  $("tokenKeepAliveRun").addEventListener("click", function () {
+    runKeepAliveNow();
+  });
+  // Bound once, like the check-in button above: the render pass rebuilds most of
+  // the panel, and a listener added per pass would fire one request per render.
+  $("growthRead").addEventListener("click", function () { readGrowth(); });
+  $("growthRun").addEventListener("click", function () { runGrowth(); });
 
   // One listener for every control in the panel, rather than one per button: the
   // render pass rebuilds most of them, so per-button listeners would have to be

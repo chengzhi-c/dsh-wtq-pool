@@ -272,7 +272,7 @@ test('WorkBuddy closes at a split terminal frame without treating content as a m
     cancel() { released = true },
   })
   const gateway = createWorkBuddyShim({ port: 0,
-    pool: { acquire: async () => ({ label: 'fixture', credential: {} }) }, catalog: {},
+    pool: { acquire: async () => ({ label: 'fixture', credential: {} }) }, catalog: { visible: () => [] },
     client: { prepareChatBody: raw => raw, chatStream: async () => ({ ok: true, response: new Response(upstream) }) },
   })
   const abort = new AbortController()
@@ -331,4 +331,20 @@ test('DSH account selection restarts credit polling after a successful preferenc
   vm.runInContext(transpile(pick + '\npick({id: "fixture"})'), context)
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(restarted, 1, 'a preference save must not leave unread credits on the old five-minute timer')
+})
+
+/**
+ * The delete button shares the remove button's box.
+ *
+ * Both sit in one flex line at the right end of an account row. The delete
+ * button inherited the default `button` padding while the remove button carried
+ * the row's smaller one, so it stood taller and its top edge sat above the
+ * control it belongs beside.
+ */
+test('the account row ships one box for the remove and delete buttons', () => {
+  const css = fs.readFileSync(path.join(root, 'renderer/panel.css'), 'utf8')
+  const shared = css.match(/\.acct-remove,\s*\n\.acct-delete \{([^}]*)\}/)
+  assert.ok(shared, 'the two buttons must be sized by one rule, not by the default button padding')
+  assert.match(shared[1], /padding:\s*4px 10px/, 'and that rule must set the row padding both of them share')
+  assert.match(shared[1], /font-size:\s*12\.5px/, 'with the row font size, so their heights match')
 })

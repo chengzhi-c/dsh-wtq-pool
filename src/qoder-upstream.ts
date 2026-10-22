@@ -8,16 +8,7 @@
  */
 import { createCipheriv, createHash, publicEncrypt, randomUUID, constants as cryptoConstants } from 'node:crypto'
 import type { QoderRegion } from './qoder-discovery'
-
-/** What one signed request needs from the credential. */
-export interface QoderCredential {
-  userID: string
-  token: string
-  name?: string
-  email?: string
-  /** Absent fingerprint is sent as the empty string, never as `undefined`. */
-  machineID?: string
-}
+import type { QoderClientCredential } from './qoder-client'
 
 /** Gateway base per region. */
 export const QODER_GATEWAYS: Readonly<Record<QoderRegion, string>> = {
@@ -142,7 +133,7 @@ function aesEncryptCBCBase64(plaintext: string, keyString: string): string {
 export function buildCosyAuthHeaders(
   body: Buffer,
   url: string,
-  credential: QoderCredential,
+  credential: QoderClientCredential,
   options: CosyHeaderOptions = {},
 ): Record<string, string> {
   const uuid = options.uuid ?? randomUUID

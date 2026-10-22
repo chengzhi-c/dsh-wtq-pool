@@ -444,7 +444,14 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
     // and nothing re-reads it: a scroll or a resize moves the trigger out from
     // under a box that then hangs over whatever is there now. Closing is the
     // least code that keeps the popup anchored to something true.
-    const onViewport = (): void => { setOpen(false) }
+    // Its own scrolling does not count. The panel scrolls once it has more rows
+    // than fit (`max-height`), so every wheel turn inside it closed it: the one
+    // control that exists to be read could not be read past the first screenful.
+    const onViewport = (event: Event): void => {
+      const target = event.target as Node | null
+      if (target !== null && panelRef.current?.contains(target) === true) return
+      setOpen(false)
+    }
     document.addEventListener('pointerdown', onPointer, true)
     document.addEventListener('keydown', onKey)
     // Captured, so a scroll inside any scrolling container counts: the trigger

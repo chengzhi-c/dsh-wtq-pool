@@ -47,15 +47,6 @@ export interface DeclarationResult {
   providerCount?: number
 }
 
-/** One host command the core registers. */
-export interface CommandSpec {
-  id: string
-  title: string
-  category?: string
-  keywords?: string[]
-  run: () => unknown
-}
-
 /**
  * The host capabilities the core needs.
  *
@@ -73,14 +64,6 @@ export interface PiBridge {
   onSettingsChanged?: (handler: (next: Record<string, unknown>) => void) => void
   /** Detach the handler {@link onSettingsChanged} installed. */
   offSettingsChanged?: (handler: (next: Record<string, unknown>) => void) => void
-  /** Register a host command. */
-  registerCommand?: (spec: CommandSpec) => Promise<void> | void
-  /** Remove a host command by id. */
-  unregisterCommand?: (id: string) => Promise<void> | void
-  /** Report something to the user. */
-  notify?: (text: string, kind: 'info' | 'warn') => Promise<void> | void
-  /** Bring this plugin's own panel to the front. */
-  openPanel?: () => Promise<void> | void
   /** Publish the provider rows; the core calls this on every declaration pass. */
   declareProviders?: (descriptors: ProviderDescriptor[]) => DeclarationResult
 }
@@ -134,26 +117,6 @@ export const pi = {
         return
       }
       absent()
-    },
-  },
-  commands: {
-    register: async (spec: CommandSpec): Promise<void> => {
-      if (bridge.registerCommand === undefined) absent()
-      await bridge.registerCommand(spec)
-    },
-    unregister: async (id: string): Promise<void> => {
-      if (bridge.unregisterCommand === undefined) absent()
-      await bridge.unregisterCommand(id)
-    },
-  },
-  ui: {
-    showToast: async (text: string, kind?: string): Promise<void> => {
-      if (bridge.notify === undefined) absent()
-      await bridge.notify(text, kind === 'warn' ? 'warn' : 'info')
-    },
-    openPanel: async (): Promise<void> => {
-      if (bridge.openPanel === undefined) absent()
-      await bridge.openPanel()
     },
   },
   services: {

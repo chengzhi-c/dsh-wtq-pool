@@ -63,11 +63,19 @@ const CHANNELS = new Set([
   'xd.distribution',
   'xd.setAutoCheckin',
   'xd.setComposerPoints',
+  'xd.setRewriteClientName',
   'xd.setCreditReserve',
   'xd.setRegionEnabled',
   'xd.setSource',
   'xd.sourceCheckin',
   'xd.sourceDistribution',
+  'xd.startLogin',
+  'xd.pollLogin',
+  // The growth centre's card: one read, one run.
+  'xd.growthState',
+  'xd.growthRun',
+  // The token keep-alive's switch and by-hand run.
+  'xd.keepAlive',
 ])
 
 /** Largest panel request body accepted, so a hung or oversized body cannot pin memory. */
@@ -338,8 +346,6 @@ window.pluginBridge = {
 };
 </script>`
   return fs.readFileSync(file, 'utf8')
-    // The chrome metas describe a host window this page is not embedded in.
-    .replace(/\s*<meta name="pi-plugin-chrome"[^>]*>/i, '')
     // Any attribute order, any quoting, any spacing around the `=`: the page's
     // own policy is a file this plugin does not control the formatting of, and
     // a copy that survived the strip would intersect with the header and block

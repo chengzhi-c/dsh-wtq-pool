@@ -13,6 +13,7 @@
  */
 const assert = require('node:assert/strict')
 const { test } = require('node:test')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -194,7 +195,7 @@ function fakeInput() {
  * whose `return` was dropped, then fails the case where a source match would
  * still pass.
  */
-function panelFunctions(names, source) {
+function panelFunctions(names, source, extra) {
   const parts = []
   for (const name of names) {
     const from = source.indexOf(`function ${name}(`)
@@ -211,6 +212,7 @@ function panelFunctions(names, source) {
   const context = vm.createContext({
     document: { createElement: () => fakeInput() },
     String, Number, Math, console,
+    ...extra,
   })
   if (ceiling) parts.unshift(ceiling[0])
   vm.runInContext(parts.join('\n'), context)
@@ -347,7 +349,8 @@ test('the frame is sized to the panel, stops at its cap, and skips a bodyless do
 
   assert.match(body, /Math\.min\(FRAME_MAX_HEIGHT,\s*doc\.body\.scrollHeight/,
     'the height has to come from the panel document and pass through the cap, and from body rather than documentElement')
-
+  assert.match(body, /setMeasured\(\(current\) => \(current === height \? current : height\)\)/,
+    'the measured height has to reach the frame, or the panel is sized to nothing')
   const guard = body.split('\n').find(line => line.includes('doc.body === null'))
   assert.ok(guard, 'the probe reads doc.body, so a bodyless document has to bail out before the read')
   // The bail-out is the guard. A line that only names the condition (a no-op
@@ -506,6 +509,33 @@ test('a token budget past the host ceiling is refused by the field itself', () =
 })
 
 /**
+ * A refused number goes back to what is committed, not to what the field showed.
+ *
+ * The sheet is rebuilt on every repaint, and the field a keypress lands in can be
+ * a half-typed number: the row holds the draft's figure, the field holds whatever
+ * the user has typed so far. After one accepted edit those two differ, so a
+ * refusal that restored the field's own opening text put back a number nobody had
+ * finished typing - and one more Enter then saved it.
+ */
+test('a refused figure goes back to the committed one, not the half-typed text', () => {
+  const panel = sourceOf('renderer/panel.js')
+  const context = panelFunctions(['numberInput'], panel)
+  const input = context.numberInput(
+    '50000',                          // what the rebuilt field opened on
+    (value) => { input.accepted = value },
+    2000000,
+    () => {},
+    () => {},
+    1000,                             // what is actually stored
+  )
+  input.value = '5000000'
+  input.dispatch('change')
+  assert.equal(input.accepted, undefined, 'the impossible figure must not be saved')
+  assert.equal(input.value, '1000',
+    'and the field shows the committed figure, not the half-typed one a repaint left behind')
+})
+
+/**
  * Switching the automatic check-in off must not depend on the hours box.
  *
  * The box can hold stale text from an earlier edit. Requiring it to parse before
@@ -526,3 +556,345 @@ test('switching the automatic check-in off survives an unreadable hours box', ()
     'the refusal must be inside the ON branch, before the save it would otherwise skip')
 })
 
+/** The promo module reports 24 for "free until midnight". Clamping to 23 ends the window an hour early. */
+test('a promo edge of 24 stays 24:00', () => {
+  const context = panelFunctions(['clockHour'], sourceOf('renderer/panel.js'))
+  assert.equal(context.clockHour(24), '24:00')
+  assert.equal(context.clockHour(9), '09:00')
+  assert.equal(context.clockHour(23), '23:00')
+})
+
+/**
+ * Saving the hours box is an explicit write. An unreadable value has to be
+ * reported even while the schedule is off; only the switch itself may ignore it.
+ */
+test('saving check-in hours reports an unreadable box even while the schedule is off', () => {
+  const source = sourceOf('renderer/panel.js')
+  const at = source.indexOf('$("autoHoursSave").addEventListener')
+  assert.notEqual(at, -1, 'the save button must have one listener')
+  const save = source.slice(at, at + 700)
+  assert.match(save, /hours === null/)
+  assert.match(save, /auto\.badHours/)
+})
+
+/**
+ * An expired account is listed in the preference picker but cannot be chosen.
+ *
+ * The host refuses an expired account as the preferred one, so offering it turned
+ * a click into an error with nothing on screen to explain it. It stays listed
+ * rather than dropped: the user needs to see the account is there and why it
+ * cannot serve.
+ *
+ * The picker is built and its options read back, not scanned: a `disabled` write
+ * the option never receives leaves the source text unchanged and the control live.
+ */
+test('an expired account is listed but not selectable as the preferred one', () => {
+  const record = (tagName, className, text) => ({
+    tagName, className, textContent: text === undefined ? '' : String(text), children: [],
+    appendChild(node) { this.children.push(node) },
+    setAttribute() {}, addEventListener() {},
+  })
+  // The reason comes from the panel's own English table rather than a copy here:
+  // a case that spells the sentence itself still passes after the entry is gone.
+  const source = sourceOf('renderer/panel.js')
+  const english = source.slice(source.indexOf('var EN = {'), source.indexOf('\n}', source.indexOf('var EN = {')))
+  const reason = /"acct\.expired": "([^"]+)"/.exec(english)?.[1]
+  assert.ok(reason, 'the English table has to name why the row cannot be chosen')
+  const context = panelFunctions(['sourcePreferredPicker'], source, {
+    el: record,
+    t: key => key === 'acct.expired' ? reason : key,
+    state: {},
+    busy: null,
+    distributionControl: () => null,
+    setPreferredSourceAccount: () => {},
+  })
+  const card = context.sourcePreferredPicker('workbuddy', 'cn', [
+    { label: 'Live', expired: false },
+    { label: 'Expired', expired: true },
+  ])
+  const picker = card.children.find(child => child.tagName === 'select')
+  assert.ok(picker, 'the picker has to be in the card it builds')
+  const options = picker.children.filter(child => child.tagName === 'option')
+  const live = options.find(option => option.textContent === 'Live')
+  const expired = options.find(option => option.textContent.startsWith('Expired'))
+  assert.ok(live && expired, 'both accounts have to be listed')
+  assert.notEqual(live.disabled, true, 'a live account stays selectable')
+  assert.equal(expired.disabled, true, 'an expired account must not be selectable')
+  assert.equal(expired.textContent, 'Expired · ' + reason, 'and the row has to say why, in the reader\'s language')
+})
+
+test('the panel\'s check-in goes through the one pass, not a second copy of it', async () => {
+  // The per-source "check in all" button used to run its own fan-out: no pause
+  // between the check-in burst and the growth burst, and no record in
+  // `autoCheckin.last`, so the panel's "last run" stayed on the previous pass
+  // while the upstream saw two request clusters back to back.
+  const host = loadHost()
+  await host.plugin.onLoad()
+  try {
+    const before = await host.plugin.onPanelInvoke('xd.state', {})
+    assert.equal(before.autoCheckin.last, undefined, 'no pass has run yet')
+    const answer = await host.plugin.onPanelInvoke('xd.checkinAll', { source: 'workbuddy' })
+    assert.equal(typeof answer.claimed, 'number', 'the answer still carries the counts the panel reads')
+    assert.equal(answer.state.autoCheckin.last.manual, true,
+      'a check-in started from the panel has to record itself, or "last run" names an older pass')
+    assert.equal(typeof answer.state.autoCheckin.last.at, 'string', 'and it has to carry the time it ran')
+    const after = await host.plugin.onPanelInvoke('xd.state', {})
+    assert.equal(after.autoCheckin.last.manual, true, 'the record has to survive the next document read too')
+  } finally {
+    await host.plugin.onUnload()
+    host.cleanup()
+  }
+})
+
+/** DSH publishes the live port, so the notice has to name the preferred port that was taken. */
+test('a port fallback notice names the preferred port', () => {
+  const panel = sourceOf('renderer/panel.js')
+  assert.match(panel, /gateway\.preferredPort/)
+  const host = sourceOf('src/host.ts')
+  assert.equal((host.match(/preferredPort: preferred/g) || []).length, 2)
+})
+
+
+/**
+ * The panel page boots on its own, and its whole script has to stay at the top
+ * level for that to mean anything.
+ *
+ * An unclosed function body swallows every declaration after it: the file still
+ * parses, so a syntax check passes, and the page dies on the first call to a
+ * name that is now nested inside some other function. That is what happened to
+ * `selectTab` and `labelTabs` once, and nothing caught it because every other
+ * case here lifts individual functions out of the text.
+ */
+test('the panel page boots whole, with its controls at the top level', () => {
+  const element = () => ({
+    childElementCount: 0, children: [], appendChild() {}, addEventListener() {}, removeEventListener() {},
+    setAttribute() {}, getAttribute() { return null }, remove() {},
+    querySelector() { return null }, querySelectorAll() { return [] },
+    style: {}, classList: { add() {}, remove() {}, toggle() {} }, dataset: {},
+    textContent: '', value: '', hidden: false, disabled: false, checked: false,
+    scrollTop: 0, clientHeight: 0, scrollHeight: 0,
+    tagName: 'DIV', className: '', type: '', title: '', href: '',
+  })
+  const context = vm.createContext({
+    console: { log() {}, warn() {}, error() {} },
+    document: {
+      getElementById: () => element(), querySelector: () => null, querySelectorAll: () => [],
+      addEventListener() {}, createElement: () => element(),
+      createRange: () => ({ selectNodeContents() {} }),
+      body: element(), documentElement: { dataset: {} },
+    },
+    window: {
+      addEventListener() {},
+      getSelection: () => ({ removeAllRanges() {}, addRange() {}, toString: () => '' }),
+    },
+    navigator: {}, localStorage: { getItem: () => null, setItem() {} },
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    fetch: async () => ({ ok: false, json: async () => ({}) }),
+  })
+  assert.doesNotThrow(() => vm.runInContext(sourceOf('renderer/panel.js'), context),
+    'the page threw while booting, so the panel never paints')
+  for (const name of ['boot', 'selectTab', 'labelTabs', 'renderAutoCheckin', 'autoNoteRows',
+    'runKeepAliveNow']) {
+    assert.equal(vm.runInContext(`typeof ${name}`, context), 'function',
+      `${name} is not at the top level, so an unclosed body above it swallowed the declaration`)
+  }
+})
+/**
+ * Every string the panel asks for is in both languages, and every string it
+ * defines is asked for.
+ *
+ * A missing entry is not a visible error: `t()` falls back to the key, so the
+ * user reads `pool.noAccounts` in the middle of a Chinese sentence. The reverse
+ * is just as invisible: an entry nothing asks for is dead weight that no case can
+ * fail on, so it survives every release.
+ *
+ * A key counts as asked for when it appears in the panel outside the two tables,
+ * or when something outside the panel drives it: the four view tabs and the four
+ * footer links come from `data-` attributes in the page, and the two pack names
+ * come from the host. Those three sources are read here rather than exempted by
+ * hand, so the link itself is what the check verifies.
+ */
+test('every string the panel asks for exists in both languages', () => {
+  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
+  const tables = ['EN', 'ZH'].map((dictionary) => {
+    const from = source.indexOf(`var ${dictionary} = {`)
+    assert.notEqual(from, -1, `the ${dictionary} table has to be in the panel`)
+    return { dictionary, body: source.slice(from, source.indexOf('\n}', from)) }
+  })
+  const definedIn = (body) => [...body.matchAll(/^\s*"([a-zA-Z]+\.[a-zA-Z0-9]+)":/gm)].map((match) => match[1])
+  const defined = [...new Set(tables.flatMap((table) => definedIn(table.body)))]
+  assert.ok(defined.length >= 150, `the panel has its tables (found ${defined.length} keys)`)
+
+  // The keys the page drives, and the two the host names.
+  const fromPage = [
+    ...[...page.matchAll(/data-tab="([\w-]+)"/g)].map((match) => 'tab.' + match[1]),
+    ...[...page.matchAll(/data-foot-label="([\w-]+)"/g)].map((match) => 'foot.' + match[1]),
+  ]
+  const fromHost = ['credits.planQuota', 'credits.addOnQuota']
+
+  const outside = source.replace(tables[0].body, '').replace(tables[1].body, '')
+  const asked = new Set([
+    ...defined.filter((key) => outside.includes('"' + key + '"')),
+    ...fromPage,
+    ...fromHost,
+  ])
+  assert.ok(asked.size >= 150, `the panel asks for its strings (found ${asked.size})`)
+
+  for (const { dictionary, body } of tables) {
+    const missing = [...asked].filter((key) => !body.includes('"' + key + '"'))
+    assert.deepEqual(missing, [], `${dictionary} is missing ${missing.join(', ')}`)
+    const orphaned = definedIn(body).filter((key) => !asked.has(key))
+    assert.deepEqual(orphaned, [], `${dictionary} defines ${orphaned.join(', ')}, which nothing asks for`)
+  }
+})
+
+/**
+ * The four view tabs and the four panels they switch between are wired to each
+ * other, in both directions.
+ *
+ * A tab that names nothing, or a panel nothing names, is not visible as a break:
+ * the panel still switches on click, because the switching is done in JavaScript
+ * by `data-tab`. What breaks is the accessibility tree, where the four views read
+ * as four unrelated regions and a screen reader cannot say which tab is showing.
+ */
+test('every view tab names the panel it controls, and that panel names it back', () => {
+  const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
+  // The source tabs carry data-source; the four view tabs carry data-tab and
+  // switch between the sections below them.
+  const tabs = [...page.matchAll(/<button[^>]*>/g)]
+    .map((match) => match[0])
+    .filter((tag) => tag.includes('role="tab"') && tag.includes('data-tab='))
+  assert.equal(tabs.length, 4, 'the page has four view tabs')
+  for (const tab of tabs) {
+    const id = /id="([^"]+)"/.exec(tab)?.[1]
+    const controls = /aria-controls="([^"]+)"/.exec(tab)?.[1]
+    assert.ok(id !== undefined, `a view tab needs an id so its panel can name it: ${tab}`)
+    assert.ok(controls !== undefined, `a view tab has to name the panel it switches to: ${tab}`)
+    const panel = new RegExp(`<section[^>]*id="${controls}"[^>]*>`).exec(page)?.[0]
+    assert.ok(panel !== undefined, `aria-controls="${controls}" names no section`)
+    assert.ok(panel.includes('role="tabpanel"'), `${controls} has to be a tabpanel`)
+    assert.ok(panel.includes(`aria-labelledby="${id}"`), `${controls} has to name ${id} back`)
+  }
+})
+
+/**
+ * The ban-risk note sits on the source tabs' line, and follows the locale.
+ *
+ * It warns about using any of the three sources, so it belongs beside the tab row
+ * rather than anywhere the user has to scroll to find it. The markup is static,
+ * so its label is written by `labelTabs` beside the footer links: markup left in
+ * the page without that write ships as an empty paragraph, and a key removed from
+ * a table ships as the raw key name.
+ *
+ * The expected text is read back out of the panel's own tables and the note is
+ * driven through the panel's own `t`, so a copy here cannot drift from the ship.
+ */
+test('the ban-risk note reaches the panel line and both READMEs', () => {
+  const panel = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
+
+  // The markup: one row holds the three source tabs and the note after them.
+  const row = /<div class="tabs-row">([\s\S]*?)\n    <\/div>/.exec(page)?.[1]
+  assert.ok(row !== undefined, 'index.html needs a row that holds the source tabs and the note')
+  const tabsAt = row.indexOf('id="sourceTabs"')
+  const noteAt = row.indexOf('id="riskNote"')
+  assert.ok(tabsAt !== -1, 'the source tabs belong in that row')
+  assert.ok(noteAt !== -1, 'and so does the risk note')
+  assert.ok(noteAt > tabsAt, 'the note reads after the tabs, i.e. to their right')
+
+  const lift = (source, name) => {
+    const from = source.indexOf(`function ${name}(`)
+    assert.notEqual(from, -1, `${name} has to be in the panel`)
+    let depth = 0
+    let index = source.indexOf('{', from)
+    for (; index < source.length; index += 1) {
+      if (source[index] === '{') depth += 1
+      else if (source[index] === '}') { depth -= 1; if (depth === 0) break }
+    }
+    return source.slice(from, index + 1)
+  }
+  const tableOf = (name) => {
+    const head = panel.indexOf(`var ${name} = {`)
+    assert.notEqual(head, -1, `the ${name} table has to be in the panel`)
+    return new Function(panel.slice(head, panel.indexOf('\n}', head) + 3) + ` return ${name}`)()
+  }
+  const EN = tableOf('EN')
+  const ZH = tableOf('ZH')
+  const note = lift(panel, 'labelTabs')
+  assert.ok(note.includes('$("riskNote")'), 'labelTabs has to write the note')
+
+  for (const [name, table] of [['EN', EN], ['ZH', ZH]]) {
+    const expected = table['risk.note']
+    assert.equal(typeof expected, 'string', `${name} has to define risk.note`)
+    assert.ok(expected.trim() !== '', `${name} risk.note must say something`)
+    assert.ok(/封号|ban/i.test(expected), `${name} risk.note has to name the risk it warns about`)
+
+    const node = { textContent: '' }
+    const context = vm.createContext({
+      document: { querySelectorAll: () => [], documentElement: { lang: name === 'ZH' ? 'zh-CN' : 'en' } },
+      $: (id) => { assert.equal(id, 'riskNote'); return node },
+      TABLE: table,
+      EN,
+      activeSource: 'workbuddy',
+    })
+    vm.runInContext(lift(panel, 't'), context)
+    vm.runInContext(note, context)
+    vm.runInContext('labelTabs()', context)
+    assert.equal(node.textContent, expected, `${name} note has to reach the page verbatim`)
+  }
+  // The docs state the same risk, in the same two languages. A README that drops
+  // it while the panel keeps it is a warning users only meet after installing.
+  for (const [file, pattern] of [['README.md', /封号风险/], ['README.en.md', /A ban is possible/]]) {
+    const readme = fs.readFileSync(path.join(root, file), 'utf8')
+    assert.match(readme, pattern, `${file} has to carry the ban-risk warning`)
+    // Near the top, above the first section heading: a warning below the install
+    // steps is one the user reads after deciding to install.
+    const firstSection = readme.search(/^## /m)
+    const at = readme.search(pattern)
+    assert.ok(at !== -1 && at < firstSection, `${file} has to warn before its first section`)
+  }
+})
+
+/**
+ * The README screenshots show the panel the repository ships now.
+ *
+ * `docs/preview-panel.html` mounts `renderer/index.html`, `panel.js` and
+ * `panel.css` at runtime, so a capture taken from it cannot disagree with what
+ * ships. What it can do is go stale: the pictures in docs/ are committed files,
+ * and the panel changed under them while the README kept showing the old one.
+ *
+ * "Newer than" is a content question, not a file-system one: git does not carry
+ * modification times, so a stamp compared against them passes on the machine that
+ * took the picture and fails on a fresh clone, in either direction. The capture
+ * writes the hashes of the three files it mounted into `docs/preview-capture.json`,
+ * and this compares against those.
+ */
+test('the README screenshots show the panel the repository ships', () => {
+  const shots = ['preview-pool.png', 'preview-dark.png', 'preview-models.png', 'preview-growth.png', 'preview-page.png']
+  const stampAt = path.join(root, 'docs', 'preview-capture.json')
+  assert.ok(fs.existsSync(stampAt), 'docs/preview-capture.json has to exist: the capture writes it')
+  const stamp = JSON.parse(fs.readFileSync(stampAt, 'utf8'))
+  const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')
+
+  for (const file of ['renderer/index.html', 'renderer/panel.js', 'renderer/panel.css']) {
+    assert.equal(stamp.rendered[file], digest(file),
+      `${file} changed since the screenshots were taken: re-capture, then run node docs/stamp.cjs`)
+  }
+  assert.deepEqual(Object.keys(stamp.shots).sort(), [...shots].sort(),
+    'the capture has to list the shots the README embeds')
+
+  // The preview page mounts the real files rather than a copy of them, which is
+  // what makes a capture trustworthy in the first place.
+  const preview = fs.readFileSync(path.join(root, 'docs', 'preview-panel.html'), 'utf8')
+  assert.ok(preview.includes('../renderer/index.html'), 'the preview has to mount the shipped markup')
+  assert.ok(preview.includes('../renderer/panel.js'), 'and load the shipped script')
+  assert.ok(preview.includes('../renderer/panel.css'), 'and the shipped stylesheet')
+
+  for (const shot of shots) {
+    const at = path.join(root, 'docs', shot)
+    assert.ok(fs.existsSync(at), `docs/${shot} has to exist: the README embeds it`)
+    assert.equal(stamp.shots[shot], digest('docs/' + shot),
+      `docs/${shot} changed without the stamp that records what it was captured against: run node docs/stamp.cjs after re-capturing`)
+  }
+})

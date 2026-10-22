@@ -73,6 +73,24 @@ const TRAE_DIRECTORY_FUNCTIONS: Readonly<Record<TraeRegion, readonly string[]>> 
 const TRAE_SOLO_CHAT_PATH = '/api/agent/v3/llm_utils_chat'
 const TRAE_SOLO_MODELS_PATH = '/api/ide/v1/get_detail_param'
 
+/**
+ * The window the upstream accepts once Max mode is on.
+ *
+ * `context_window_tokens.dev` in the directory is the plan's default, not the
+ * ceiling: it reads 200000 for models that then serve far more. Measured against
+ * the live chat endpoint in Max mode, a 1005020-token prompt was answered to
+ * `finish_reason: stop` on both glm-5.3-flash and deepseek-v4.1-flash, and a
+ * 1350030-token prompt was refused with `4022 your prompt tokens have exceeded the
+ * maximum limit`.
+ *
+ * A row that states a larger tier of its own keeps that figure - the directory is
+ * the upstream speaking about its own model - and only a row that states none gets
+ * this measured ceiling. Publishing a ceiling at all is what lets a caller use the
+ * room: the gateway asks for Max mode only when the window in force is above the
+ * answer's default, so a model left on its default behaves exactly as before.
+ */
+const TRAE_MAX_CONTEXT_WINDOW = 1_000_000
+
 /** Upstream failure classes the future shim can map onto HTTP answers. */
 export type TraeUpstreamErrorKind =
   | 'authentication'
@@ -94,6 +112,13 @@ export interface TraeSoloModel {
   id: string
   name: string
   contextWindow?: number
+  /**
+   * The larger window the model accepts once Max mode is on, when it advertises
+   * one. The directory sells Max as a separate tier, so a model's default window
+   * is not its ceiling: `context_window_tokens` carries both, and reading only
+   * the default published every Max-capable model at a fraction of what it takes.
+   */
+  maxContextWindow?: number
   maxTokens?: number
   reasoning?: TraeReasoningCapability
   /**
@@ -105,6 +130,31 @@ export interface TraeSoloModel {
   creditMultiplier?: number
   /** The directory function that listed this config (replayed when calling it). */
   function?: string
+  /**
+   * Every directory answer about this model, in the order the functions answered.
+   * The numbers above are derived from these; the gateway picks the one that can
+   * serve the window in force rather than trusting a single row.
+   */
+  variants?: readonly TraeSoloVariant[]
+}
+
+/**
+ * One directory read: the roster, and whether a function failed on the way.
+ *
+ * `partial` is what tells the caller the roster is not a complete statement of
+ * what the machine can call. Without it a single timed-out function read as a
+ * model that no longer exists.
+ */
+export interface TraeDirectoryRead {
+  models: TraeSoloModel[]
+  partial: boolean
+  /**
+   * The functions that did not answer. Their previous answer is still folded in -
+   * the models only they list stay callable - but the answers that did arrive are
+   * ranked ahead of them, so a function that has stopped being served stops being
+   * the first choice.
+   */
+  failedFunctions: string[]
 }
 
 const TRAE_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const
@@ -289,6 +339,7 @@ export function prepareSoloBody(
   defaultModel = 'glm-5.2',
   functionName?: string,
   capability?: TraeReasoningCapability,
+  maxMode = false,
 ): string {
   const input = JSON.parse(source) as Record<string, unknown>
   const model = typeof input['model'] === 'string' && input['model'].trim() !== '' ? input['model'].trim() : defaultModel
@@ -312,6 +363,11 @@ export function prepareSoloBody(
     stream: true,
     ...Array.isArray(input['tools']) ? { tools: input['tools'] } : {},
     ...wireEffort === undefined ? {} : { reasoning_effort: wireEffort },
+    // Max mode is a separate window the upstream only serves when the request
+    // asks for it (`v2_max_mode_enabled`, the flag Trae's own client sends when
+    // the Max switch is on). Declaring the larger window without sending it
+    // would size the host's budget for room the gateway then refuses.
+    ...maxMode ? { extra_info: { v2_max_mode_enabled: true } } : {},
   }
   if (Array.isArray(body['messages'])) {
     for (const raw of body['messages']) {
@@ -388,11 +444,129 @@ function wireCreditMultiplier(config: Record<string, unknown>): number | undefin
 }
 
 /**
- * Merge one directory function's config list into the shared catalogue.
- * First function to list a `config_name` owns it, so precedence follows
- * `TRAE_DIRECTORY_FUNCTIONS` order. Pure: no network, no token logging.
+ * One directory function's answer about one model.
+ *
+ * The same `config_name` is listed by several functions and they disagree: a row
+ * can serve a wider window, a larger Max tier, or a bigger output budget than
+ * another row for the same model. Keeping one answer threw the others away, which
+ * is how a 32k-output model ended up published at 16k (the Max-capable function
+ * states the smaller budget) and how a narrow row with a Max tier equal to its own
+ * default window beat a wider row without one.
  */
-function collectTraeSoloModels(
+export interface TraeSoloVariant {
+  /** The `llm_utils_chat` function this answer came from. */
+  function: string
+  /** The window this answer serves before Max mode. */
+  contextWindow?: number
+  /** The Max tier this answer offers, kept only when it is above its own default. */
+  maxContextWindow?: number
+  /** The output budget this answer states. */
+  maxTokens?: number
+}
+
+/** The widest window one answer can serve, Max tier included. */
+function variantReach(variant: TraeSoloVariant): number {
+  return Math.max(variant.contextWindow ?? 0, variant.maxContextWindow ?? 0)
+}
+
+/**
+ * The answer that should serve a request for `window`.
+ *
+ * Candidates are answers that serve the window on their OWN default tier. An
+ * answer that only reaches it with Max mode on is not a candidate at that size:
+ * picking it would put a default-window request on the larger tier's terms, and
+ * Max mode is billed that way. Only when nothing serves the window on its own
+ * tier - which is exactly a request above every default, i.e. a real Max
+ * request - do the Max-capable answers become candidates.
+ *
+ * Among equals the largest output budget wins: a user who keeps the default
+ * window then gets the function that grants the most room to answer. Equal
+ * budgets prefer the tighter ceiling, so nothing is declared wider than it
+ * needs to be.
+ *
+ * The last resort - a window no answer can reach - is ranked the other way round.
+ * There the tightest ceiling would be the answer that takes the LEAST of the
+ * request, so the widest wins instead, and Max mode is asked for it: that is the
+ * only combination that can serve a window the directory has since narrowed away
+ * from.
+ */
+export function traeVariantFor(model: TraeSoloModel, window?: number): TraeSoloVariant | undefined {
+  const variants = model.variants ?? []
+  if (variants.length === 0) return undefined
+  const wanted = window !== undefined && window > 0 ? window : (model.contextWindow ?? 0)
+  const own = variants.filter((variant) => (variant.contextWindow ?? 0) >= wanted)
+  const reaching = own.length > 0 ? own : variants.filter((variant) => variantReach(variant) >= wanted)
+  // Reached only when nothing can serve the window: prefer the answer whose own
+  // tier is the widest, because it is the closest fit and the one Max mode gets
+  // the most out of.
+  const exhausted = reaching.length === 0
+  const pool = exhausted ? variants : reaching
+  let best: TraeSoloVariant | undefined
+  for (const variant of pool) {
+    if (best === undefined) {
+      best = variant
+      continue
+    }
+    const out = variant.maxTokens ?? 0
+    const bestOut = best.maxTokens ?? 0
+    if (exhausted) {
+      // Widest own tier first; among equals, the larger output budget.
+      const tier = variant.contextWindow ?? 0
+      const bestTier = best.contextWindow ?? 0
+      if (tier > bestTier) best = variant
+      else if (tier === bestTier && out > bestOut) best = variant
+      continue
+    }
+    if (out > bestOut) best = variant
+    else if (out === bestOut && variantReach(variant) < variantReach(best)) best = variant
+  }
+  return best
+}
+
+/**
+ * The published figures, derived from every answer about a model.
+ *
+ * The default window is the widest any function serves and the output budget
+ * belongs to the answer that serves it - the same answer a request at that window
+ * uses. The ceiling is the widest tier any function states, or the measured one
+ * when none states a tier above the default.
+ *
+ * A tier equal to the widest default is not published as one: most rows state a
+ * `max` that merely repeats their own window (the `__max` checkpoint naming the
+ * same size), and offering that as a second tier would put a Max switch on the
+ * model that changes nothing.
+ */
+function figuresFrom(variants: readonly TraeSoloVariant[]): Pick<TraeSoloModel, 'contextWindow' | 'maxContextWindow' | 'maxTokens' | 'function'> {
+  const windows = variants.map((v) => v.contextWindow ?? 0)
+  const defaultWindow = Math.max(0, ...windows)
+  const declaredCeiling = Math.max(0, ...variants.map(variantReach))
+  // A stated tier above the default outranks the measured ceiling; only a row that
+  // states none gets that one, and a row that states no window at all is published
+  // with no tier - its reach is simply unknown.
+  const ceiling = defaultWindow <= 0
+    ? declaredCeiling
+    : declaredCeiling > defaultWindow ? declaredCeiling : TRAE_MAX_CONTEXT_WINDOW
+  const serving = traeVariantFor({ id: '', name: '', variants }, defaultWindow)
+  // Every key is written even when it has no value: the caller spreads this over
+  // the entry it already has, and an omitted key would leave the previous
+  // merge's figure standing - a ceiling from an answer the new set no longer
+  // contains, or a `function` from a row that was just dropped.
+  return {
+    contextWindow: defaultWindow > 0 ? defaultWindow : undefined,
+    maxContextWindow: ceiling > defaultWindow ? ceiling : undefined,
+    maxTokens: serving?.maxTokens,
+    function: serving?.function,
+  }
+}
+
+/**
+ * Merge one directory answer into the roster.
+ *
+ * Exported because the merge rule is the whole point: the answers disagree, and
+ * which one is kept used to depend on the order the gateway happened to answer in.
+ * Every answer is kept as a variant, so nothing one function states is lost.
+ */
+export function collectTraeSoloModels(
   list: readonly unknown[],
   directoryFunction: string,
   byId: Map<string, TraeSoloModel>,
@@ -421,6 +595,10 @@ function collectTraeSoloModels(
       ? config['context_window_tokens'] as Record<string, unknown>
       : {}
     const contextWindow = finitePositive(contextTokens['dev']) ?? finitePositive(detail['prompt_max_tokens'])
+    // Max is a second, larger window the model accepts with Max mode on. It is
+    // not a different checkpoint - the same `config_name` serves both - so a row
+    // that states one is the same model with more room.
+    const maxContextWindow = finitePositive(contextTokens['max'])
     const maxTokens = finitePositive(detail['max_tokens'])
     const reasoning = parseTraeReasoningCapability({ ...config, ...detail })
     const creditMultiplier = wireCreditMultiplier(config)
@@ -430,18 +608,75 @@ function collectTraeSoloModels(
     // model it marks true was verified against the live account, so the flag is
     // published rather than guessed from a name.
     const multimodal = display['multimodal']
-    if (byId.has(id)) continue
+    const variant: TraeSoloVariant = {
+      function: directoryFunction,
+      ...contextWindow === undefined ? {} : { contextWindow },
+      ...maxContextWindow === undefined ? {} : { maxContextWindow },
+      ...maxTokens === undefined ? {} : { maxTokens },
+    }
+    const existing = byId.get(id)
+    const variants = [...existing?.variants ?? []]
+    const known = variants.findIndex((entry) => entry.function === directoryFunction)
+    const previous = known === -1 ? undefined : variants[known]
+    if (previous === undefined) variants.push(variant)
+    else if (variantReach(variant) > variantReach(previous) || (variant.maxTokens ?? 0) > (previous.maxTokens ?? 0)) {
+      variants[known] = variant
+    }
+    if (existing !== undefined) {
+      byId.set(id, { ...existing, ...figuresFrom(variants), variants })
+      continue
+    }
     byId.set(id, {
       id,
       name: typeof display['display_name'] === 'string' && display['display_name'] !== '' ? display['display_name'] : id,
-      ...contextWindow === undefined ? {} : { contextWindow },
-      ...maxTokens === undefined ? {} : { maxTokens },
       ...reasoning === undefined ? {} : { reasoning },
       ...creditMultiplier === undefined ? {} : { creditMultiplier },
       ...typeof multimodal === 'boolean' ? { supportsImages: multimodal } : {},
-      function: directoryFunction,
+      ...figuresFrom(variants),
+      variants,
     })
   }
+}
+
+/**
+ * Fold a partial directory read into the roster already held.
+ *
+ * A function that failed lists models the answer does not mention, so two facts
+ * have to be kept apart: an id only the earlier read knows stays callable, and
+ * an id both reads know keeps the variants of both. The failed function may be
+ * the only one that stated a Max tier or a wider window, and dropping its answer
+ * would re-publish the model at the smaller figures - the same silent narrowing
+ * the variant system exists to prevent.
+ *
+ * A complete read is never merged: it is the directory's current word, and a
+ * model it no longer lists is one that is gone.
+ *
+ * A variant carried over from a failed function is still chosen by
+ * `traeVariantFor` when it is the one that reaches the window, and the request is
+ * then sent to a function that may have stopped answering entirely. That is the
+ * right call while the failure was a timeout - the chat path is a different
+ * endpoint - and the gateway retries once with another answer when the chosen one
+ * turns out to be gone.
+ */
+export function mergeTraeDirectory(
+  previous: readonly TraeSoloModel[],
+  next: readonly TraeSoloModel[],
+): readonly TraeSoloModel[] {
+  const merged = new Map<string, TraeSoloModel>(next.map((model) => [model.id, model]))
+  for (const model of next) {
+    const before = previous.find((entry) => entry.id === model.id)
+    if (before === undefined) continue
+    const variants = [...model.variants ?? []]
+    for (const variant of before.variants ?? []) {
+      if (!variants.some((entry) => entry.function === variant.function)) variants.push(variant)
+    }
+    if (variants.length === (model.variants ?? []).length) continue
+    merged.set(model.id, { ...model, ...figuresFrom(variants), variants })
+  }
+  for (const model of previous) {
+    if (!merged.has(model.id)) merged.set(model.id, model)
+  }
+  return [...merged.values()]
 }
 
 /** Daily check-in endpoints on the CN pay host (`REGION_GATEWAYS.cn.pay`). */
@@ -702,16 +937,27 @@ export class TraeSoloUpstreamClient {
    * Read the callable roster for this credential's region. Every function in
    * `TRAE_DIRECTORY_FUNCTIONS` is asked in order and their answers unioned;
    * one function failing never hides the others' rosters.
+   *
+   * The answer says whether it is `partial`: a function that failed is one that
+   * would have listed models, and the ones only it lists are missing from what
+   * came back. That has to travel with the read, because the roster replaces the
+   * cached one - and a roster that lost models makes the gateway refuse them as
+   * `not_found`, for as long as the read stays fresh.
    */
-  async fetchModels(signal?: AbortSignal): Promise<TraeSoloModel[]> {
+  async fetchModels(signal?: AbortSignal): Promise<TraeDirectoryRead> {
     const [credential, identity] = await Promise.all([this.options.credential(), this.options.identity()])
     const region = traeRegionOfCredential(credential)
     const base = this.options.baseUrl ?? REGION_GATEWAYS[region].chat
     const headers = { ...buildTraeHeaders(credential, identity), Accept: 'application/json' }
     const byId = new Map<string, TraeSoloModel>()
     const failures: string[] = []
-    for (const directoryFunction of TRAE_DIRECTORY_FUNCTIONS[region]) {
-      let list: unknown[]
+    /** The functions whose answer this read could not use, by name only. */
+    const failedFunctions: string[] = []
+    // Asked together, not one after the other: a cold roster is four or five round
+    // trips, and the host asks for `/v1/models` while this runs. Collected in
+    // priority order afterwards, so the first function to name a `config_name`
+    // still decides which of its variants leads.
+    const answers = await Promise.all(TRAE_DIRECTORY_FUNCTIONS[region].map(async (directoryFunction) => {
       try {
         const response = await this.fetchImpl(traeEndpoint(base, TRAE_SOLO_MODELS_PATH), {
           redirect: 'error',
@@ -730,12 +976,29 @@ export class TraeSoloUpstreamClient {
         })
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         const document = await response.json() as Record<string, unknown>
-        list = Array.isArray(document['config_info_list']) ? document['config_info_list'] : []
+        // A 200 that carries no list is not an empty answer, it is an answer this
+        // read could not use - the upstream sends its own error envelope with a
+        // 200 often enough. Counting it as success made the whole read look
+        // complete, which then replaced the roster and dropped every model only
+        // this function lists: the same 404 the partial flag exists to prevent,
+        // with a different trigger.
+        if (!Array.isArray(document['config_info_list'])) {
+          const code = typeof document['code'] === 'number' ? document['code'] : undefined
+          const message = typeof document['message'] === 'string' ? document['message'].slice(0, 60) : ''
+          throw new Error(code === undefined ? 'no config_info_list' : `code ${code}${message === '' ? '' : ': ' + message}`)
+        }
+        return { directoryFunction, list: document['config_info_list'] as unknown[] }
       } catch (error: unknown) {
-        failures.push(`${directoryFunction}: ${String(error).slice(0, 80)}`)
+        failedFunctions.push(directoryFunction)
+        return { directoryFunction, failure: `${directoryFunction}: ${String(error).slice(0, 80)}` }
+      }
+    }))
+    for (const answer of answers) {
+      if (answer.failure !== undefined) {
+        failures.push(answer.failure)
         continue
       }
-      collectTraeSoloModels(list, directoryFunction, byId)
+      collectTraeSoloModels(answer.list, answer.directoryFunction, byId)
     }
     const models = [...byId.values()]
     if (models.length === 0) {
@@ -747,7 +1010,7 @@ export class TraeSoloUpstreamClient {
       const found = reasoning.get(model.id)
       if (found !== undefined) model.reasoning = found
     }
-    return models
+    return { models, partial: failures.length > 0, failedFunctions }
   }
 
   /**
@@ -866,10 +1129,17 @@ export class TraeSoloUpstreamClient {
     functionName?: string,
     capability?: TraeReasoningCapability,
     timeouts?: { headersMs?: number; idleMs?: number },
+    maxMode?: boolean,
   ): Promise<TraeChatResult> {
     let prepared: string
-    try { prepared = prepareSoloBody(bodyJson, undefined, functionName, capability) }
-    catch { return { ok: false, status: 400, kind: 'client', message: 'invalid JSON request' } }
+    try { prepared = prepareSoloBody(bodyJson, undefined, functionName, capability, maxMode === true) } catch (error: unknown) {
+      // The message is carried through rather than flattened into "invalid JSON
+      // request": the envelope builder refuses specific shapes (a tool message
+      // with no `tool_call_id`, a body that is not an object), and the caller
+      // can only fix what the answer names.
+      const message = error instanceof Error && error.message !== '' ? error.message : 'invalid JSON request'
+      return { ok: false, status: 400, kind: 'client', message }
+    }
     let credential: TraeCredential
     let identity: TraeIdentity
     try {

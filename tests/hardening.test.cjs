@@ -163,6 +163,71 @@ test('a sealed sign-in the key cannot open keeps the account the pool already ha
 })
 
 /**
+ * The signature scan is handed a module path its own edition can load.
+ *
+ * `powershell` is Windows PowerShell 5.1, and it binds
+ * `Microsoft.PowerShell.Security` by walking `PSModulePath` in order. Any machine
+ * with a Store-installed PowerShell 7 carries that build's Modules directory
+ * ahead of the system one, because the Store install prepends it to the variable
+ * the desktop host inherited. 5.1 then binds the 7 build's copy of the module, the
+ * import dies on a type-data conflict, and `Get-AuthenticodeSignature` throws for
+ * every candidate. The scan's own catch swallows that, the policy function is
+ * handed an empty status, and the at-rest key reads as "no WorkBuddy executable
+ * found" on a machine holding two signed installs - which is what it read as
+ * here, until the scan was given a path of its own.
+ *
+ * The chain is driven from a stubbed `node:child_process` and an environment
+ * built here, so the case proves the child is handed a path of our own rather
+ * than the ambient one, and that the path puts the system directory ahead of the
+ * Store one. Dropping the option, or restoring the ambient order, fails it.
+ */
+test('the signature scan is handed a module path 5.1 can load', async () => {
+  const spawns = []
+  const ownRequire = createRequire(path.join(root, 'src/at-rest.ts'))
+  const modules = path.join('C:\\Windows', 'system32', 'WindowsPowerShell', 'v1.0', 'Modules')
+  const store = path.join('C:\\Program Files', 'WindowsApps', 'microsoft.powershell_7.6.7.0_x64__8wekyb3d8bbwe', 'Modules')
+  const ambient = [
+    path.join('C:\\Users\\fixture', 'Documents', 'PowerShell', 'Modules'),
+    path.join('C:\\Program Files', 'PowerShell', 'Modules'),
+    store,
+    modules,
+  ].join(';')
+  const context = vm.createContext({
+    require: (specifier) => specifier === 'node:child_process'
+      ? { execFileSync: (file, args, options) => { spawns.push({ file, args, options }); return '' } }
+      : ownRequire(specifier),
+    // No install root the scan would find, so the only candidate source left is
+    // the registry, and the only registry is the stub above.
+    process: { env: { SystemRoot: 'C:\\Windows', PSModulePath: ambient }, platform: 'win32' },
+    module: { exports: {} }, exports: {}, console: { log() {} }, Buffer,
+  })
+  context.exports = context.module.exports
+  vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/at-rest.ts'), 'utf8')), context)
+  const { signatureScanEnv, encryptedFieldOpener } = context.module.exports
+  assert.equal(typeof signatureScanEnv, 'function')
+  await encryptedFieldOpener()
+  assert.equal(spawns.length, 1, 'the scan runs exactly once')
+  // Pinned by absolute path rather than resolved through PATH: the scan exists
+  // because a user-level process can plant what runs, and a user-writable
+  // directory is on the default PATH.
+  assert.equal(spawns[0].file, path.join('C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
+  const handed = spawns[0].options.env
+  assert.notEqual(handed, undefined, 'the child must be handed an environment of our own, not the ambient one')
+  const order = handed.PSModulePath.split(';')
+  assert.equal(order[0], modules, 'the 5.1 modules directory leads the path the child is given')
+  assert.ok(order.indexOf(modules) < order.indexOf(store),
+    'the system modules directory precedes the Store PowerShell 7 one, which is the whole fix')
+  assert.equal(order.length, ambient.split(';').length + 1,
+    'nothing is dropped: a user\'s own modules still resolve behind the system one')
+  assert.equal(signatureScanEnv({ SystemRoot: 'C:\\Windows', PSModulePath: ambient, PATH: 'unchanged' }).PATH, 'unchanged',
+    'the rest of the environment is passed through untouched')
+  assert.equal(signatureScanEnv({ SystemRoot: 'C:\\Windows', PSModulePath: order.join(';') }).PSModulePath, order.join(';'),
+    'building it twice is a no-op, so the path cannot grow on every scan')
+  assert.equal(signatureScanEnv({ PATH: 'unchanged' }).PATH, 'unchanged',
+    'with no SystemRoot to derive from the environment is left as it is rather than given an invented path')
+})
+
+/**
  * Two sign-ins with no identity at all are two accounts.
  *
  * A credential with no `uin`, `uid` or `nickname` has nothing to key on but
@@ -433,7 +498,7 @@ test('a sign-in that answers 401 hands the turn to the next one in the list', as
   // The directory is stubbed so nothing here walks a vendor endpoint; the
   // `fetchImpl` below only ever sees the chat call.
   t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchModels',
-    async () => [{ id: 'fixture-model', name: 'Fixture', function: 'chat' }])
+    async () => ({ models: [{ id: 'fixture-model', name: 'Fixture', function: 'chat' }], partial: false }))
   t.mock.method(QoderUpstreamClient.prototype, 'fetchModels',
     async () => [{ id: 'fixture-model', name: 'Fixture', supportsImages: false }])
   const WIRE = {
@@ -604,7 +669,7 @@ test('the collected check-in slots survive a restart and stay three days deep', 
   })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')), module: { exports: {} }, exports: {},
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
@@ -1852,8 +1917,11 @@ test('a check-in pass that starts after a stop still collects', async () => {
     AbortController,
     GROWTH_AFTER_CHECKIN_MS: 0,
     checkinAbort: new AbortController(),
+    checkinScope: { enterWith() {} },
     checkinPassRunning: false,
     checkinPassToken: 0,
+    // Nothing is in growth, which is the state the guard has to let through.
+    growthPassRunning: false,
     serviceStopped: false,
     checkinHours: () => [9],
     autoCheckinSlots: slots,
@@ -1875,7 +1943,7 @@ test('a check-in pass that starts after a stop still collects', async () => {
     qoderCheckinAll: async () => { claims.qoder += 1; return { claimed: 1, skipped: 0, failed: 0 } },
     traeCheckinAll: async () => { claims.trae += 1; return { claimed: 1, skipped: 0, failed: 0 } },
     checkinDelay: async () => {},
-    claimAllGrowth: async () => { claims.growth += 1; return { streak: 0, tasks: 0, credit: 0 } },
+    claimAllGrowth: async () => { claims.growth += 1; return { streak: 0, credit: 0 } },
     scheduleRefresh: () => {},
     log: () => {},
     safeMessage: (error) => String(error),
@@ -1892,6 +1960,41 @@ test('a check-in pass that starts after a stop still collects', async () => {
   assert.equal(answer.claimed, 2, 'the counts the workers returned must reach the answer')
   assert.equal(context.checkinAbort.signal.aborted, false,
     'the pass must have re-armed the flag, or the next one inherits this stop')
+})
+
+/**
+ * A reload installs a new controller while a pass is still between accounts.
+ * The pause has to keep the signal that pass captured. Reading the global
+ * instead returned at once, and the pass walked the rest of the pool.
+ */
+test('a check-in pause follows the pass that started it', async () => {
+  const { AsyncLocalStorage } = require('node:async_hooks')
+  const source = fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')
+  const scope = new AsyncLocalStorage()
+  const stopped = new AbortController()
+  stopped.abort()
+  const context = vm.createContext({
+    AbortController,
+    checkinAbort: stopped,
+    checkinScope: scope,
+    setTimeout,
+    clearTimeout,
+  })
+  vm.runInContext(
+    balanced(source, source.indexOf('function currentCheckinSignal(')) + '\n' +
+      balanced(source, source.indexOf('function checkinDelay(')),
+    context,
+  )
+  const pass = new AbortController()
+  const started = Date.now()
+  await scope.run(pass.signal, () => context.checkinDelay(40))
+  assert.ok(Date.now() - started >= 30, 'the pause must wait on the pass signal, not the aborted global')
+  const cut = new AbortController()
+  const cutAt = Date.now()
+  const pending = scope.run(cut.signal, () => context.checkinDelay(5000))
+  cut.abort()
+  await pending
+  assert.ok(Date.now() - cutAt < 500, 'aborting the pass signal must cut the pause')
 })
 
 /**
@@ -2002,47 +2105,6 @@ test('a spent account is held out of rotation instead of returning each minute',
 })
 
 /**
- * One task code the upstream will not take costs that code, not the account's
- * whole round.
- *
- * Enrolment is one batch POST. A retired or renamed code makes the whole batch
- * fail, and the caller never reached its second list read, so every reward that
- * was already accepted went uncollected for the day. The batch is retried code
- * by code when it fails as a whole, and the codes the upstream refuses are
- * reported instead of thrown.
- */
-test('one refused task code costs that code, not the account\'s whole round', async () => {
-  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
-  const sent = []
-  const client = new WorkBuddyUpstreamClient({ fetchImpl: async (_url, init) => {
-    const codes = JSON.parse(String(init.body)).task_codes
-    sent.push(codes)
-    // The batch as a whole is refused whenever it carries the dead code, and so
-    // is the dead code on its own: that is the upstream retiring a task.
-    const refused = codes.includes('dead-code')
-    return new Response(JSON.stringify(refused ? { code: 500, msg: 'invalid task_code' } : { code: 0, data: {} }), {
-      status: 200, headers: { 'content-type': 'application/json' },
-    })
-  } })
-  const credential = { accessToken: 't', refreshToken: 'r', expiresAtMs: 0, domain: 'www.workbuddy.cn', sourcePath: '' }
-  const refused = await client.acceptTasks(credential, ['good-code', 'dead-code'])
-  assert.deepEqual(refused, ['dead-code'], 'the code the upstream refused is reported, not thrown')
-  assert.deepEqual(sent[0], ['good-code', 'dead-code'], 'the batch is tried once before the per-code retry')
-  assert.deepEqual(sent.slice(1), [['good-code'], ['dead-code']], 'and the retry walks the codes one at a time')
-})
-
-test('a batch where every code is refused still fails the account', async () => {
-  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
-  const client = new WorkBuddyUpstreamClient({ fetchImpl: async () => new Response(
-    JSON.stringify({ code: 500, msg: 'invalid task_code' }),
-    { status: 200, headers: { 'content-type': 'application/json' } },
-  ) })
-  const credential = { accessToken: 't', refreshToken: 'r', expiresAtMs: 0, domain: 'www.workbuddy.cn', sourcePath: '' }
-  await assert.rejects(() => client.acceptTasks(credential, ['dead-a', 'dead-b']),
-    /invalid task_code/, 'nothing was accepted, so the caller must still see a failed account')
-})
-
-/**
  * The reset time is read in the spellings the upstream actually sends.
  *
  * A quoted value and a seconds-level one both occur, and either fell through to
@@ -2103,7 +2165,7 @@ test('a sign-in the upstream just refused leads no request until its wait ends',
   const first = context.orderSourceCredentials('trae', 'cn', live, labelOf, true).map(labelOf)
   assert.deepEqual(first, ['account-a', 'account-b'], 'with nothing held the order is the discovery order')
   // A two-hour wait, the figure a Qoder daily limit states.
-  context.noteSourceFailure('trae', 'account-a', '7200')
+  context.noteSourceFailure('trae', 'cn', 'account-a', '7200')
   const held = context.orderSourceCredentials('trae', 'cn', live, labelOf, true).map(labelOf)
   assert.deepEqual(held, ['account-b', 'account-a'],
     'the refused sign-in moves behind the healthy one instead of every request paying for it again')
@@ -2121,7 +2183,7 @@ test('a hold with no stated wait ends at the cooldown', () => {
   const context = sourceFailureContext(() => 0)
   const live = [{ label: 'account-a', expiresAtMs: 0 }, { label: 'account-b', expiresAtMs: 0 }]
   const labelOf = (credential) => credential.label
-  context.noteSourceFailure('qoder', 'account-a', undefined)
+  context.noteSourceFailure('qoder', 'cn', 'account-a', undefined)
   const ordered = context.orderSourceCredentials('qoder', 'cn', live, labelOf, true).map(labelOf)
   assert.deepEqual(ordered, ['account-a', 'account-b'],
     'a hold whose wait has passed leads again, and the expired entry is dropped')
@@ -2207,7 +2269,7 @@ test('a sign-in the upstream just refused is tried after the healthy ones but be
   const healthy = { name: 'healthy', expiresAtMs: now + 3_600_000 }
   const held = { name: 'held', expiresAtMs: now + 3_600_000 }
   const dead = { name: 'dead', expiresAtMs: now - 60_000 }
-  pool.noteSourceFailure('trae', 'held', undefined)
+  pool.noteSourceFailure('trae', 'cn', 'held', undefined)
   assert.deepEqual(pool.orderSourceCredentials('trae', 'cn', [dead, held, healthy], sourceLabel, false).map(sourceLabel),
     ['healthy', 'held', 'dead'],
     'healthy first, then the refused one, then the expired one')
@@ -2215,6 +2277,29 @@ test('a sign-in the upstream just refused is tried after the healthy ones but be
   assert.deepEqual(pool.orderSourceCredentials('trae', 'cn', [dead, held], sourceLabel, false).map(sourceLabel),
     ['held', 'dead'],
     'a held sign-in is still used when it is all there is')
+})
+
+/**
+ * A hold belongs to one region's sign-in, not to its name.
+ *
+ * The scanner keys its rows by label *and* region because one Trae account keeps
+ * a copy in each region (and two different accounts can share a numeral). Keying
+ * the hold by the label alone handed a 429 in one region to the other region's
+ * copy, which then sorted behind a healthy account it had never failed against.
+ */
+test('a hold in one region does not reach the same name in the other', () => {
+  const pool = orderingContext()
+  const now = Date.now()
+  const cnCopy = { name: 'same-name', expiresAtMs: now + 3_600_000 }
+  const aiCopy = { name: 'same-name', expiresAtMs: now + 3_600_000 }
+  const aiHealthy = { name: 'other', expiresAtMs: now + 3_600_000 }
+  pool.noteSourceFailure('trae', 'cn', 'same-name', '7200')
+  assert.deepEqual(pool.orderSourceCredentials('trae', 'cn', [cnCopy, aiHealthy], sourceLabel, false).map(sourceLabel),
+    ['other', 'same-name'],
+    'the refused copy in this region sorts behind the healthy one')
+  assert.deepEqual(pool.orderSourceCredentials('trae', 'ai', [aiCopy, aiHealthy], sourceLabel, false).map(sourceLabel),
+    ['same-name', 'other'],
+    "the other region's copy of that name never failed, so it leads")
 })
 
 test('the picked account leads in every mode, and a retired pick does not', () => {
@@ -2250,8 +2335,8 @@ test('the expiry mode spends the soonest-expiring pack first, and never an expir
   // a one-off pack has to be spent before it lapses, and a monthly pack can
   // wait. `packUrgency` returns Infinity for a sign-in with nothing recorded, so
   // both of these carry a pack.
-  pool.sourceCreditExpiry.set('trae\nsoon', now + 3_600_000)
-  pool.sourceCreditExpiry.set('trae\nlater', now + 86_400_000)
+  pool.sourceCreditExpiry.set(pool.accountStateKey('trae', 'cn', 'soon'), now + 3_600_000)
+  pool.sourceCreditExpiry.set(pool.accountStateKey('trae', 'cn', 'later'), now + 86_400_000)
   const soon = { name: 'soon', expiresAtMs: now + 7 * 86_400_000 }
   const later = { name: 'later', expiresAtMs: now + 3_600_000 }
   const dead = { name: 'dead', expiresAtMs: now - 60_000 }
@@ -2259,7 +2344,7 @@ test('the expiry mode spends the soonest-expiring pack first, and never an expir
     ['soon', 'later', 'dead'],
     'the pack that expires soonest is spent first, so a one-off pack is not wasted - and the token expiry says the opposite, which is the point')
   // An expired sign-in is last even when its pack is the most urgent.
-  pool.sourceCreditExpiry.set('trae\ndead', now + 60_000)
+  pool.sourceCreditExpiry.set(pool.accountStateKey('trae', 'cn', 'dead'), now + 60_000)
   assert.deepEqual(pool.orderSourceCredentials('trae', 'cn', [later, soon, dead], sourceLabel, false).map(sourceLabel),
     ['soon', 'later', 'dead'],
     'an expired sign-in is never spent first however urgent its pack is')
@@ -2335,7 +2420,7 @@ test('a forced refresh holds the pass slot until the background pass has finishe
   const gate = new Promise((resolve) => { release = resolve });
   let documents = 0;
   const context = vm.createContext({
-    setTimeout, clearTimeout,
+    setTimeout, clearTimeout, setInterval, clearInterval,
     serviceStopped: false,
     loadGeneration: 1,
     refreshInflight: null,
@@ -3571,7 +3656,7 @@ test('a refusal that merely contains "already" is a failure', () => {
   const body = balanced(source, start)
   const mod = { exports: {} }
   new Function('module', 'exports', 'require',
-    'const messageOf = (error) => String((error && error.message) || error);\n' + body
+    'const safeMessage = (error) => String((error && error.message) || error);\n' + body
     + '\nmodule.exports = { isAlreadyCheckin };')(mod, mod.exports, require)
   assert.equal(mod.exports.isAlreadyCheckin(new Error('already')), false,
     'a bare word is not the sentence the upstream uses for a collected day')
@@ -3744,30 +3829,283 @@ test('an international turn opens with a system prompt', async () => {
 })
 
 /**
+ * A request that names no thinking effort is not refused for the omission.
+ *
+ * `glm-5.1` rejects the whole request with HTTP 400 / 11133 ("the request
+ * parameters were rejected by the model provider") when `reasoning_effort` is
+ * absent, while the same request carrying `off` or any rung of its ladder is
+ * served. A client that expresses no preference - a plain OpenAI client, or the
+ * host on a model whose off level is not a name its map carries - therefore got
+ * a refusal where an answer was due. The gateway retries once with the model's
+ * own declared default, and only for that refusal: a genuinely malformed request
+ * keeps its 400 and is not spent upstream twice.
+ */
+test('a request that names no thinking effort gets the model default, once', async () => {
+  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const { WorkBuddyCatalog } = require('../src/catalog.ts')
+  const { createWorkBuddyShim } = require('../src/shim.ts')
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-effort-'))
+  const home = path.join(dir, 'home')
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(path.join(home, 'workbuddy-desktop.info'), JSON.stringify({
+    auth: { accessToken: 'effort-token', refreshToken: 'effort-refresh', expiresAt: 0, domain: 'www.workbuddy.cn' },
+    account: { uin: 'u-effort', nickname: 'effort' },
+  }))
+
+  // The refusal the upstream really answers with, verbatim enough for the code.
+  const refusal = JSON.stringify({
+    code: 11133,
+    msg: 'the request parameters were rejected by the model provider',
+    extError: { code: '1210', type: 'invalid_request_error', StatusCode: 400 },
+  })
+  const bodies = []
+  const client = new WorkBuddyUpstreamClient({
+    fetchImpl: async (url, init) => {
+      // Only the chat calls are counted: the pool also refreshes the token for a
+      // sign-in whose expiry has passed, and that POST is not a model request.
+      if (!String(url).endsWith('/v2/chat/completions')) {
+        return new Response(JSON.stringify({ code: 0, data: { accessToken: 'effort-token', expiresIn: 3600 } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      const body = JSON.parse(String(init?.body ?? '{}'))
+      bodies.push(body)
+      // The upstream's rule, as measured: any named effort is served (glm-5.1
+      // even takes names outside its own ladder), and the field merely being
+      // absent - or present but empty, which is not a level either - is what it
+      // rejects.
+      if (typeof body.reasoning_effort !== 'string' || body.reasoning_effort === '') {
+        return new Response(refusal, { status: 400, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response('data: {"choices":[{"delta":{"content":"pong"}}]}\n\ndata: [DONE]\n\n', {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      })
+    },
+  })
+  const catalog = new WorkBuddyCatalog()
+  // The declared ladder comes from the upstream roster; the static fallback
+  // states none, so the fixture states the row the live directory really carries.
+  catalog.update([{
+    id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200000, maxOutputTokens: 48000,
+    supportedEfforts: ['off', 'low', 'medium', 'high', 'xhigh', 'max'], defaultThinkingLevel: 'medium',
+  }])
+  // The pool must read THIS file and nothing else. Without `authDirs` it falls
+  // back to the real desktop profile directories, so the case would pass on a
+  // machine with a live WorkBuddy sign-in and fail everywhere else - a test that
+  // reads the developer's own tokens.
+  const pool = new WorkBuddyAccountPool({ authDirs: [home], client, cooldownMs: 60000 })
+  const shim = createWorkBuddyShim({ pool, client, catalog })
+  const ask = async () => {
+    const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({ model: 'glm-5.1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 }),
+    })
+    return { status: answer.status, text: await answer.text() }
+  }
+  try {
+    await shim.ready
+    const served = await ask()
+    assert.equal(served.status, 200, 'the turn is served instead of refused for the missing field')
+    assert.match(served.text, /pong/, 'and the upstream answer reaches the caller')
+    assert.equal(bodies.length, 2, 'exactly one retry: the refusal, then the same request with a default')
+    assert.equal(bodies[0].reasoning_effort, undefined, 'the first attempt is the caller\'s body, unchanged')
+    assert.equal(bodies[1].reasoning_effort, 'medium',
+      'the retry carries the default the catalog declares for this model')
+    assert.deepEqual(bodies[1].messages, bodies[0].messages, 'and nothing else about the request changes')
+
+    // A caller that named an effort is served on the first attempt: nothing is
+    // sent twice on behalf of a request that was already complete.
+    bodies.length = 0
+    const named = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({
+        model: 'glm-5.1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16, reasoning_effort: 'off',
+      }),
+    })
+    assert.equal(named.status, 200, 'a request that names its effort is served as sent')
+    assert.equal(bodies.length, 1, 'and is not spent upstream a second time')
+    assert.equal(bodies[0].reasoning_effort, 'off', 'the caller\'s own choice is what reaches the upstream')
+
+    // An empty string is "no preference" spelled differently, so it is filled in
+    // rather than read as a named level.
+    bodies.length = 0
+    const blank = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({
+        model: 'glm-5.1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16, reasoning_effort: '',
+      }),
+    })
+    assert.equal(blank.status, 200, 'an empty effort is filled in, not passed through as a refusal')
+    assert.equal(bodies.length, 2, 'the empty string is retried, not accepted as a named level')
+    assert.equal(bodies[1].reasoning_effort, 'medium', 'the declared default replaces the empty string')
+  } finally {
+    await shim.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * A 400 that is not the parameter refusal is answered as it came.
+ *
+ * 11133 is a general invalid-parameter code, so the retry is gated on it being
+ * that code *and* the request having named no effort. A different refusal - a
+ * bad `temperature`, an unsupported field - must reach the caller after one
+ * upstream call: retrying it would spend an account's request to produce the
+ * same error, and would replace the first answer with the second.
+ */
+test('a refusal that is not the parameter rejection is not retried', async () => {
+  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const { WorkBuddyCatalog } = require('../src/catalog.ts')
+  const { createWorkBuddyShim } = require('../src/shim.ts')
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-effort-skip-'))
+  const home = path.join(dir, 'home')
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(path.join(home, 'workbuddy-desktop.info'), JSON.stringify({
+    auth: { accessToken: 'skip-token', refreshToken: 'skip-refresh', expiresAt: 0, domain: 'www.workbuddy.cn' },
+    account: { uin: 'u-skip', nickname: 'skip' },
+  }))
+
+  let chatCalls = 0
+  const client = new WorkBuddyUpstreamClient({
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith('/v2/chat/completions')) {
+        return new Response(JSON.stringify({ code: 0, data: { accessToken: 'skip-token', expiresIn: 3600 } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      chatCalls += 1
+      return new Response(JSON.stringify({ code: 11128, msg: 'the first message is not a system prompt' }), {
+        status: 400, headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+  const catalog = new WorkBuddyCatalog()
+  catalog.update([{
+    id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200000, maxOutputTokens: 48000,
+    supportedEfforts: ['off', 'low', 'medium', 'high'], defaultThinkingLevel: 'medium',
+  }])
+  const pool = new WorkBuddyAccountPool({ authDirs: [home], client, cooldownMs: 60000 })
+  const shim = createWorkBuddyShim({ pool, client, catalog })
+  try {
+    await shim.ready
+    const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({ model: 'glm-5.1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 }),
+    })
+    assert.equal(answer.status, 400, 'a different refusal keeps its own status')
+    assert.equal(chatCalls, 1, 'and is spent upstream exactly once')
+    assert.match(await answer.text(), /11128/, 'the caller sees the upstream\'s own reason, not a rewritten one')
+  } finally {
+    await shim.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * A declared default the model does not accept is not sent.
+ *
+ * Answering the refusal with a level the upstream also refuses would spend a second
+ * call to produce the same error. The catalog is the only source of the default, and
+ * it can disagree with the ladder it states - a row written by hand, or an upstream
+ * that lists a level its own default is not on.
+ */
+test('a default outside the model ladder is not retried with', async () => {
+  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const { WorkBuddyCatalog } = require('../src/catalog.ts')
+  const { createWorkBuddyShim } = require('../src/shim.ts')
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-effort-ladder-'))
+  const home = path.join(dir, 'home')
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(path.join(home, 'workbuddy-desktop.info'), JSON.stringify({
+    auth: { accessToken: 'ladder-token', refreshToken: 'ladder-refresh', expiresAt: 0, domain: 'www.workbuddy.cn' },
+    account: { uin: 'u-ladder', nickname: 'ladder' },
+  }))
+
+  let chatCalls = 0
+  const client = new WorkBuddyUpstreamClient({
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith('/v2/chat/completions')) {
+        return new Response(JSON.stringify({ code: 0, data: { accessToken: 'ladder-token', expiresIn: 3600 } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      chatCalls += 1
+      return new Response(JSON.stringify({ code: 11133, msg: 'the request parameters were rejected by the model provider' }), {
+        status: 400, headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+  const catalog = new WorkBuddyCatalog()
+  catalog.update([{
+    id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200000, maxOutputTokens: 48000,
+    // The declared default is not on the ladder this row states.
+    supportedEfforts: ['off', 'low', 'high'], defaultThinkingLevel: 'max',
+  }])
+  const pool = new WorkBuddyAccountPool({ authDirs: [home], client, cooldownMs: 60000 })
+  const shim = createWorkBuddyShim({ pool, client, catalog })
+  try {
+    await shim.ready
+    const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({ model: 'glm-5.1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 }),
+    })
+    assert.equal(answer.status, 400, 'the refusal is passed through')
+    await answer.text()
+    assert.equal(chatCalls, 1,
+      'and not retried: a default the model states it does not accept would be refused again')
+  } finally {
+    await shim.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
  * A sign-in that is gone takes its hold and pack expiry with it.
  *
- * Both maps are keyed by source and label, and a label is not unique to one
- * sign-in: a departed account's hold was inherited by the next one that happened
- * to carry the same name, which demoted it for the rest of the hold despite
- * never having failed, and its pack expiry corrupted expiry-mode ordering.
+ * A label is not unique to one sign-in: a departed account's hold was inherited
+ * by the next one that happened to carry the same name, which demoted it for the
+ * rest of the hold despite never having failed, and its pack expiry corrupted
+ * expiry-mode ordering. The keys come from the engine's own `sourceRegionKey`, so
+ * the fixture cannot drift from the format `pruneSourceState` builds.
  */
 test('a departed sign-in leaves no hold or pack expiry behind', () => {
   const source = fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')
   const rows = {
     traeAccountRows: [{ label: 'kept', region: 'cn' }],
     qoderAccountRows: [{ label: 'kept', region: 'cn' }],
-    sourceFailureHold: new Map([['trae\nkept', Date.now() + 60000], ['trae\ngone', Date.now() + 60000]]),
-    sourceCreditExpiry: new Map([['qoder\nkept', Date.now() + 60000], ['qoder\ngone', Date.now() + 60000]]),
+    sourceFailureHold: new Map(),
+    sourceCreditExpiry: new Map(),
   }
   const context = vm.createContext({ console, ...rows })
-  const at = source.indexOf('function pruneSourceState(')
-  assert.notEqual(at, -1, 'pruneSourceState must exist in the host entry')
-  vm.runInContext(balanced(source, at), context)
+  const keyAt = source.indexOf('function sourceRegionKey(')
+  const pruneAt = source.indexOf('function pruneSourceState(')
+  assert.notEqual(keyAt, -1, 'sourceRegionKey must exist in the host entry')
+  assert.notEqual(pruneAt, -1, 'pruneSourceState must exist in the host entry')
+  vm.runInContext(balanced(source, keyAt) + balanced(source, pruneAt), context)
+  context.accountStateKey = (from, region, label) => context.sourceRegionKey(from, region) + '\n' + label
+  const keptTrae = context.accountStateKey('trae', 'cn', 'kept')
+  const goneTrae = context.accountStateKey('trae', 'cn', 'gone')
+  const keptQoder = context.accountStateKey('qoder', 'cn', 'kept')
+  const goneQoder = context.accountStateKey('qoder', 'cn', 'gone')
+  const until = Date.now() + 60000
+  rows.sourceFailureHold.set(keptTrae, until).set(goneTrae, until)
+  rows.sourceCreditExpiry.set(keptQoder, until).set(goneQoder, until)
   context.pruneSourceState()
   assert.equal(context.sourceFailureHold.size, 1, 'the hold of the departed sign-in is dropped')
-  assert.ok(context.sourceFailureHold.has('trae\nkept'), 'and the one that is still signed in keeps its hold')
+  assert.ok(context.sourceFailureHold.has(keptTrae), 'and the one that is still signed in keeps its hold')
   assert.equal(context.sourceCreditExpiry.size, 1, 'the same for the pack expiry')
-  assert.ok(context.sourceCreditExpiry.has('qoder\nkept'), 'the surviving sign-in keeps its expiry')
+  assert.ok(context.sourceCreditExpiry.has(keptQoder), 'the surviving sign-in keeps its expiry')
 })
 
 /**
@@ -3792,14 +4130,17 @@ test('a service stop releases the refresh slot', async () => {
     ...state,
     clearTimeout: () => { stopped.push('timer') },
     stopAutoCheckin: () => stopped.push('checkin'),
+    stopAccountWatch: () => stopped.push('accountWatch'),
     abortWarmups: () => stopped.push('warmups'),
+    clearModelRetries: () => stopped.push('modelRetries'),
     checkinAbort: { abort: () => stopped.push('checkinAbort') },
     runtimes: new Map(),
+    runtimeStarts: new Map(),
     traeGateways: new Map(),
     qoderGateways: new Map(),
     stopRuntime: async () => {},
     log: () => {},
-    messageOf: (error) => String(error?.message ?? error),
+    safeMessage: (error) => String(error?.message ?? error),
   })
   const at = source.indexOf('async function onServiceStop(')
   assert.notEqual(at, -1, 'onServiceStop must exist in the host entry')
@@ -3808,4 +4149,29 @@ test('a service stop releases the refresh slot', async () => {
   assert.equal(context.refreshInflight, null,
     'the slot must be free for the freshly loaded plugin\'s first background pass')
   assert.equal(context.refreshTimer, null, 'and the deferred timer with it')
+  assert.ok(stopped.includes('modelRetries'),
+    'and the roster retries, which would otherwise fire into the next activation')
+})
+
+/**
+ * The vendor's channel check is answered as a cause, not as a wall of tips.
+ *
+ * WorkBuddy's domestic host refuses any request whose prompt names DeepSeek
+ * Harness as the client (code 11128), on every account of that region. Rotation
+ * cannot clear it, so the pool must not spend four upstream calls pretending to
+ * try; and the body it returns is a block of mixed Chinese and English advice
+ * that names no cause and no way forward. This pins the sentence the user reads.
+ */
+test('the channel refusal names its cause and the way forward', () => {
+  const { unapprovedChannelRefusal } = require('../src/loopback.ts')
+  const body = '{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayTips":{"zh":"这次调用没通过渠道校验"}}'
+  const sentence = unapprovedChannelRefusal(body)
+  assert.ok(typeof sentence === 'string', 'the refusal has to be recognised')
+  assert.match(sentence, /DeepSeek Harness/, 'it names the identity the vendor rejected')
+  assert.match(sentence, /international|Trae|Qoder/, 'and the sources that do serve it')
+  assert.doesNotMatch(sentence, /unapproved channel|displayTips/, 'the vendor block of tips is not what the user reads')
+  // A 400 that is not this one keeps the ordinary sentence, or the mapping would
+  // swallow every real client error.
+  assert.equal(unapprovedChannelRefusal('{"code":4003,"msg":"messages must not be empty"}'), undefined)
+  assert.equal(unapprovedChannelRefusal('nothing structured'), undefined)
 })
