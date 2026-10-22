@@ -3527,6 +3527,41 @@ test('a Qoder model publishes the largest window its catalog offers', () => {
 })
 
 /**
+ * The global directory's unnamed routes never reach the picker.
+ *
+ * Qoder lists four entries under its own codenames — Ultimate, Efficient,
+ * Sonus, Cantus — beside the named models, with nothing in the payload marking
+ * them as different. Read as models they put four opaque rows above Qwen3.8-Max
+ * in the picker. The body below is the live `chat` group, trimmed to one row per
+ * kind: the four routes, the `auto` route that stays, and two named models.
+ */
+test('a Qoder directory publishes its named models and drops the unnamed routes', async () => {
+  const { QoderUpstreamClient } = require('../src/qoder-client.ts')
+  const directory = {
+    chat: [
+      { key: 'auto', display_name: 'Auto', enable: true, is_default: true, max_input_tokens: 200000 },
+      { key: 'ultimate', display_name: 'Ultimate', enable: true, is_reasoning: true, max_input_tokens: 1000000 },
+      { key: 'efficient', display_name: 'Efficient', enable: true, max_input_tokens: 200000 },
+      { key: 'smodel', display_name: 'Sonus', enable: true, is_new: true, max_input_tokens: 180000 },
+      { key: 'cmodel', display_name: 'Cantus', enable: true, max_input_tokens: 180000 },
+      { key: 'qmodel_38max', display_name: 'Qwen3.8-Max', enable: true, max_input_tokens: 180000 },
+      { key: 'gmodel', display_name: 'GLM-5.3', enable: true, max_input_tokens: 180000 },
+    ],
+  }
+  const client = new QoderUpstreamClient({
+    region: 'global',
+    credential: async () => ({ userID: 'fixture', token: 'fixture-token' }),
+    fetchImpl: async () => new Response(JSON.stringify(directory), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }),
+  })
+  const ids = (await client.fetchModels()).map((model) => model.id)
+  assert.deepEqual(ids, ['auto', 'qmodel_38max', 'gmodel'],
+    'the four codenames are dropped; Auto and the named models are published')
+})
+
+/**
  * A forced pass does not collapse onto a background read that skipped the roster.
  *
  * `connect` skips the fetch whenever the cached roster is still fresh, so a

@@ -745,11 +745,26 @@ function qoderContextWindowOf(record: Record<string, unknown>): number | undefin
   return sizes.length === 0 ? undefined : Math.max(...sizes)
 }
 
+/**
+ * The routes Qoder lists beside its models without naming them.
+ *
+ * The global directory returns four entries whose display names are Qoder's own
+ * codenames — Ultimate, Efficient, Sonus, Cantus — and nothing in the payload
+ * marks them as different from a named model: same `source`, same `format`, same
+ * `is_editable`, and one of them even carries a promotion. Offered in the picker
+ * they read as four opaque names between Auto and Qwen3.8-Max. The keys are what
+ * Qoder's API has returned for them across versions, so they are matched by key
+ * on whichever directory lists them. The `auto` route stays: it is a model choice
+ * a user recognises, and it is the row the directory marks `is_default`.
+ */
+const QODER_UNNAMED_ROUTES = new Set(['ultimate', 'efficient', 'smodel', 'cmodel'])
+
 /** One directory row → one callable model, or undefined when unusable. */
 export function qoderModelOf(entry: unknown): QoderChatModel | undefined {
   if (entry === null || typeof entry !== 'object') return undefined
   const record = entry as Record<string, unknown>
   if (typeof record['key'] !== 'string' || record['key'].length === 0) return undefined
+  if (QODER_UNNAMED_ROUTES.has(record['key'])) return undefined
   if (record['enable'] === false) return undefined
   if (typeof record['display_name'] !== 'string' || record['display_name'].length === 0) return undefined
   const config = record['thinking_config'] as
