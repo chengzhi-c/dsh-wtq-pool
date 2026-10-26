@@ -47,6 +47,7 @@ const zh: Record<string, string> = {
   'card.open': '重新载入面板',
   'card.frameTitle': '账号池面板',
   'card.missing': '面板资源没有装好，重新安装这个插件即可。',
+  'card.probeFailed': '面板没有打开：',
 }
 
 const en: Record<string, string> = {
@@ -57,6 +58,7 @@ const en: Record<string, string> = {
   'card.open': 'Reload panel',
   'card.frameTitle': 'Account pool panel',
   'card.missing': 'The panel assets are missing; reinstalling this plugin restores them.',
+  'card.probeFailed': 'The panel did not open:',
 }
 
 interface CardProps {
@@ -78,6 +80,7 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
   const [generation, setGeneration] = React.useState(0)
   const [measured, setMeasured] = React.useState(0)
   const [missing, setMissing] = React.useState(false)
+  const [probeFailure, setProbeFailure] = React.useState<string | null>(null)
   const frameRef = React.useRef<HTMLIFrameElement | null>(null)
 
   const appearance = React.useMemo(() => {
@@ -105,15 +108,49 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
     if (view === 'summary') return undefined
     let live = true
     setMissing(false)
+    setProbeFailure(null)
     const attempts = 3
     const probe = (remaining: number): void => {
       fetch(`${PANEL_BASE}/panel.css`)
         .then((response) => {
           if (!live) return
-          if (response.ok || remaining <= 1) setMissing(!response.ok)
-          else setTimeout(() => probe(remaining - 1), 500)
+          if (response.ok) {
+            setMissing(false)
+            setProbeFailure(null)
+            return
+          }
+          if (remaining > 1) {
+            setTimeout(() => probe(remaining - 1), 500)
+            return
+          }
+          // A 404 is the host half still loading or missing its assets. Every
+          // other refusal says why (the loopback or origin guard), and sending
+          // those users to reinstall is advice that cannot work.
+          if (response.status === 404) {
+            setMissing(true)
+            setProbeFailure(null)
+            return
+          }
+          void response.text().then((body) => {
+            if (!live) return
+            let detail = ''
+            try {
+              const parsed = JSON.parse(body) as { error?: unknown }
+              detail = typeof parsed.error === 'string' ? parsed.error : ''
+            } catch { /* the status is the diagnosis */ }
+            setMissing(true)
+            setProbeFailure(detail === '' ? `HTTP ${response.status}` : `HTTP ${response.status}: ${detail}`)
+          }).catch(() => {
+            if (!live) return
+            setMissing(true)
+            setProbeFailure(`HTTP ${response.status}`)
+          })
         })
-        .catch(() => { if (live && remaining <= 1) setMissing(true) })
+        .catch(() => {
+          if (!live || remaining > 1) return
+          setMissing(true)
+          setProbeFailure(null)
+        })
     }
     probe(attempts)
     return () => { live = false }
@@ -130,6 +167,7 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
     if (view === 'summary') return undefined
     const frame = frameRef.current
     const measure = () => {
+      if (document.hidden === true) return
       const doc = frame === null ? null : frame.contentDocument
       // `body` is null between the new document being installed and its content
       // arriving, and the read below has no other guard. Measured there it threw,
@@ -170,7 +208,8 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
       }, t('card.open')),
     ),
     missing
-      ? React.createElement('div', { style: MISSING_STYLE }, t('card.missing'))
+      ? React.createElement('div', { style: MISSING_STYLE },
+        probeFailure === null ? t('card.missing') : `${t('card.probeFailed')} ${probeFailure}`)
       : React.createElement('iframe', {
         key: generation,
         ref: frameRef,

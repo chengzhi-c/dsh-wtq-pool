@@ -271,6 +271,16 @@ export function bridgeQoderStream(
   let sawToolCalls = false
   let emittedFinishReason = false
   let usage: Record<string, unknown> | undefined
+  // Qoder acknowledges and reports progress with frames that have no OpenAI
+  // shape. Relaying a comment keeps the downstream socket alive while those
+  // frames arrive and the client has nothing to read.
+  let lastKeepaliveAt = 0
+  const keepalive = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
+    const now = Date.now()
+    if (now - lastKeepaliveAt < 10_000) return
+    lastKeepaliveAt = now
+    controller.enqueue(encoder.encode(': keepalive\n\n'))
+  }
   const reader = source.getReader()
   let cancelled = false
   // A producer parked on a full queue waits for this; the consumer's next read
@@ -307,7 +317,10 @@ export function bridgeQoderStream(
   const consume = (payload: string, controller: ReadableStreamDefaultController<Uint8Array>): void => {
     if (finished) return
     const decoded = decodeQoderFrame(payload)
-    if (decoded.type === 'unknown') return
+    if (decoded.type === 'unknown') {
+      keepalive(controller)
+      return
+    }
     if (decoded.type === 'failure') {
       const { error } = classifyQoderFailure({ code: decoded.code, message: decoded.detail, retryAfterSeconds: decoded.retryAfterSeconds })
       throw error

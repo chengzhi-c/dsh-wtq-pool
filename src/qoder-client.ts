@@ -512,6 +512,12 @@ function textOf(content: unknown): string {
 function toQoderMessages(messages: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(messages)) return []
   const out: Array<Record<string, unknown>> = []
+  // Legacy `role: "function"` results carry the function name, not the call id.
+  // They are matched back to the assistant call they answer; a result nobody
+  // called is refused rather than dropped, because a model that cannot see the
+  // tool output it asked for repeats the call or answers from nothing.
+  const callsByName = new Map<string, string[]>()
+  const answered = new Set<string>()
   for (const raw of messages as Array<Record<string, unknown>>) {
     if (raw === null || typeof raw !== 'object') continue
     if (raw['role'] === 'system' || raw['role'] === 'developer') {
@@ -558,8 +564,26 @@ function toQoderMessages(messages: unknown): Array<Record<string, unknown>> {
         }
       }
       const entry: Record<string, unknown> = { role: 'assistant', content: textOf(raw['content']) }
-      if (toolCalls.length > 0) entry['tool_calls'] = toolCalls
+      if (toolCalls.length > 0) {
+        entry['tool_calls'] = toolCalls
+        for (const call of toolCalls) {
+          const name = String((call['function'] as Record<string, unknown>)['name'])
+          callsByName.set(name, [...(callsByName.get(name) ?? []), String(call['id'])])
+        }
+      }
       out.push(entry)
+      continue
+    }
+    if (raw['role'] === 'function') {
+      const name = raw['name']
+      const callId = typeof name === 'string'
+        ? (callsByName.get(name) ?? []).find((id) => !answered.has(id))
+        : undefined
+      if (callId === undefined) {
+        throw new Error(`toQoderMessages: function message "${typeof name === 'string' ? name : ''}" does not answer any assistant tool_call; the tool loop cannot match it`)
+      }
+      answered.add(callId)
+      out.push({ role: 'tool', tool_call_id: callId, content: textOf(raw['content']) })
       continue
     }
     if (raw['role'] === 'tool' || raw['role'] === 'toolResult') {
@@ -567,8 +591,13 @@ function toQoderMessages(messages: unknown): Array<Record<string, unknown>> {
       if (typeof toolCallId !== 'string' || toolCallId.length === 0) {
         throw new Error('toQoderMessages: tool result message is missing tool_call_id; it cannot be linked to the calling assistant turn')
       }
+      answered.add(toolCallId)
       out.push({ role: 'tool', tool_call_id: toolCallId, content: textOf(raw['content']) })
+      continue
     }
+    // Every other role is refused rather than dropped: a message that vanishes
+    // turns a broken client into a confident wrong answer.
+    throw new Error(`toQoderMessages: unsupported message role "${String(raw['role'])}"`)
   }
   return out
 }
@@ -840,6 +869,10 @@ export class QoderUpstreamClient {
       const model = qoderModelOf(raw)
       if (model !== undefined) models.push(model)
     }
+    // An empty roster is a failed read, not a directory that happens to list
+    // nothing: the host drops a provider whose discovery came back empty, and a
+    // 200 with no models also let the gateway cache it for its full TTL.
+    if (models.length === 0) throw new Error('Qoder model list contained no callable model')
     return models
   }
   private openApiBase(): string { return QODER_OPENAPI[this.options.region] }
@@ -981,8 +1014,13 @@ export class QoderUpstreamClient {
     let plain: string
     try {
       plain = buildQoderChatBody(openAiBody, model, options)
-    } catch {
-      return { ok: false, status: 400, kind: 'client', message: 'invalid JSON request' }
+    } catch (error: unknown) {
+      // Only a body that is not JSON is "invalid JSON request"; the envelope
+      // builder's own refusals name what the caller has to add (a tool result
+      // with no `tool_call_id`, a call with no name), and flattening those made
+      // the one fixable part of the message disappear.
+      const detail = error instanceof Error ? error.message : ''
+      return { ok: false, status: 400, kind: 'client', message: detail === '' ? 'invalid JSON request' : detail }
     }
     let credential: QoderClientCredential
     try {

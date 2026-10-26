@@ -8,7 +8,7 @@
  * identity, `fetchImpl`), so the whole path can be exercised offline.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessage, listedModels, pumpToResponse, readRequestBody, relayStreamOf, retryAfterHeader, writeJson, writeOpenAIError } from './loopback'
+import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessage, listedModels, pumpToResponse, readRequestBody, relayStreamOf, requestPathname, retryAfterHeader, writeJson, writeOpenAIError } from './loopback'
 import type { TraeCredential } from './trae-discovery'
 import type { TraeIdentity, TraeReasoningCapability, TraeSoloModel, TraeSoloVariant, TraeUpstreamErrorKind } from './trae-upstream'
 import { TraeSoloUpstreamClient, mergeTraeDirectory, traeVariantFor } from './trae-upstream'
@@ -104,7 +104,13 @@ function capabilityMapOf(models: readonly TraeSoloModel[]): Map<string, TraeReas
  */
 function functionGone(status: number, kind: TraeUpstreamErrorKind | undefined, message: string): boolean {
   if (kind === 'not_found') return true
-  return status === 400 && /"code"\s*:\s*"?4001\b/.test(message)
+  if (status !== 400) return false
+  // Two spellings reach here: the raw envelope when the refusal arrives as an
+  // HTTP body, and the prose `code 4001 · upstream: …` the in-stream bridge
+  // builds when the same refusal arrives as an SSE error frame. Only the first
+  // was recognised, so a stale function that answered in the stream failed the
+  // whole turn instead of handing it to another answer.
+  return /"code"\s*:\s*"?4001\b/.test(message) || /\bcode 4001\b/.test(message)
 }
 
 export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
@@ -457,7 +463,7 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!guardsPass(req, res)) return
-    const url = req.url ?? '/'
+    const url = requestPathname(req.url)
     if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
       const credentials = await options.credentials().catch(() => [])
       writeJson(res, 200, { ok: true, source: 'trae', credentials: credentials.length, models: cachedModels.length })

@@ -32,6 +32,16 @@
         trae: { claimed: 1, skipped: 0, failed: 0 },
       },
     },
+    // The keep-alive is a duty of its own, reported on its own card: what its
+    // last run did and when. It sits beside the check-in in the status document
+    // rather than inside it, the same way the panel draws it.
+    keepAlive: {
+      at: iso(-0.05),
+      refreshed: 2,
+      fresh: 3,
+      failed: 0,
+      noToken: 0,
+    },
     preferredAccountIds: { cn: 'wb-cn-1', global: '' },
     removedAccounts: [],
     declaration: { ok: true, changed: false, providerCount: 6 },
@@ -111,6 +121,27 @@
         disabled: false,
         credits: { total: 980, packages: [{ packageName: 'Top-up', remain: 980, size: 1000, validDays: 30 }] },
         checkin: { active: true, todayCheckedIn: false, streakDays: 3, dailyCredit: 20, todayCredit: 0 },
+      },
+      {
+        id: 'wb-cn-4',
+        label: 'qi.cn@example.com',
+        region: 'cn',
+        // A sign-in the upstream refused. Its own expiry still reads as weeks
+        // away, which is why the refusal used to stay invisible until a read
+        // spent an upstream call on it: the upstream revokes the session the
+        // sign-in belongs to without rewriting the token's expiry.
+        expiresAt: iso(12),
+        cooling: true,
+        cooldownUntil: new Date(Date.now() + 6 * 3600 * 1000).toISOString(),
+        // What the panel renders the row from: the refused sign-in, and the
+        // hold that stops every pass from paying for it again.
+        hold: 'session',
+        rateLimitHits: 1,
+        active: false,
+        preferred: false,
+        disabled: false,
+        // No credits and no check-in state: the reads that would fill them are
+        // the ones the hold stands in front of.
       },
       {
         id: 'wb-global-1',
@@ -307,8 +338,8 @@
       { id: 'source-workbuddy', ok: true, detail: 'on' },
       { id: 'source-trae', ok: true, detail: 'on; 2 account(s) (cn x1, ai x1); serving cn: 2 model(s), ai: 1 model(s)' },
       { id: 'source-qoder', ok: true, detail: 'on; 2 account(s) (cn x1, global x1); serving cn: 1 model(s), global: 1 model(s)' },
-      { id: 'accounts', ok: true, detail: '4 account(s): lin.cn@example.com, du.cn@example.com, wu.cn@example.com, lin.intl@example.com' },
-      { id: 'rotation', ok: true, detail: '3 of 4 account(s) can serve a request now' },
+      { id: 'accounts', ok: true, detail: '5 account(s)' },
+      { id: 'rotation', ok: true, detail: '3 of 5 account(s) can serve a request now' },
       { id: 'host-registered-providers', ok: true, detail: 'the host is serving every provider this plugin declares' },
       { id: 'at-rest-key', ok: true, detail: 'no at-rest key failure' },
       { id: 'WTQ Pool (CN): endpoint', ok: true, detail: 'listening on http://127.0.0.1:42831/v1' },

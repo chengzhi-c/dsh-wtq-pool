@@ -10,13 +10,15 @@
  * - A pool with no account left answers the caller with the cause, not a 500.
  *
  * Every auth directory is a scratch one and every upstream is a stub, so nothing
- * here reaches the network or a real install.
+ * here reaches the network or a real install. It loads the sources through
+ * the same TypeScript transform the host builds with.
  */
 const assert = require('node:assert/strict')
-const { test, mock } = require('node:test')
+const { test } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+
 const { registerHooks } = require('node:module')
 const { fileURLToPath } = require('node:url')
 const ts = require('typescript')
@@ -26,6 +28,8 @@ const transpile = (source) => ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },
 }).outputText
 
+// The core imports its siblings without an extension, so the loader needs the
+// same `.ts` resolution the DSH entry builds against.
 registerHooks({
   resolve(specifier, context, next) {
     const ownSource = context.parentURL?.startsWith('file:') && fileURLToPath(context.parentURL).startsWith(path.join(root, 'src') + path.sep)
@@ -33,15 +37,13 @@ registerHooks({
   },
   load(url, context, next) {
     if (url.startsWith('file:') && url.endsWith('.ts')) return {
-      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')),
+      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')), 
     }
     return next(url, context)
   },
 })
 
-const {
-  WorkBuddyAccountPool,
-} = require('../src/accounts.ts')
+const { WorkBuddyAccountPool } = require('../src/accounts.ts')
 const { createWorkBuddyShim } = require('../src/shim.ts')
 
 const scratch = (label) => fs.mkdtempSync(path.join(os.tmpdir(), `dsh-pool-${label}-`))
@@ -77,11 +79,9 @@ test('a cooldown that lapses puts the account back in rotation', async () => {
 
   // Past the window rather than a sleep: the check asks the pool what it thinks
   // now, which is the same question the next request asks.
-  const later = Date.now() + 400
-  const again = pool.available(later, undefined, 'cn')
+  const again = pool.available(Date.now() + 400, undefined, 'cn')
   assert.deepEqual(again.map((entry) => entry.id), [account.id],
     'once the window has lapsed the account is usable again, or one 429 retires it for the life of the process')
-  assert.equal(pool.acquire === undefined, false)
 })
 
 test('a per-model cooldown leaves the account\'s other models usable', async () => {
@@ -118,18 +118,26 @@ test('a balance read releases a spent hold and leaves a dead session held', asyn
   const after = pool.available(now + 10, undefined, 'cn').map((entry) => entry.id)
   assert.deepEqual(after, [spent.id],
     'the spent account comes back; releasing the dead session on a balance read put a 401 back at the head of the queue every probe cycle')
+
+  // The panel's "clear all cooldowns" is the manual way out of both holds, and
+  // it is the only thing that releases a session hold without a new sign-in.
+  pool.resetCooldowns()
+  assert.equal(pool.activeHold(dead.id), null, 'a manual reset drops the session hold itself, not just its window')
+  assert.deepEqual(pool.available(now + 20, undefined, 'cn').map((entry) => entry.id).sort(), [spent.id, dead.id].sort(),
+    'a manual reset releases the session hold too')
 })
 
-test('a session hold waits for the sign-in file to change, not for a refresh', async () => {
+test('a session hold is released by a sign-in minted after the refusal', async () => {
   const dir = scratch('session-release')
   const file = writeSignIn(dir, 'workbuddy-desktop', '90000000110')
-  // The pool mints its own tokens when the upstream reports a dead session. That
-  // refresh is not a re-login, and it is the shape the release used to confuse
-  // with one: the in-memory token changed, the file on disk did not.
+  // The pool mints its own tokens when it renews a sign-in. A refusal recorded
+  // before that renewal names the token the files held then, so the minted token
+  // is a sign-in the refusal never named and the account gets to serve with it.
+  // That is the difference between "sign in again" and an account the pool can
+  // already serve.
   const pool = poolOf([dir], {
-    // The host always provides one, and the archive it enables is what a refresh
-    // writes into. Without it the "a refresh is not a re-login" half of this case
-    // would be a no-op.
+    // The host always provides one, and the archive it enables is where a refresh
+    // of this sign-in lands (the desktop's own file is not written to).
     dataPath: () => path.join(dir, 'data'),
     client: {
       refreshToken: async () => ({ accessToken: 'token-minted-by-the-pool', expiresInSec: 3600 }),
@@ -137,16 +145,20 @@ test('a session hold waits for the sign-in file to change, not for a refresh', a
     },
   })
   const [account] = await pool.scan()
-  assert.equal(await pool.refreshAccount(account.id), true, 'the pool refreshed the token in memory')
   pool.penalize(account.id, Date.now() + 60_000, undefined, 'session')
   assert.equal(pool.available(Date.now(), undefined, 'cn').length, 0, 'the account is out')
+  assert.equal(await pool.refreshAccount(account.id), true, 'the pool mints a token for it anyway')
+  await pool.scan()
+  assert.equal(pool.available(Date.now() + 10, undefined, 'cn').length, 1,
+    'a sign-in the refusal did not name puts the account back')
 
-  // A rescan of the same files: nothing the user did changed on disk, so the hold
-  // stands. Releasing here put a refused account back at the head of the queue
-  // every scan and spent an upstream call discovering it was still refused.
+  // That chance is not free. Once the upstream refuses the copy now in force, the
+  // hold names it, and a rescan of the same files does not release it again: the
+  // retry loop the old rule was guarding against is still guarded.
+  pool.penalize(account.id, Date.now() + 60_000, undefined, 'session')
   await pool.scan()
   assert.equal(pool.available(Date.now() + 10, undefined, 'cn').length, 0,
-    'a rescan of unchanged files must not release the hold')
+    'the sign-in that was refused is not tried again on every scan')
 
   // What a re-login does leave behind: the file now holds a different sign-in.
   fs.writeFileSync(file, JSON.stringify({
@@ -163,11 +175,28 @@ test('a session hold waits for the sign-in file to change, not for a refresh', a
     'signing in again releases the hold, which is the remedy the docs promise')
 })
 
+test('a session hold on an account the archive serves survives a scan', async () => {
+  const dir = scratch('archive-hold')
+  const file = writeSignIn(dir, 'workbuddy-desktop', '90000000121')
+  const pool = poolOf([dir], { dataPath: () => path.join(dir, 'data') })
+  const [account] = await pool.scan()
+  // The client switches accounts: its one live file is overwritten, and this
+  // account now lives in the archive alone. Nothing on disk can prove a re-login
+  // for it, so a scan must not read "no file changed" as "the sign-in is fine".
+  fs.unlinkSync(file)
+  await pool.scan()
+  pool.penalize(account.id, Date.now() + 60_000, undefined, 'session')
+  assert.equal(pool.available(Date.now(), undefined, 'cn').length, 0, 'the refused account is out')
+  await pool.scan()
+  assert.equal(pool.available(Date.now() + 10, undefined, 'cn').length, 0,
+    'a hold no file can clear must survive a scan, or every scan retries a dead sign-in')
+})
+
 test('a re-login is served, not the live sign-in it replaced', async () => {
   // The shape the desktop app leaves behind: its own live file, plus a panel
-  // sign-in for the same account. A live file outranks a panel sign-in in the
-  // ordering whatever their issue times, so releasing the hold is not enough on
-  // its own - the account also has to stop sending the token that was refused.
+  // sign-in for the same account. Releasing the hold is not enough on its own: the
+  // refused live token is still on disk, and a ranking that forgot the refusal
+  // would serve it again one scan later.
   const live = scratch('live-refused')
   const own = scratch('panel-relogin')
   writeSignIn(live, 'workbuddy-desktop', '90000000111')
@@ -432,7 +461,6 @@ test('a pool with every account cooling answers the cause, not a 500', async () 
   const pool = poolOf([dir], { cooldownMs: 60_000 })
   await pool.scan()
 
-  const answers = []
   const shim = createWorkBuddyShim({
     pool,
     region: 'cn',
@@ -451,16 +479,19 @@ test('a pool with every account cooling answers the cause, not a 500', async () 
   await shim.ready
   try {
     const [account] = pool.list('cn')
-    // Cool the only account, then ask for a turn.
     pool.penalize(account.id, Date.now() + 60_000, 'hy3')
-    const body = JSON.stringify({ model: 'hy3', messages: [{ role: 'user', content: 'hi' }] })
-    const response = await callShim(shim, '/v1/chat/completions', body, answers)
+    const response = await fetch(`${shim.baseUrl().replace(/\/v1$/, '')}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'hy3', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const text = await response.text()
     // Exactly the retryable answer: the only account is rate-limited, and the
     // status, the code and the deadline all come from that one reason.
     assert.equal(response.status, 429,
-      `a rate-limited pool must answer 429, not hand the caller a turn failure (got ${response.status} ${answers.at(-1)})`)
+      `a rate-limited pool must answer 429, not hand the caller a turn failure (got ${response.status} ${text.slice(0, 160)})`)
     assert.equal(response.headers.get('retry-after'), '60', 'and say how long the wait is')
-    const parsed = JSON.parse(answers.join(''))
+    const parsed = JSON.parse(text)
     assert.equal(parsed.error.code, 'soft_rate')
     assert.equal(typeof parsed.error.message, 'string')
     assert.ok(parsed.error.message.length > 0, 'and the message has to name the reason')
@@ -468,15 +499,3 @@ test('a pool with every account cooling answers the cause, not a 500', async () 
     await shim.close()
   }
 })
-
-/** Drive one shim request through a real loopback listen. */
-async function callShim(shim, route, body, sink) {
-  const response = await fetch(`${shim.baseUrl().replace(/\/v1$/, '')}${route}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body,
-  })
-  const text = await response.text()
-  sink.push(text)
-  return response
-}

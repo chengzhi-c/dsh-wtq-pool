@@ -107,15 +107,6 @@ function qoderMachineOs(platform: NodeJS.Platform = process.platform, arch: stri
   return arch === 'arm64' ? 'aarch64_linux' : 'x86_64_linux'
 }
 
-export interface CosyHeaderOptions {
-  /** Seconds since epoch; injectable so a signature can be reproduced. */
-  nowSeconds?: () => number
-  /** UUID source; injectable for the same reason. */
-  uuid?: () => string
-  /** Per-request AES key material; injectable to keep tests deterministic. */
-  aesKey?: string
-}
-
 /** AES-128-CBC encrypt with the key doubling as the IV, base64-encoded. */
 function aesEncryptCBCBase64(plaintext: string, keyString: string): string {
   const key = Buffer.from(keyString)
@@ -134,11 +125,9 @@ export function buildCosyAuthHeaders(
   body: Buffer,
   url: string,
   credential: QoderClientCredential,
-  options: CosyHeaderOptions = {},
 ): Record<string, string> {
-  const uuid = options.uuid ?? randomUUID
   // 16 characters = the 16-byte AES-128 key the gateway unwraps from Cosy-Key.
-  const aesKey = options.aesKey ?? uuid().replace(/-/g, '').slice(0, 16)
+  const aesKey = randomUUID().replace(/-/g, '').slice(0, 16)
   const infoB64 = aesEncryptCBCBase64(
     JSON.stringify({
       uid: credential.userID,
@@ -154,10 +143,11 @@ export function buildCosyAuthHeaders(
     Buffer.from(aesKey),
   ).toString('base64')
 
-  const timestamp = Math.floor((options.nowSeconds ?? (() => Date.now() / 1000))()).toString()
+  const timestamp = Math.floor(Date.now() / 1000).toString()
+  const requestId = randomUUID()
   const payloadB64 = Buffer.from(JSON.stringify({
     version: 'v1',
-    requestId: uuid(),
+    requestId,
     info: infoB64,
     cosyVersion: COSY_VERSION,
     ideVersion: '',
@@ -196,6 +186,6 @@ export function buildCosyAuthHeaders(
     'Cosy-Organization-Id': '',
     'Cosy-Organization-Tags': '',
     'Login-Version': LOGIN_VERSION,
-    'X-Request-Id': uuid(),
+    'X-Request-Id': randomUUID(),
   }
 }

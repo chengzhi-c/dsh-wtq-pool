@@ -1,14 +1,14 @@
 {
   "rendered": {
-    "renderer/index.html": "cea661fdf93fd7c0b08038c60a98adb94ed38666560f78b8fffe95dfe568674c",
-    "renderer/panel.js": "9c8f1e1a7a9a8a2c27860bc7adc1c26764195781bfcd8da2a4d6a68360a4e71f",
-    "renderer/panel.css": "8995968b07fd38055a79da348e9c22833daadc83517319dfc21045dc8cb6ec89"
+    "renderer/index.html": "5b730a464c10288e5186a71b2e6d917368946d6dc3d2afcc6eebd84ba99caae2",
+    "renderer/panel.js": "5eecf8a35d5a3c2f67b4ddabcc74b66d46b4f7676a924f6b4e017c4096674108",
+    "renderer/panel.css": "e7bbfba0e9134347cc178a27fd6497c73b3d452df3b4f4c8fddcf9f93732054e"
   },
   "shots": {
-    "preview-pool.png": "4a88c557b785d040c906de04b678e1742dc0529bc68cfc12f1ae3e4308ccf661",
-    "preview-dark.png": "c3f48ff316cbb20ed89260cbbc74d6c1f5b2043f82ee7ac95df0d4e25d0a2f91",
-    "preview-models.png": "30a8888ec2b621bf9656dd33d53df89623ad8155e7f471d7314ea6b3bbb976cb",
-    "preview-growth.png": "9fad38859e6f0608ac873c1bfac9c144366e84151708a980063dab351a385985",
-    "preview-page.png": "53b573405a9880cdd3dcb8e5caf67e63161e247dc1ad94fb22812ac3ea2678d7"
+    "preview-pool.png": "ebcce78f0315cd20d4182bd835265fbd613eacf0397272001b2c3ef20e033034",
+    "preview-dark.png": "f6a2f071a3012bf9550535e5fc209e6b18c54554252afe0f41a19a705bdba047",
+    "preview-models.png": "25951efdd399acb8d0c169aa4015156fde818f5b78cf390e55aafe3eb52e43ae",
+    "preview-growth.png": "e1717103cc8ec3e39694a5f114d53d13e4fc3a0807e2419abea5b95ecffdb0ea",
+    "preview-page.png": "e7544abc5ee0095ab790e50d34629150138c6fb78d501089b5210560d93b2780"
   }
 }

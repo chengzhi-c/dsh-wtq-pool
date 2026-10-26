@@ -513,7 +513,6 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
 .source-head .checkin-all { margin-left: auto; }
 .source-accounts .card { margin-bottom: 8px; }
 .source-foot { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12.5px; margin-top: 4px; }
-
 .card {
   border: 1px solid var(--xd-border);
   border-radius: var(--xd-radius);
@@ -521,7 +520,6 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
   padding: 12px 14px;
   margin-bottom: 10px;
 }
-
 .card-head {
   display: flex;
   align-items: center;
@@ -614,6 +612,7 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
  */
 .badge.ok { color: var(--xd-muted); }
 .badge.cool { color: var(--xd-warn); border-color: color-mix(in srgb, var(--xd-warn) 40%, transparent); }
+.badge.dead { color: var(--xd-danger); border-color: color-mix(in srgb, var(--xd-danger) 45%, transparent); }
 .badge.next { color: var(--xd-accent); border-color: color-mix(in srgb, var(--xd-accent) 40%, transparent); }
 .badge.free { color: var(--xd-ok); }
 .badge.off { color: var(--xd-muted); border-style: dashed; }
@@ -1177,13 +1176,19 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
 
 .finding {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   align-items: baseline;
   padding: 6px 0;
   border-bottom: 1px solid var(--xd-line);
 }
 .finding:last-child { border-bottom: 0; }
-.finding-id { font-family: ui-monospace, Consolas, "Cascadia Mono", monospace; font-size: 12.5px; min-width: 200px; }
+.finding-id {
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+  font-size: 12.5px;
+  min-width: 200px;
+  overflow-wrap: anywhere;
+}
 .finding-pass, .finding-fail {
   flex: none;
   font-size: 11px;
@@ -1194,7 +1199,13 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
 }
 .finding-pass { color: var(--xd-ok); border: 1px solid color-mix(in srgb, var(--xd-ok) 35%, transparent); }
 .finding-fail { color: var(--xd-danger); border: 1px solid color-mix(in srgb, var(--xd-danger) 40%, transparent); }
-.finding-detail { color: var(--xd-muted); font-size: 12.5px; flex: 1; }
+.finding-detail {
+  flex: 1 1 220px;
+  min-width: 0;
+  color: var(--xd-muted);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
 
 .report {
   margin-top: 10px;

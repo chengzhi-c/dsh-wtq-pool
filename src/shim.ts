@@ -17,9 +17,9 @@
 
 import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { WorkBuddyAccount, WorkBuddyAccountPool } from './accounts'
+import { POOL_HOLD_MS, type WorkBuddyAccount, type WorkBuddyAccountPool } from './accounts'
 import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog'
-import { parseRateLimitReset, WorkBuddyUpstreamClient, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream'
+import { isHardCreditText, parseRateLimitReset, WorkBuddyUpstreamClient, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream'
 import { SseDecoder } from './trae-sse'
 
 export interface ShimLogger {
@@ -66,8 +66,19 @@ export interface WorkBuddyShimOptions {
  * Loopback guards, the request body bound and the server shell live in
  * `./loopback` — one copy, shared with the Trae and Qoder gateways.
  */
-import { boundedRetryAfterSeconds, createLoopbackServer, guardsPass, isJsonContentType, listedModels, readRequestBody, relayStreamOf, safeMessage, unapprovedChannelRefusal, writeJson, writeOpenAIError } from './loopback'
+import { boundedRetryAfterSeconds, createLoopbackServer, guardsPass, isJsonContentType, listedModels, PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, readRequestBody, relayStreamOf, requestPathname, safeMessage, unapprovedChannelRefusal, writeChunk, writeJson, writeOpenAIError } from './loopback'
 import { LOG_PREFIX } from './log'
+
+/** Whether one SSE data frame carries a non-null `finish_reason`. */
+function carriesFinishReason(data: string): boolean {
+  try {
+    const parsed = JSON.parse(data) as { choices?: Array<{ finish_reason?: unknown }> }
+    return Array.isArray(parsed.choices)
+      && parsed.choices.some(choice => typeof choice?.finish_reason === 'string' && choice.finish_reason !== '')
+  } catch {
+    return false
+  }
+}
 /** HTTP status each upstream failure class surfaces as. */
 const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   hard_credit: 402,
@@ -77,8 +88,37 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   not_found: 502,
   server: 502,
   client: 400,
+  model_tier: 400,
+  account_restricted: 403,
   transport: 502,
   aborted: 499,
+}
+
+/**
+ * How long one account keeps a model it is not entitled to out of rotation.
+ *
+ * A plan does not change inside a working day, and the upstream names no
+ * window of its own. A day is long enough that the gate costs one refusal per
+ * account per day, and short enough that a plan bought later comes back
+ * without a restart.
+ */
+const MODEL_TIER_HOLD_MS = 24 * 60 * 60 * 1000
+
+/**
+ * The business code an account-level 200 envelope carries.
+ *
+ * `classifyUpstreamError` only reads codes on the statuses the upstream uses
+ * for failures, so a refusal wearing a 200 was classed `client` and answered as
+ * a one-off 502. These are the codes that make it the same account property a
+ * non-200 answer would carry.
+ */
+function classifyEnvelopeCode(code: string | undefined, text: string): UpstreamErrorKind | undefined {
+  if (code === '6004') return 'soft_rate'
+  if (code === '11158') return 'model_tier'
+  if (code === '11140') return 'account_restricted'
+  if (code === '12153') return 'session_dead'
+  if (isHardCreditText(text)) return 'hard_credit'
+  return undefined
 }
 
 
@@ -100,6 +140,73 @@ function conversationKeyOf(raw: string): string | undefined {
     return undefined
   }
   return undefined
+}
+
+/**
+ * Read enough of a 200 body to tell an SSE stream from a refusal wearing a 200.
+ *
+ * WorkBuddy answers a refusal with a JSON envelope and an upstream hiccup can
+ * end the body before the first frame; both leave the status code claiming
+ * success. The head is what decides: a body that opens with `{` or `[` is the
+ * envelope, a body that already ended empty is no answer at all, and anything
+ * else is relayed as the stream it claims to be.
+ *
+ * The bytes the peek took are returned so the relay can put them back in front.
+ */
+async function peekAnswerHead(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<{ head: Uint8Array[]; ended: boolean; refusal?: string; code?: string }> {
+  const head: Uint8Array[] = []
+  const decoder = new TextDecoder()
+  let text = ''
+  let bytes = 0
+  let ended = false
+  let jsonLooking = false
+  for (;;) {
+    const next = await reader.read()
+    if (next.done) {
+      ended = true
+      break
+    }
+    head.push(next.value)
+    bytes += next.value.byteLength
+    text += decoder.decode(next.value, { stream: true })
+    const trimmed = text.replace(/^\uFEFF/, '').trimStart()
+    if (trimmed === '') {
+      // Nothing but whitespace so far: keep reading within the same bounds the
+      // sibling gateways peek with, so a silent upstream cannot park the turn.
+      if (bytes >= PEEK_MAX_BYTES || head.length >= PEEK_MAX_CHUNKS) break
+      continue
+    }
+    jsonLooking = trimmed.startsWith('{') || trimmed.startsWith('[')
+    if (!jsonLooking) break
+    // An envelope is read whole before it is judged, bounded: one that never
+    // ends is reported as a refusal rather than relayed as a stream.
+    if (ended || bytes >= PEEK_MAX_BYTES / 8 || head.length >= PEEK_MAX_CHUNKS) break
+  }
+  const trimmed = text.replace(/^\uFEFF/, '').trim()
+  if (trimmed === '' && ended) {
+    return { head, ended, refusal: 'workbuddy returned an empty answer stream' }
+  }
+  if (!jsonLooking) return { head, ended }
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>
+    const code = parsed['code'] ?? parsed['errCode'] ?? parsed['errorCode']
+    const msg = parsed['msg'] ?? parsed['message'] ?? parsed['error']
+    const detail = typeof msg === 'string' && msg.trim() !== '' ? msg.trim() : ''
+    const named = code === undefined || code === null || code === 0 || code === '0' ? '' : `code ${String(code)}`
+    const sentence = [named, detail].filter(part => part !== '').join(' · ')
+    return {
+      head,
+      ended,
+      refusal: sentence === ''
+        ? 'workbuddy answered 200 with a JSON body where a stream was expected'
+        : `workbuddy answered 200 with ${sentence}`,
+      ...named === '' ? {} : { code: String(code) },
+    }
+  } catch {
+    return { head, ended, refusal: `workbuddy answered 200 with a body that is neither a stream nor an envelope: ${safeMessage(trimmed.slice(0, 200))}` }
+  }
 }
 
 /**
@@ -178,24 +285,13 @@ function isContextTooLong(body: string): boolean {
 /**
  * How long a spent or dead session is held out of rotation.
  *
- * Neither condition clears by itself: the credit balance has to change, or the
- * user has to sign in again. The configured cooldown window is sized for a
- * limit that expires, and using it here put a spent account back at the head of
- * the queue every minute, where it failed again and burned the attempts of the
- * healthy accounts behind it. This hold is a fallback, not a verdict: a manual
- * cooldown reset, a re-scan and a balance read that finds credits again all
- * release it.
- */
-const SPENT_ACCOUNT_HOLD_MS = 6 * 60 * 60 * 1000
-
-/**
- * The hold as the absolute reset `penalize` expects.
- *
- * `penalize` takes a timestamp, not a duration: handing it the duration put the
- * reset in 1970, which reads as already past and falls back to the configured
+ * `penalize` takes an absolute reset rather than a duration, and the duration
+ * itself lives with the pool that owns the hold: see `POOL_HOLD_MS` in
+ * `./accounts`. Handing the duration straight to `penalize` once put the reset
+ * in 1970, which reads as already past and falls back to the configured
  * cooldown, so the hold never took effect at all.
  */
-const spentAccountHoldUntil = (): number => Date.now() + SPENT_ACCOUNT_HOLD_MS
+const holdUntil = (): number => Date.now() + POOL_HOLD_MS
 
 /** Turn an upstream `Retry-After` (seconds) into the absolute reset `penalize` wants. */
 function resetFromRetryAfter(seconds: number | undefined): number | undefined {
@@ -251,6 +347,22 @@ export function unavailableAnswer(
   if (only === 'rate-limited') {
     return { status: 429, code: 'soft_rate', detail: `every account is rate-limited for model ${modelId}`, retryAfterSeconds }
   }
+  // Steady state, not just the discovering turn: the first refusal explains
+  // itself from the rotation loop, and every request after it lands here.
+  if (only === 'plan') {
+    return {
+      status: 400,
+      code: 'model_tier',
+      detail: `no WorkBuddy account has model ${modelId} in its plan; pick another model, or add an account whose plan includes it`,
+    }
+  }
+  if (only === 'restricted by the upstream') {
+    return {
+      status: 403,
+      code: 'account_restricted',
+      detail: 'every WorkBuddy account was restricted by the upstream; appeal the restriction in the WorkBuddy console, or add another account',
+    }
+  }
   const detail = only === 'sign-in expired'
     ? 'every WorkBuddy sign-in for this gateway has expired; sign in again in the desktop app'
     : only === 'sign-in refused'
@@ -274,7 +386,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!guardsPass(req, res)) return
-    const url = req.url ?? '/'
+    const url = requestPathname(req.url)
     if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
       writeJson(res, 200, { ok: true, pool: pool.status() })
       return
@@ -352,12 +464,11 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     const tried: string[] = []
     let last: { kind: UpstreamErrorKind; status: number; message: string } | undefined
     let exhaustedByRateLimit = false
-    // Built once: the retry below is the only caller, and the answer does not
-    // change inside one request.
-    const effortFallback = (() => {
-      const effort = declaredEffortOf(catalog, modelId)
-      return effort === undefined ? undefined : withReasoningEffort(prepared, effort)
-    })()
+    // Built on first use: the retry below is the only caller, and the answer does
+    // not change inside one request. Every request would otherwise pay a full
+    // parse+stringify of the whole conversation for a branch almost none take.
+    let effortFallback: string | undefined
+    let effortFallbackBuilt = false
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (controller.signal.aborted) return
@@ -379,14 +490,22 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
               ? `every WorkBuddy account is out of credits${model}`
               : last.kind === 'session_dead'
                 ? `every WorkBuddy sign-in is no longer accepted${model}`
-                : last.kind === 'transport'
-                  ? `the upstream host could not be reached on any account${model}`
-                  : `every account is rate-limited${model}`
+                : last.kind === 'model_tier'
+                  ? `no WorkBuddy account can use model ${modelId}`
+                  : last.kind === 'account_restricted'
+                    ? 'every WorkBuddy account was restricted by the upstream'
+                    : last.kind === 'transport'
+                      ? `the upstream host could not be reached on any account${model}`
+                      : `every account is rate-limited${model}`
           const advice = last.kind === 'soft_rate'
             ? 'resets at the upstream window'
-            : last.kind === 'transport'
-              ? 'check the connection to the upstream host'
-              : 'sign in again in the desktop app'
+            : last.kind === 'model_tier'
+              ? 'pick another model, or add an account whose plan includes it'
+              : last.kind === 'account_restricted'
+                ? 'appeal the restriction in the WorkBuddy console, or add another account'
+                : last.kind === 'transport'
+                  ? 'check the connection to the upstream host'
+                  : 'sign in again in the desktop app'
           writeOpenAIError(
             res,
             KIND_STATUS[last.kind],
@@ -444,40 +563,44 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       // no effort at all and was rejected for it is served with the model's own
       // declared default. Retrying every 400 would spend a second upstream call
       // on requests that are genuinely malformed.
-      if (!result.ok && result.kind === 'client' && effortFallback !== undefined
+      if (!result.ok && result.kind === 'client'
         && PARAMETER_REJECTION.test(result.message) && !controller.signal.aborted) {
-        // Logged because the retry is invisible otherwise: a turn that took two
-        // upstream calls looks like a slow model unless the reason is written
-        // down somewhere.
-        logger?.info?.(`${LOG_PREFIX}: ${modelId} refused a request that named no effort; retrying with the model's declared default`)
-        result = await client.chatStream(account.credential, effortFallback, controller.signal)
+        if (!effortFallbackBuilt) {
+          effortFallbackBuilt = true
+          const effort = declaredEffortOf(catalog, modelId)
+          effortFallback = effort === undefined ? undefined : withReasoningEffort(prepared, effort)
+        }
+        if (effortFallback !== undefined) {
+          // Logged because the retry is invisible otherwise: a turn that took two
+          // upstream calls looks like a slow model unless the reason is written
+          // down somewhere.
+          logger?.info?.(`${LOG_PREFIX}: ${modelId} refused a request that named no effort; retrying with the model's declared default`)
+          result = await client.chatStream(account.credential, effortFallback, controller.signal)
+        }
       }
 
       if (result.ok) {
-        // A 200 with no stream body is a refusal the status code hides, exactly
-        // as the other two gateways treat it: answering it as an empty stream
-        // would leave the host waiting for a turn that never started.
-        if (result.response.body === null) {
-          writeOpenAIError(res, 502, 'upstream_error', 'workbuddy returned no stream')
-          return
-        }
-        logger?.info?.(`${LOG_PREFIX}: served by ${account.label}`)
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-          'X-Accel-Buffering': 'no',
-        })
-        // Headers before the first token: Node holds them until the first body
-        // write, so a slow or queued upstream showed the client no response at
-        // all until it produced something.
-        res.flushHeaders()
+        // The attached relay stream, not `response.body`: see `relayStreamOf`.
+        const reader = relayStreamOf(result.response).getReader()
         let sawDone = false
+        let sawFinish = false
+        let envelopeFailure: UpstreamErrorKind | undefined
         const decoder = new TextDecoder()
         const sse = new SseDecoder()
-        // The attached relay stream, not `response.body`: see `relayStreamOf`.
-        const relay = relayStreamOf(result.response)
-        const reader = relay.getReader()
+        const startStream = (): void => {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+          })
+          // Headers before the first token: Node holds them until the first body
+          // write, so a slow or queued upstream showed the client no response at
+          // all until it produced something. A 200 whose body is not a stream is
+          // decided before this, so that answer still reaches the caller as a
+          // status and a sentence instead of a stream that never starts.
+          res.flushHeaders()
+        }
         /**
          * End the relayed stream in a shape the client can finish on.
          *
@@ -511,6 +634,15 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         function closeWithoutDone(): void {
           if (sawDone || !res.writable) return
           logger?.warn?.(LOG_PREFIX + ': upstream stream ended without [DONE]')
+          // A truncated stream that carried content but no finish frame is a
+          // turn the client cannot close: the terminator alone leaves the last
+          // `finish_reason` null, which reads as a turn still in flight. The
+          // sibling bridges already send this frame before their terminator.
+          if (!sawFinish) {
+            res.write(`data: ${JSON.stringify({
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            })}\n\n`)
+          }
           res.end('data: [DONE]\n\n')
         }
 
@@ -522,20 +654,93 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
          * carries `[DONE]` is written out and the loop stops on it.
          */
         const relayLoop = (async (): Promise<void> => {
+          // A 200 is not a promise that an answer follows. Read the head before
+          // answering: an empty body, or the JSON envelope a channel check
+          // answers with, otherwise reached the client framed as a turn that
+          // never started, and the refusal sentence reached nobody.
+          let head: Uint8Array[] = []
+          let ended = false
+          try {
+            const peeked = await peekAnswerHead(reader)
+            head = peeked.head
+            ended = peeked.ended
+            if (peeked.refusal !== undefined) {
+              await reader.cancel().catch(() => {})
+              logger?.warn?.(`${LOG_PREFIX}: ${account.label} answered 200 with no stream: ${peeked.refusal}`)
+              const envelopeKind = classifyEnvelopeCode(peeked.code, peeked.refusal)
+              // A 200 envelope can still be an account-level refusal (a rate
+              // limit, a spent balance, a dead session, the 11158 plan gate).
+              // Answering it as one upstream 502 skipped rotation and left the
+              // account at the head of the queue, so the next request hit the
+              // same refusal while healthy accounts sat idle.
+              if (envelopeKind === 'soft_rate' || envelopeKind === 'hard_credit'
+                || envelopeKind === 'session_dead' || envelopeKind === 'account_restricted'
+                || envelopeKind === 'model_tier') {
+                last = { kind: envelopeKind, status: 200, message: peeked.refusal }
+                exhaustedByRateLimit = true
+                envelopeFailure = envelopeKind
+                if (envelopeKind === 'soft_rate') {
+                  pool.penalize(account.id, undefined, modelId)
+                } else if (envelopeKind === 'model_tier') {
+                  pool.blockModel(account.id, modelId, Date.now() + MODEL_TIER_HOLD_MS)
+                } else if (envelopeKind === 'session_dead' && await pool.refreshAccount(account.id)) {
+                  // The refresh token still worked, so the account is not dead:
+                  // the next attempt rides the new access token, exactly as the
+                  // non-200 session-dead path does.
+                } else {
+                  pool.penalize(account.id, holdUntil(), undefined,
+                    envelopeKind === 'hard_credit' ? 'spent'
+                      : envelopeKind === 'session_dead' ? 'session' : 'restricted')
+                }
+                return
+              }
+              writeOpenAIError(res, 502, 'upstream_error', peeked.refusal)
+              return
+            }
+          } catch (error: unknown) {
+            // A stream that dies before its first byte is the same mid-flight
+            // failure one frame later, so it ends in the same place: the client
+            // gets headers, an error frame and a terminator it can finish on.
+            startStream()
+            failInBand(error)
+            return
+          }
+          logger?.info?.(`${LOG_PREFIX}: served by ${account.label}`)
+          startStream()
+          let headIndex = 0
           try {
             for (;;) {
-              const { done, value } = await reader.read()
-              if (done) break
+              // The bytes the peek already took are replayed first, in order.
+              const replayed = headIndex < head.length ? head[headIndex++] : undefined
+              const { done, value } = replayed !== undefined
+                ? { done: false, value: replayed }
+                : ended ? { done: true, value: undefined } : await reader.read()
+              if (done || value === undefined) break
               if (!res.writable) return
-              res.write(value)
+              // Honours the client's socket: writing past a full buffer would
+              // park the whole answer in this process instead of slowing the read
+              // from the upstream, as the two sibling gateways already do.
+              await writeChunk(res, value)
               try {
                 const decoded = decoder.decode(value, { stream: true })
-                if (sse.push(decoded).some(event => event.data === '[DONE]')) {
-                  // The terminal frame is the last thing the client needs. Ending
-                  // the response here is what closes the turn: `closeWithoutDone`
-                  // deliberately does nothing once `[DONE]` has been seen. The
-                  // upstream is cancelled rather than drained, so a stream that
-                  // keeps talking after its terminator is not read any further.
+                const events = sse.push(decoded)
+                if (!sawFinish && events.some(event => carriesFinishReason(event.data))) sawFinish = true
+                if (events.some(event => event.data === '[DONE]')) {
+                  // The terminal frame is the last thing the client needs. A
+                  // stream that sent content but no finish frame gets one here,
+                  // before the terminator, or the last `finish_reason` stays
+                  // null and the turn reads as unfinished.
+                  if (!sawFinish && res.writable) {
+                    res.write(`data: ${JSON.stringify({
+                      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                    })}\n\n`)
+                    sawFinish = true
+                  }
+                  // Ending the response here is what closes the turn:
+                  // `closeWithoutDone` deliberately does nothing once `[DONE]`
+                  // has been seen. The upstream is cancelled rather than
+                  // drained, so a stream that keeps talking after its
+                  // terminator is not read any further.
                   sawDone = true
                   if (res.writable) res.end()
                   await reader.cancel().catch(() => {})
@@ -551,6 +756,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                 const rest = decoder.decode()
                 const events = rest === '' ? sse.finish() : [...sse.push(rest), ...sse.finish()]
                 if (events.some(event => event.data === '[DONE]')) sawDone = true
+                if (events.some(event => carriesFinishReason(event.data))) sawFinish = true
               } catch {
                 // Same as above: the frames already relayed stand.
               }
@@ -565,7 +771,11 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
             try { reader.releaseLock() } catch { /* already released */ }
           }
         })()
-        return await relayLoop
+        await relayLoop
+        // The peek found an account-level refusal before any byte was sent, so
+        // the hold above is already applied and the next account gets the turn.
+        if (envelopeFailure === undefined) return
+        continue
       }
 
       last = { kind: result.kind, status: result.status, message: result.message }
@@ -591,14 +801,22 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
        * for hours over a transient block.
        *
        * A `transport` failure is the network path's, not the account's, so the
-       * next sign-in is tried as well. An `aborted` turn is the client's own
-       * doing and stops the loop immediately.
+       * rotation stops: every account here reaches the same host, and trying
+       * each one just spends another header timeout before answering. An
+       * `aborted` turn is the client's own doing and stops the loop too.
        */
       if (result.kind === 'aborted') break
 
+      if (result.kind === 'transport') {
+        last = { kind: result.kind, status: result.status, message: result.message }
+        exhaustedByRateLimit = true
+        break
+      }
+
       if (result.kind !== 'soft_rate' && result.kind !== 'waf_block'
         && result.kind !== 'hard_credit' && result.kind !== 'session_dead'
-        && result.kind !== 'transport') break
+        && result.kind !== 'model_tier'
+        && result.kind !== 'account_restricted') break
 
       exhaustedByRateLimit = true
       if (result.kind === 'soft_rate') {
@@ -617,6 +835,18 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           ? bodyReset
           : resetFromRetryAfter(result.retryAfter)
         pool.penalize(account.id, resetAtMs, modelId)
+      } else if (result.kind === 'model_tier') {
+        // The plan gate clears only when the subscription changes, so this model
+        // stays out of this account's rotation for a day rather than for the
+        // upstream's rate-limit window. The account itself is not cooled: it
+        // serves every other model, and parking it would take those away too.
+        pool.blockModel(account.id, modelId, Date.now() + MODEL_TIER_HOLD_MS)
+      } else if (result.kind === 'account_restricted') {
+        // The vendor restricted this account, and no retry with the same sign-in
+        // lifts it. It takes the hold rather than a cooldown: the window is a
+        // guess at when an operator might revisit the appeal, not a limit that
+        // expires, and the pool reports the reason rather than "rate-limited".
+        pool.penalize(account.id, holdUntil(), undefined, 'restricted')
       } else if (result.kind === 'hard_credit' || result.kind === 'session_dead') {
         // A spent account and a dead session do not come back on their own: the
         // credit balance has to change, or the user has to sign in again. The
@@ -632,7 +862,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         // account back to the head of the queue on every probe cycle.
         pool.penalize(
           account.id,
-          spentAccountHoldUntil(),
+          holdUntil(),
           undefined,
           result.kind === 'hard_credit' ? 'spent' : 'session',
         )

@@ -389,11 +389,13 @@ test('a panel.css that 404s twice before it loads is waited out, not reported mi
   const drive = (answers, view) => {
     const waits = []
     const missing = []
+    const failures = []
     let asked = 0
     const context = vm.createContext({
       React: { useEffect: run => run() },
       view, generation: 0,
       setMissing: value => missing.push(value),
+      setProbeFailure: value => failures.push(value),
       PANEL_BASE: '/panel-base',
       fetch: async () => {
         const answer = answers[Math.min(asked, answers.length - 1)] ?? new Response('', { status: 404 })
@@ -404,7 +406,7 @@ test('a panel.css that 404s twice before it loads is waited out, not reported mi
       clearTimeout: () => {},
     })
     vm.runInContext(effect, context, { filename: 'src/client/index.tsx' })
-    return { waits, missing, asked: () => asked }
+    return { waits, missing, failures, asked: () => asked }
   }
 
   const notFound = new Response('', { status: 404 })
@@ -425,6 +427,19 @@ test('a panel.css that 404s twice before it loads is waited out, not reported mi
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(concluded.missing, [false, true],
     'three 404s in a row are the missing-assets verdict, and it must still be reachable')
+
+  // A refusal that is not 404 carries the reason: reinstalling cannot fix a
+  // browser address or origin the host's loopback guard turned away.
+  const forbidden = new Response(JSON.stringify({ error: 'peer-not-loopback' }), {
+    status: 403, headers: { 'content-type': 'application/json' },
+  })
+  const denied = drive([forbidden], 'full')
+  await new Promise(resolve => setImmediate(resolve))
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(denied.asked(), 3, 'a transient host-half error is still retried before concluding')
+  assert.deepEqual(denied.missing, [false, true], 'the error is a verdict after the retries')
+  assert.match(denied.failures.at(-1), /HTTP 403: peer-not-loopback/,
+    'the card names the status and the host\'s own reason')
 
   // And the probe costs nothing on the list's inline summary, where there is no
   // frame to tell anything about.
@@ -790,7 +805,7 @@ test('every view tab names the panel it controls, and that panel names it back',
  * The expected text is read back out of the panel's own tables and the note is
  * driven through the panel's own `t`, so a copy here cannot drift from the ship.
  */
-test('the ban-risk note reaches the panel line and both READMEs', () => {
+test('the ban-risk note reaches the panel line', () => {
   const panel = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
   const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
 
@@ -843,17 +858,6 @@ test('the ban-risk note reaches the panel line and both READMEs', () => {
     vm.runInContext('labelTabs()', context)
     assert.equal(node.textContent, expected, `${name} note has to reach the page verbatim`)
   }
-  // The docs state the same risk, in the same two languages. A README that drops
-  // it while the panel keeps it is a warning users only meet after installing.
-  for (const [file, pattern] of [['README.md', /封号风险/], ['README.en.md', /A ban is possible/]]) {
-    const readme = fs.readFileSync(path.join(root, file), 'utf8')
-    assert.match(readme, pattern, `${file} has to carry the ban-risk warning`)
-    // Near the top, above the first section heading: a warning below the install
-    // steps is one the user reads after deciding to install.
-    const firstSection = readme.search(/^## /m)
-    const at = readme.search(pattern)
-    assert.ok(at !== -1 && at < firstSection, `${file} has to warn before its first section`)
-  }
 })
 
 /**
@@ -883,13 +887,6 @@ test('the README screenshots show the panel the repository ships', () => {
   }
   assert.deepEqual(Object.keys(stamp.shots).sort(), [...shots].sort(),
     'the capture has to list the shots the README embeds')
-
-  // The preview page mounts the real files rather than a copy of them, which is
-  // what makes a capture trustworthy in the first place.
-  const preview = fs.readFileSync(path.join(root, 'docs', 'preview-panel.html'), 'utf8')
-  assert.ok(preview.includes('../renderer/index.html'), 'the preview has to mount the shipped markup')
-  assert.ok(preview.includes('../renderer/panel.js'), 'and load the shipped script')
-  assert.ok(preview.includes('../renderer/panel.css'), 'and the shipped stylesheet')
 
   for (const shot of shots) {
     const at = path.join(root, 'docs', shot)

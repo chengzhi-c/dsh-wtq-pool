@@ -105,22 +105,26 @@
           <button type="button" id="autoHoursSave" class="small"></button>
           <button type="button" id="autoRunNow" class="small"></button>
         </div>
-        <!-- One button, by hand: the token keep-alive has no schedule, so there
-             is no switch to turn it on or off with. It sits on the same card as
-             the check-in because both walk the same accounts, but it has no
-             hour to set. -->
-        <div class="switch-row">
-          <button type="button" class="small" id="tokenKeepAliveRun"></button>
-          <span class="switch-copy">
-            <span class="switch-lead" id="keepAliveText"></span>
-            <span class="hint" id="keepAliveHint"></span>
-          </span>
-        </div>
         <!-- Its own box, below the controls rather than beside them: the lines
              are a log of what a pass did, and sharing a row with the hour field
              made both hard to read. -->
         <div class="hint log-box" id="autoNote"></div>
         <p class="hint" id="autoHint"></p>
+      </div>
+      <!-- A card of its own: the keep-alive renews tokens rather than collecting
+           rewards and has no hour to set, so sharing the check-in card made both
+           harder to read. -->
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title" id="keepAliveTitle"></span>
+        </div>
+        <div class="switch-row">
+          <button type="button" class="small" id="tokenKeepAliveRun"></button>
+          <span class="switch-copy">
+            <span class="hint" id="keepAliveHint"></span>
+          </span>
+        </div>
+        <div class="hint log-box" id="keepAliveNote"></div>
       </div>
     </section>
 

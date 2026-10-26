@@ -84,6 +84,9 @@ function loginHeaders(origin: string): Record<string, string> {
     'Referer': `${origin}/`,
     'User-Agent': LOGIN_UA,
     'X-Requested-With': 'XMLHttpRequest',
+    // The login channel pins its own build (`LOGIN_UA`), but it shares the CN
+    // origin with chat, so its token must not ride a pooled socket either.
+    'Connection': 'close',
   }
 }
 

@@ -52,6 +52,22 @@ export function hostIsLoopback(host: string | undefined): boolean {
   return LOOPBACK_HOSTS.has(hostnameOfHost(host))
 }
 
+/**
+ * The pathname of a request target.
+ *
+ * `req.url` keeps the query string and may be an absolute-form proxy target;
+ * routing compared it whole, so `?api-version=…` or `GET http://host/v1/…`
+ * answered 404 on every route.
+ */
+export function requestPathname(raw: string | undefined): string {
+  if (raw === undefined || raw === '') return '/'
+  try {
+    return new URL(raw, 'http://127.0.0.1').pathname
+  } catch {
+    return '/'
+  }
+}
+
 /** A present Origin must be loopback; non-browser clients send none and pass. */
 export function originIsLoopback(origin: string | undefined): boolean {
   if (origin === undefined || origin.trim() === '') return true
@@ -512,6 +528,28 @@ export function relayStreamOf(response: Response): ReadableStream<Uint8Array> {
   if (attached !== undefined) return attached
   if (response.body === null) throw new Error('response carries no body')
   return response.body as ReadableStream<Uint8Array>
+}
+
+/**
+ * Write one relayed chunk, waiting while the client's socket is full.
+ *
+ * A relay that ignores the false return of `res.write` keeps reading the
+ * upstream at full speed and parks the whole answer inside the plugin process,
+ * competing with the gateways and the panel for one event loop.
+ */
+export async function writeChunk(res: ServerResponse, chunk: Uint8Array): Promise<void> {
+  if (res.destroyed || res.writableEnded) return
+  if (res.write(Buffer.from(chunk))) return
+  if (res.destroyed) return
+  await new Promise<void>((resolve) => {
+    const wake = (): void => {
+      res.off('drain', wake)
+      res.off('close', wake)
+      resolve()
+    }
+    res.once('drain', wake)
+    res.once('close', wake)
+  })
 }
 
 /**

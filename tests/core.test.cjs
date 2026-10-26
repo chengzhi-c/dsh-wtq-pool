@@ -82,7 +82,10 @@ test('an account overwritten by the next global sign-in is kept and keeps servin
   assert.equal(accounts.length, 2, 'the overwritten account is still listed')
   const first = accounts.find(account => account.credential.uin === 'uin-first')
   const second = accounts.find(account => account.credential.uin === 'uin-second')
-  assert.equal(first?.archived, true, 'the overwritten account is marked archived')
+  // The international client keeps one live file and no snapshots, so nothing on
+  // disk holds this account any more: only the archive does. That is what the flag
+  // reports now.
+  assert.equal(first?.archived, true, 'the overwritten account lives in the archive alone')
   assert.equal(second?.archived, undefined, 'the live account is not archived')
   assert.deepEqual(
     pool.available(Date.now()).map(account => account.credential.uin).sort(),
@@ -492,4 +495,21 @@ test('a plain-text upstream body is redacted before it is relayed', () => {
   assert.doesNotMatch(plain, new RegExp(token), 'a body that is not JSON is redacted too')
   const envelope = liftUpstreamMessage(JSON.stringify({ error: 'bad token ' + token }))
   assert.doesNotMatch(envelope, new RegExp(token), 'a parsed envelope is redacted as before')
+})
+/**
+ * A Qoder signature draws its own request id.
+ *
+ * The id inside the signed payload and the request-id header are independent
+ * draws; collapsing them changes the bytes on every request and no other test
+ * would see it.
+ */
+test('a Qoder signature draws its own request id', () => {
+  const { buildCosyAuthHeaders } = require('../src/qoder-upstream.ts')
+  const credential = { userID: 'user-1', token: 'token-1', name: 'n', email: 'e@example.com', machineID: 'machine-1' }
+  const call = () => buildCosyAuthHeaders(Buffer.from('{}'), 'https://gateway.qoder.com.cn/v1/chat', credential)
+  const headers = call()
+  const payload = JSON.parse(Buffer.from(headers.Authorization.split('.')[1], 'base64').toString('utf8'))
+  assert.match(headers['X-Request-Id'], /^[0-9a-f-]{36}$/u, 'the header carries a uuid')
+  assert.notEqual(headers['X-Request-Id'], payload.requestId, 'the header and the signed payload do not share one id')
+  assert.notEqual(call()['X-Request-Id'], headers['X-Request-Id'], 'and each request draws a new one')
 })

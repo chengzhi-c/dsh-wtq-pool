@@ -178,6 +178,7 @@ test('a gateway that could not bind is reported as address drift', () => {
   const context = vm.createContext({
     runtimes: new Map(),
     gatewayStartFailures: new Map(),
+    sourceStartFailures: new Map(),
     publishedIds: new Set(),
     activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => [],
     PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn' },
@@ -198,6 +199,17 @@ test('a gateway that could not bind is reported as address drift', () => {
   context.publishedIds = new Set(['xdpool-cn'])
   assert.equal(drift(), true,
     'once the host holds the row, a gateway with no shim is drift')
+
+  // The same question for Trae/Qoder: their start failures have no map entry
+  // either, so comparing the maps alone called a dead provider healthy.
+  context.gatewayStartFailures = new Map()
+  context.publishedIds = new Set()
+  context.activeTraeRegions = () => ['cn']
+  context.TRAE_PROVIDER_ID_BY_REGION = { cn: 'xdpool-trae-cn' }
+  context.sourceStartFailures = new Map([['trae:cn', 'listen EADDRINUSE']])
+  assert.equal(drift(), false, 'a Trae first start that failed has nothing to drift from yet')
+  context.declaredSourceBaseUrl = () => 'http://127.0.0.1:42851'
+  assert.equal(drift(), true, 'once its row is published, a Trae gateway with no bind is drift')
 })
 
 test('DSH publishes the live gateway after its preferred port is occupied', async (t) => {

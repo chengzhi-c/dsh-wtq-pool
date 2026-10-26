@@ -11,10 +11,10 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import { tokenExpiryMs, regionOf, type WorkBuddyRegion } from './upstream'
+import { tokenExpiryMs, regionOf, upstreamErrorKind, type WorkBuddyRegion } from './upstream'
 import { encryptedFieldOpener, isEncryptedFieldWrapper } from './at-rest'
 import { LOG_PREFIX } from './log'
 
@@ -30,6 +30,15 @@ export interface TokenRefresher {
 
 /** Live auth file name the WorkBuddy desktop app writes. */
 const WORKBUDDY_LIVE_FILENAME = 'workbuddy-desktop.info'
+/**
+ * Live auth file name the international client writes.
+ *
+ * One file, no snapshots beside it: the client overwrites this one when the user
+ * switches accounts. Treating it as an abandoned snapshot had the pool take over
+ * the session the app was still signed into and renew it behind the app's back,
+ * which spends the rotation the app needed on its next refresh.
+ */
+const WORKBUDDY_GLOBAL_LIVE_FILENAME = 'workbuddy-desktop-ai.info'
 
 /** Env override for the auth file or its directory. */
 const WORKBUDDY_AUTH_FILE_ENV = 'WORKBUDDY_AUTH_FILE'
@@ -45,6 +54,15 @@ const WORKBUDDY_AUTH_FILE_ENV = 'WORKBUDDY_AUTH_FILE'
 const ARCHIVE_FILENAME = 'credentials-archive.json'
 /** Subdirectory of the plugin's own data root that holds the sign-ins it wrote. */
 const OWN_SIGN_IN_DIRNAME = 'signins'
+/**
+ * Sign-ins the user deleted, kept as a tombstone so a scan cannot resurrect them.
+ *
+ * Deleting only the file is not enough: the account's token is still in the
+ * archive, and the desktop client still keeps a superseded snapshot of it, so the
+ * next scan took the snapshot over and wrote the file straight back. The row never
+ * moved, and the delete read as a button that does nothing.
+ */
+const DELETED_SIGN_INS_FILENAME = 'deleted-signins.json'
 /** File-name prefix that marks one of those sign-ins as the plugin's own. */
 const OWN_SIGN_IN_PREFIX = 'workbuddy-panel-'
 /**
@@ -74,6 +92,12 @@ export interface OwnSignIn {
   uin: string
   enterpriseId: string
   nickname: string
+  /**
+   * When the upstream issued this token, for a sign-in taken over from the
+   * desktop client. Stamping an adopted sign-in as new would hide how old it
+   * is and delay its first renewal, so the issue time travels with the token.
+   */
+  lastRefreshAtMs?: number
 }
 /**
  * How long an archived credential is kept after the last token it can still be
@@ -121,10 +145,11 @@ export interface WorkBuddyCredential {
  *
  * `refreshed` spent an upstream call and got a new token. `fresh` needed
  * nothing, which is the answer for a token that still has hours on it and for
- * an international one that lives a year. `failed` could not refresh.
- * `noToken` has no refresh token to refresh with, so it is dead for good.
+ * an international one that lives a year. `failed` could not refresh. `refused`
+ * was turned down by the upstream, so the sign-in itself is dead. `noToken` has
+ * no refresh token to refresh with, so it is dead for good.
  */
-export type KeepAliveOutcome = 'refreshed' | 'fresh' | 'failed' | 'noToken'
+export type KeepAliveOutcome = 'refreshed' | 'fresh' | 'failed' | 'refused' | 'noToken'
 /** An account is a credential plus pool bookkeeping. */
 export interface WorkBuddyAccount {
   /** Stable pool key: sha256 of the billing identity. */
@@ -148,8 +173,24 @@ export interface WorkBuddyAccount {
    * Per-model cooldowns, keyed by upstream model id → epoch ms until that model
    * on THIS account is skipped. A 429 on `hy4-preview` cools only that model
    * here; `hy3`/`glm-*` on the same account keep serving.
+   *
+   * Always a prototype-less object: the key is the client's model id, and a
+   * request naming `__proto__` would otherwise write through to the prototype
+   * and leave no own key, so the cooldown silently did nothing.
    */
   modelCooldowns: Record<string, number>
+  /**
+   * Models this account's plan does not include, keyed by model id → epoch ms
+   * until the block is retried.
+   *
+   * Kept apart from {@link modelCooldowns} because the two answer differently:
+   * a cooldown is a window the upstream named and clears on its own, so the
+   * gateway answers 429 with a retry hint. A plan block has no window, is not a
+   * rate limit, and the client must be told about the plan rather than told to
+   * wait. Storing it in the cooldown table made the next request say
+   * "rate-limited" about a model the account can never use.
+   */
+  modelBlocks: Record<string, number>
   /** Lifetime count of rate-limit hits; this is what the panel shows. */
   rateLimitHits: number
   /**
@@ -338,12 +379,13 @@ function decryptableString(
 }
 
 /**
- * True when `path` is the desktop app's live sign-in (as opposed to a backup
- * snapshot it left behind). The live file always wins: it is the session the
- * app itself is using.
+ * Whether `path` is the desktop app's live sign-in (as opposed to a backup
+ * snapshot it left behind). A copy of it outranks an abandoned snapshot of the
+ * same token, because the app keeps it current.
  */
 function isLiveAuthFile(path: string): boolean {
-  return basename(path) === WORKBUDDY_LIVE_FILENAME
+  const name = basename(path)
+  return name === WORKBUDDY_LIVE_FILENAME || name === WORKBUDDY_GLOBAL_LIVE_FILENAME
 }
 
 /**
@@ -351,31 +393,225 @@ function isLiveAuthFile(path: string): boolean {
  *
  * Ordering, highest first:
  *
- * 1. the live file the desktop app is signed in with;
- * 2. the credential the upstream issued most recently (`lastRefreshAtMs`);
+ * 1. the credential the upstream issued most recently (`lastRefreshAtMs`);
+ * 2. the source the copy came from: the live sign-in file, then a sign-in the
+ *    plugin wrote, then a superseded snapshot the client left behind;
  * 3. the longer stored expiry, as a fallback for documents that carry no issue
- *    time (the plugin's own refreshed copy, older builds).
+ *    time at all.
+ *
+ * Issue time comes first, and source rank only breaks a tie between copies of
+ * the same token. Rank used to come first, on the reasoning that a file the
+ * plugin writes is the one with a future, and that ordering cost the pool a
+ * working token outright: a renewal of an account the desktop was signed into
+ * is written to the archive, the plugin's own copy of that account stays one
+ * rotation behind, and the next scan served the dead copy while the live one sat
+ * next to it. An account was marked "sign in again" with a working token in the
+ * same directory.
  *
  * The stored expiry alone is NOT a freshness signal: the upstream does not
  * rewrite it when it revokes a token, so a long-dead backup can claim to expire
  * later than the token that actually works. Selecting on it made every upstream
  * call return 401 while a perfectly good credential sat in the same directory.
  */
-function compareFreshness(a: WorkBuddyCredential, b: WorkBuddyCredential): number {
-  const aLive = isLiveAuthFile(a.sourcePath) ? 1 : 0
-  const bLive = isLiveAuthFile(b.sourcePath) ? 1 : 0
-  if (aLive !== bLive) return bLive - aLive
-
+function compareFreshness(a: WorkBuddyCredential, b: WorkBuddyCredential, ownDir: string): number {
   const aIssued = a.lastRefreshAtMs ?? 0
   const bIssued = b.lastRefreshAtMs ?? 0
+  if (aIssued !== bIssued && aIssued > 0 && bIssued > 0) return bIssued - aIssued
+
+  const aRank = credentialRank(a, ownDir)
+  const bRank = credentialRank(b, ownDir)
+  // One dated, one not. A copy the plugin wrote or refresh carries a date it set
+  // itself, and that date is newer than the undated document it replaced; treating
+  // the pair as unordered put the app's file back in front and served a token the
+  // rotation beside it had already retired. A dated *snapshot* is the other way
+  // round: nobody renews it, so an undated live file is still the better bet.
+  if ((aIssued > 0) !== (bIssued > 0)) {
+    if (aIssued > 0 && aRank <= 1) return -1
+    if (bIssued > 0 && bRank <= 1) return 1
+  }
+
+  if (aRank !== bRank) return aRank - bRank
   if (aIssued !== bIssued) return bIssued - aIssued
 
   return b.expiresAtMs - a.expiresAtMs
 }
 
+/**
+ * Which kind of source a credential came from, lowest number first.
+ *
+ * A sign-in the plugin wrote outranks a snapshot the client left behind because
+ * the plugin renews it and nothing renews the snapshot: the same token, but one
+ * of the two copies has a future.
+ */
+function credentialRank(credential: WorkBuddyCredential, ownDir: string): number {
+  if (isLiveAuthFile(credential.sourcePath)) return 0
+  if (ownSignInPath(credential.sourcePath, ownDir)) return 1
+  return 2
+}
+
 /** True when `candidate` should replace `incumbent` for the same account. */
-function isFresher(candidate: WorkBuddyCredential, incumbent: WorkBuddyCredential): boolean {
-  return compareFreshness(candidate, incumbent) < 0
+function isFresher(candidate: WorkBuddyCredential, incumbent: WorkBuddyCredential, ownDir: string): boolean {
+  return compareFreshness(candidate, incumbent, ownDir) < 0
+}
+
+/**
+ * Queue order for the account list: the live sign-in first, then the copy the
+ * upstream issued last, then the newest expiry.
+ *
+ * This is a different question from `compareFreshness`, which decides which copy
+ * of *one* account serves. That rule falls back to the source only when a copy
+ * carries no issue time, which makes it cycle across three copies (a dated
+ * snapshot, an undated live file, a dated panel sign-in) and leaves a list sort
+ * with the order TimSort happened to produce. A key vector cannot.
+ */
+function compareQueueOrder(a: WorkBuddyCredential, b: WorkBuddyCredential, ownDir: string): number {
+  const aRank = credentialRank(a, ownDir)
+  const bRank = credentialRank(b, ownDir)
+  if (aRank !== bRank) return aRank - bRank
+  const aIssued = a.lastRefreshAtMs ?? 0
+  const bIssued = b.lastRefreshAtMs ?? 0
+  if (aIssued !== bIssued) return bIssued - aIssued
+  return b.expiresAtMs - a.expiresAtMs
+}
+
+/**
+ * One deleted sign-in: enough to tell it apart from a later re-login.
+ *
+ * The token is stored as a digest, not as the token itself. This file has to
+ * survive restarts, and a deleted sign-in is one the user asked to be rid of;
+ * keeping the secret to recognise it is a worse trade than keeping its hash.
+ */
+interface DeletedSignIn {
+  tokenDigest: string
+  /** When the upstream issued the deleted token; 0 when its file did not say. */
+  lastRefreshAtMs: number
+  /** When the user deleted it, which is what the tombstone's own age is. */
+  deletedAtMs: number
+}
+
+function tokenDigest(accessToken: string): string {
+  return createHash('sha256').update(`workbuddy\0deleted\0${accessToken}`).digest('hex').slice(0, 32)
+}
+
+/**
+ * A stamp for one file that changes when its content is replaced.
+ *
+ * Millisecond mtime alone repeats on a coarse filesystem, and two pools over one
+ * data directory then kept a stale tombstone set; the size is in here so a rewrite
+ * that lands in the same reported millisecond still reads as a different file.
+ */
+async function signInFileStamp(file: string): Promise<string> {
+  try {
+    const entry = await stat(file)
+    return `${entry.mtimeMs}:${entry.size}`
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Run `work` while holding a lock file, or without it when the lock stays taken.
+ *
+ * The tombstone document is the one file two pools over the same data directory
+ * both write, and a read-union-write is only as good as its serialisation. The
+ * budget is short on purpose: a panel call is answered within seconds, and the
+ * work is a few kilobytes of JSON. A lock older than that is a process that died
+ * holding it, so it is dropped and retried.
+ */
+async function withFileLock(lock: string, work: () => Promise<void>): Promise<void> {
+  let held = false
+  for (let attempt = 0; attempt < 25 && !held; attempt += 1) {
+    try {
+      await writeFile(lock, '', { flag: 'wx', mode: 0o600 })
+      held = true
+      break
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') break
+      const age = await stat(lock).then(entry => Date.now() - entry.mtimeMs, (): number => 0)
+      if (age > 5_000) {
+        await unlink(lock).catch(() => {})
+        continue
+      }
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+  }
+  try {
+    await work()
+  } finally {
+    if (held) await unlink(lock).catch(() => {})
+  }
+}
+
+/**
+ * Read the tombstone document.
+ *
+ * Throws when the file exists but cannot be read or parsed, so the caller can keep
+ * what it already knows instead of treating a scanner's EBUSY as "no deleted
+ * sign-ins".
+ */
+async function readDeletedSignInsFile(file: string): Promise<Map<string, DeletedSignIn>> {
+  const parsed = JSON.parse(await readFile(file, 'utf8')) as { entries?: unknown }
+  const tombstones = new Map<string, DeletedSignIn>()
+  const entries = parsed?.entries
+  if (entries === null || typeof entries !== 'object' || Array.isArray(entries)) return tombstones
+  for (const [id, value] of Object.entries(entries as Record<string, unknown>)) {
+    const entry = value as Partial<DeletedSignIn> | null
+    if (entry === null || typeof entry !== 'object') continue
+    const digest = entry.tokenDigest
+    if (typeof digest !== 'string' || digest === '') continue
+    const issued = entry.lastRefreshAtMs
+    const deletedAt = entry.deletedAtMs
+    tombstones.set(id, {
+      tokenDigest: digest,
+      lastRefreshAtMs: typeof issued === 'number' && Number.isFinite(issued) ? issued : 0,
+      deletedAtMs: typeof deletedAt === 'number' && Number.isFinite(deletedAt) ? deletedAt : 0,
+    })
+  }
+  return tombstones
+}
+
+/**
+ * Whether `credential` is a sign-in the user made after deleting the account.
+ *
+ * A re-login is newer than the tombstone, so its issue time is the signal. Files
+ * that carry no issue time cannot be ordered, and for those a different token is
+ * the only evidence of a new sign-in.
+ *
+ * The same token never ends it, whatever stamp the copy carries: a superseded
+ * snapshot the client still keeps is that same sign-in lying in another file, and
+ * a tolerant comparison (same stamp within a few minutes) let one of them bring a
+ * deleted account back the moment the build allowed it. An older-issued token is
+ * not a re-login either, which is why the comparison stays strict: a genuine
+ * re-login is issued after the deleted one, and the alternative — accepting a
+ * slightly older stamp as “close enough” — cannot tell it apart from the next
+ * snapshot down the stack.
+ */
+function endsTombstone(tombstone: DeletedSignIn, credential: WorkBuddyCredential): boolean {
+  if (tokenDigest(credential.accessToken) === tombstone.tokenDigest) return false
+  const issued = credential.lastRefreshAtMs ?? 0
+  // Only two dated copies can be ordered. An undated one is decided by its name:
+  // the live file is what the app writes on a sign-in, and every other name is a
+  // copy it left behind, where an older build's snapshot carries no issue time and
+  // would otherwise undo a delete.
+  if (tombstone.lastRefreshAtMs > 0 && issued > 0) return issued > tombstone.lastRefreshAtMs
+  // The deleted sign-in had no issue time, so its own stamp says nothing. A dated
+  // replacement minted after the delete is a re-login whatever file it lands in:
+  // "Add account" writes into the pool's directory, which is not a live file, and
+  // an account re-added that way stayed out of the pool forever.
+  if (tombstone.lastRefreshAtMs === 0 && issued > 0) return issued >= tombstone.deletedAtMs
+  return isLiveAuthFile(credential.sourcePath)
+}
+
+/**
+ * Whether `sourcePath` sits inside the directory the plugin writes into.
+ *
+ * A walk that escapes the root is not inside it, and `..` is how a path gets
+ * there. An empty walk means the path IS the directory.
+ */
+function ownSignInPath(sourcePath: string, ownDir: string): boolean {
+  if (ownDir === '' || sourcePath === '') return false
+  const walked = relative(resolve(ownDir), resolve(sourcePath))
+  return walked !== '' && !walked.startsWith('..') && !isAbsolute(walked)
 }
 
 export function workbuddyAccountId(
@@ -497,6 +733,28 @@ async function readCredential(path: string): Promise<CredentialRead> {
 /** Refresh a credential this long before its expiry, so a request never rides one that dies mid-flight. */
 const REFRESH_MARGIN_MS = 5 * 60 * 1000
 /**
+ * Oldest a sign-in the plugin itself wrote may get before it is renewed, weeks
+ * of lifetime left or not.
+ *
+ * An expiry-based lead cannot do this job. The upstream revokes a session
+ * without rewriting the token's `expiresAt`, so an account the user signed out
+ * of still claims weeks of life: a lead of any size waits for an expiry that
+ * never arrives, and the dead sign-in is only discovered when a request rides
+ * it. Renewing on age instead means the renewal is visible in the panel, and a
+ * sign-in the upstream no longer honours surfaces within this window rather
+ * than at expiry.
+ *
+ * Only the plugin's own sign-ins qualify. A credential read out of the desktop
+ * app's directory belongs to that app: it refreshes it, and a renewal here would
+ * be discarded by the next scan while still spending an upstream call. Once a
+ * desktop sign-in has been renewed here the copy in force is the plugin's own,
+ * which is what keeps an account whose session ran out under this window.
+ *
+ * Six hours: short enough that a revoked session is noticed the same day, long
+ * enough that the cost stays at one lightweight POST per account per window.
+ */
+const REFRESH_AFTER_MS = 6 * 60 * 60 * 1000
+/**
  * Longest one penalize may cool an account: same 2h ceiling as the parse
  * layer, so a raw caller-supplied timestamp cannot sleep a pool all day.
  *
@@ -507,8 +765,30 @@ const REFRESH_MARGIN_MS = 5 * 60 * 1000
  * value can reach it.
  */
 const PENALIZE_CAP_MS = 2 * 60 * 60 * 1000
-/** How long a hold the pool itself decided may keep an account out of rotation. */
-const POOL_HOLD_CAP_MS = 24 * 60 * 60 * 1000
+/**
+ * How long a hold the pool decided itself keeps an account out of rotation.
+ *
+ * Neither condition behind a hold clears by itself: the credit balance has to
+ * change, or the user has to sign in again. The configured cooldown window is
+ * sized for a limit that expires, and using it here put a held account back at
+ * the head of the queue every minute, where it failed again and burned the
+ * attempts of the healthy accounts behind it. A hold is a fallback, not a
+ * verdict: a manual cooldown reset, a re-scan and a balance read that finds
+ * credits again all release it.
+ */
+export const POOL_HOLD_MS = 6 * 60 * 60 * 1000
+/**
+ * What a read on an account whose sign-in the upstream refuses is answered with
+ * while the hold stands.
+ *
+ * The upstream's own sentence names a stale sign-in and sends the reader to the
+ * connection check, which is right for the first refusal and noise on every
+ * poll after it: the hold is the plugin's own statement that this account needs
+ * a new sign-in, and it is the one the panel shows until one arrives.
+ */
+const REFUSED_SIGN_IN_MESSAGE =
+  'this account\'s sign-in was refused by the upstream and its refresh token is spent; ' +
+  'sign in again in the WorkBuddy desktop app'
 /**
  * Live per-model cooldown keys kept per account.
  *
@@ -545,10 +825,12 @@ const RATE_LIMIT_STREAK_STEPS = 4
  */
 const RATE_LIMIT_STREAK_WINDOW_MS = RATE_LIMIT_STREAK_CAP * 2
 
-/** Drop expired per-model cooldowns, then cap what is left, soonest first. */
+/** Drop expired per-model cooldowns and blocks, then cap what is left, soonest first. */
 function pruneModelCooldowns(account: WorkBuddyAccount, now: number): void {
-  for (const [modelId, until] of Object.entries(account.modelCooldowns)) {
-    if (until <= now) delete account.modelCooldowns[modelId]
+  for (const table of [account.modelCooldowns, account.modelBlocks]) {
+    for (const [modelId, until] of Object.entries(table)) {
+      if (until <= now) delete table[modelId]
+    }
   }
   const keys = Object.keys(account.modelCooldowns)
   if (keys.length <= MAX_MODEL_COOLDOWN_KEYS) return
@@ -569,6 +851,29 @@ function pruneModelCooldowns(account: WorkBuddyAccount, now: number): void {
  */
 export function ownSignInDir(dataPath: string): string {
   return dataPath === '' ? '' : join(dataPath, OWN_SIGN_IN_DIRNAME)
+}
+
+/**
+ * The sign-in document fields one credential spells, in the vocabulary
+ * `writeOwnSignIn` takes.
+ *
+ * `OwnSignIn` spells "the upstream did not say" as the empty string and a parsed
+ * credential spells it as an absent field; coalescing here keeps that meeting
+ * point in one place rather than in every writer.
+ */
+function ownSignInOf(credential: WorkBuddyCredential): OwnSignIn {
+  return {
+    region: regionOf(credential.domain),
+    accessToken: credential.accessToken,
+    refreshToken: credential.refreshToken,
+    expiresAtMs: credential.expiresAtMs,
+    domain: credential.domain,
+    ...credential.lastRefreshAtMs === undefined ? {} : { lastRefreshAtMs: credential.lastRefreshAtMs },
+    uid: credential.uid ?? '',
+    uin: credential.uin ?? '',
+    enterpriseId: credential.enterpriseId ?? '',
+    nickname: credential.nickname ?? '',
+  }
 }
 
 /**
@@ -593,7 +898,7 @@ export async function writeOwnSignIn(
       refreshToken: signIn.refreshToken,
       expiresAt: signIn.expiresAtMs,
       domain: signIn.domain,
-      lastRefreshTime: Date.now(),
+      lastRefreshTime: signIn.lastRefreshAtMs ?? Date.now(),
     },
     account: {
       ...signIn.uid === '' ? {} : { uid: signIn.uid },
@@ -603,6 +908,32 @@ export async function writeOwnSignIn(
     },
   }, null, 2), { mode: 0o600 })
   return file
+}
+
+/**
+ * Rewrite one of the plugin's own sign-in files with a renewed token.
+ *
+ * Read-modify-write of the document that is already there, so the identity
+ * fields the vendor's own parser looks for survive untouched and only the three
+ * auth values a refresh replaces are written. Atomic for the same reason as the
+ * archive: a truncated `.info` is an account the scan cannot open.
+ */
+export async function renewOwnSignInFile(file: string, credential: WorkBuddyCredential): Promise<void> {
+  const document = JSON.parse(await readFile(file, 'utf8')) as { auth?: Record<string, unknown> }
+  const auth = document.auth ?? {}
+  auth.accessToken = credential.accessToken
+  auth.refreshToken = credential.refreshToken
+  auth.expiresAt = credential.expiresAtMs
+  auth.lastRefreshTime = credential.lastRefreshAtMs ?? Date.now()
+  document.auth = auth
+  const temporary = `${file}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temporary, JSON.stringify(document, null, 2), { mode: 0o600 })
+    await rename(temporary, file)
+  } catch (error: unknown) {
+    await unlink(temporary).catch(() => {})
+    throw error
+  }
 }
 /**
  * Soonest future one-off expiry. Missing or past sorts last. None left -> list head.
@@ -758,7 +1089,26 @@ async function writeArchivedCredentials(
 export type AccountDistribution = 'priority' | 'round-robin' | 'expiry' | 'sticky'
 
 /** The condition behind a pool-decided hold. */
-export type PoolHoldReason = 'spent' | 'session'
+export type PoolHoldReason = 'spent' | 'session' | 'restricted'
+
+/**
+ * Why an account is not being served, as `unavailableReason` reports it.
+ *
+ * A union rather than a string so every reason is spelled in one place, and a
+ * new one shows up where the gateway answers them; that answer function is still
+ * updated by hand, and an unrecognised reason falls through to the generic 503.
+ */
+export type IneligibleReason =
+  | 'removed'
+  | 'switched off'
+  | 'under its credit reserve'
+  | 'sign-in expired'
+  | 'other region'
+  | 'sign-in refused'
+  | 'restricted by the upstream'
+  | 'on hold'
+  | 'plan'
+  | 'rate-limited'
 
 /**
  * Why the pool itself is holding an account out of rotation, and until when.
@@ -779,13 +1129,14 @@ export interface PoolHold {
    * Recorded so a new sign-in can be recognised on its own evidence: the pool
    * releases `session` when a sign-in appears that was not there before, which is
    * the one thing a user re-login does and a token refresh does not. Adoption
-   * cannot answer this — `compareFreshness` ranks a live desktop file above every
-   * panel sign-in regardless of issue time — and a timestamp cannot either, since
-   * it would compare this machine's clock with the one that issued the sign-in.
+   * cannot answer this — which copy of an account serves is decided by issue time
+   * now, so a refresh that lands in a file looks like one — and a timestamp cannot
+   * either, since it would compare this machine's clock with the one that issued
+   * the sign-in.
    *
-   * Empty rather than absent when the account has no readable file of its own: those
-   * live in the archive or behind a sealed token, they are the ones most likely to
-   * be refused, and a missing set made the documented remedy unreachable for them.
+   * Never empty as this build writes it: the credential in force is always named,
+   * so an account with no readable file has its archive token in here. The guard
+   * that skips an empty set stays for a hold recorded by an older build.
    */
   heldSignIns: readonly string[]
 }
@@ -886,6 +1237,17 @@ export class WorkBuddyAccountPool {
   private archiveQueue: Promise<void> = Promise.resolve()
   /** The one scan in progress; concurrent callers await it instead of duplicating it. */
   private scanInflight: Promise<WorkBuddyAccount[]> | undefined
+  /** Torn-down sign-ins, read on first use: a scan cannot resurrect what is here. */
+  /**
+   * Cached tombstones, with the file stamp they were read at.
+   *
+   * A second pool over the same data directory writes this file too. Serving a
+   * cache read before that write and then writing it back verbatim dropped the
+   * other pool's deletions, and a deleted account came back the next time the
+   * client's snapshot was adopted. The stamp makes a write elsewhere visible.
+   */
+  private deletedSignIns: Map<string, DeletedSignIn> | undefined
+  private deletedSignInsStamp: string | undefined
   /** The directories the in-flight scan is reading, so a repoint supersedes it. */
   private scanDirs: readonly string[] = []
   /**
@@ -908,6 +1270,16 @@ export class WorkBuddyAccountPool {
    */
   private heldIds = new Map<string, PoolHold>()
   /**
+   * Accounts the desktop client is signed into right now.
+   *
+   * The pool renews one of these into its own directory when the app's session
+   * runs out, and serves that copy until the app writes a newer one. Renewing it
+   * does not make it the pool's own account: the app still holds the session, and
+   * a delete would hide the account from the pool while the user believed they
+   * were removing something the plugin had added.
+   */
+  private appHeldIds: ReadonlySet<string> = new Set()
+  /**
    * The sign-ins each account's own files hold, as of the last scan.
    *
    * Only the files the client and the panel write, not the archive: the archive
@@ -918,10 +1290,11 @@ export class WorkBuddyAccountPool {
   /**
    * Sign-ins the upstream refused, per account.
    *
-   * `compareFreshness` ranks a live desktop file above every panel sign-in
-   * whatever their issue times, so a token that was refused would win that ranking
-   * again on the very next scan and the account would go on sending it - the hold
-   * would look released while the requests kept failing. Kept across scans, and
+   * A refused token must not come back through the ranking: the copies are
+   * compared by issue time, and a token the upstream rejected can be the newest
+   * one (a re-login that did not work, a sign-in copied from another machine).
+   * Without this the scan would serve it again, and the hold would look released
+   * while the requests kept failing. Kept across scans, and
    * dropped once the sign-in is no longer on disk or the cooldowns are reset.
    */
   private refusedSignIns = new Map<string, readonly string[]>()
@@ -1056,10 +1429,16 @@ export class WorkBuddyAccountPool {
    * True when this account's sign-in is one the plugin wrote, so it may be
    * deleted. The panel asks before it offers the button: deleting a desktop
    * app's own sign-in would sign the user out of that app.
+   *
+   * A refreshed desktop sign-in does not qualify. The pool holds a copy of it
+   * after a renewal, but the app is still signed in, so the row stays out of
+   * reach: removing it would suppress an account the user only ever added to the
+   * app, and nothing on that row says so.
    */
   ownsSignIn(accountId: string): boolean {
     const account = this.accounts.find(item => item.id === accountId)
-    return account !== undefined && this.isOwnSignInPath(account.credential.sourcePath)
+    if (account === undefined || this.appHeldIds.has(accountId)) return false
+    return this.isOwnSignInPath(account.credential.sourcePath)
   }
 
   /**
@@ -1079,7 +1458,7 @@ export class WorkBuddyAccountPool {
   async removeOwnSignIn(accountId: string): Promise<boolean> {
     const account = this.accounts.find(item => item.id === accountId)
     if (account === undefined) return false
-    if (!this.isOwnSignInPath(account.credential.sourcePath)) return false
+    if (!this.ownsSignIn(accountId)) return false
     // Let a scan that is already reading the directories finish first. Its copy
     // of this sign-in is queued for the archive, and an archive write queued
     // behind the drop below would put the entry back - the file gone, the
@@ -1092,26 +1471,292 @@ export class WorkBuddyAccountPool {
     // the entry is dropped again once that scan settles, which is the same
     // ordering, just taken on the other side.
     const running = this.scanInflight
+    // Torn down before anything else, including that wait. The account's token is
+    // still in the archive and its snapshot still in the client's directory, and a
+    // walk that got past the tombstone check before this point would put the
+    // account straight back on assignment.
+    const known = (await this.loadDeletedSignIns()).has(account.id)
+    // A delete whose tombstone could not be recorded is not a delete: the file is
+    // about to go, and the only thing that keeps the client's copy from taking the
+    // account back is that record. Reporting success would leave a row that
+    // returns after the next restart.
+    if (!await this.rememberDeletedSignIn(account.id, account.credential)) {
+      throw new Error('could not record the deleted sign-in')
+    }
     if (running !== undefined) {
       const settled = await raceWithTimeout(running.catch(() => {}), DELETE_SCAN_WAIT_MS)
       if (!settled) void running.catch(() => {}).then(() => this.forgetArchived(account.id))
     }
     // Already gone is success: the point is that no sign-in is left, and a
     // second delete must not read as a failure.
-    await unlink(account.credential.sourcePath).catch((error: unknown) => {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-    })
+    try {
+      await unlink(account.credential.sourcePath)
+    } catch (error: unknown) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'ENOENT') {
+        // The file is still there, so the delete failed and the row has to stay.
+        // Keeping the tombstone wrote it anyway: the next scan would hide the
+        // account while the panel had just reported the delete as failed, and the
+        // file left behind would bring it back once the tombstone was gone.
+        if (!known) {
+          ;(await this.loadDeletedSignIns()).delete(account.id)
+          await this.writeDeletedSignIns([account.id])
+        }
+        throw error
+      }
+    }
     await this.forgetArchived(account.id)
+    // Dropped from the pool here, not on the next walk. The credential in memory
+    // is one whose file is gone, and until a walk replaces the list it outranks
+    // every copy a walk finds: the row came straight back after a delete, serving
+    // a token the user asked to be rid of.
+    this.forgetAccount(account.id)
     return true
   }
 
-  /** Whether `sourcePath` sits inside the directory the plugin writes into. */  private isOwnSignInPath(sourcePath: string): boolean {
-    const own = ownSignInDir(this.dataPath?.() ?? '')
-    if (own === '' || sourcePath === '') return false
-    const walked = relative(resolve(own), resolve(sourcePath))
-    // A walk that escapes the root is not inside it, and `..` is how a path
-    // gets there. An empty walk means the path IS the directory.
-    return walked !== '' && !walked.startsWith('..') && !isAbsolute(walked)
+  /** Drop one account and everything the pool remembers about it. */
+  private forgetAccount(accountId: string): void {
+    this.accounts = this.accounts.filter(item => item.id !== accountId)
+    // The warn-once flag is keyed by id, so a re-sign-in later must be able to
+    // warn again. The balances and check-in state are dropped with the account:
+    // a balance and an expiry that outlive their account are inherited by the
+    // next sign-in under the same id, which then reads as unpickable on a
+    // reserve floor nobody set for it.
+    this.noRefreshWarned.delete(accountId)
+    this.creditBalances.delete(accountId)
+    this.creditExpiries.delete(accountId)
+    this.heldIds.delete(accountId)
+    this.signInTokens.delete(accountId)
+    this.refusedSignIns.delete(accountId)
+  }
+
+  /**
+   * Record one deleted sign-in, so no later scan puts the account back.
+   *
+   * The file is written before the delete is reported: a tombstone that only
+   * lived in memory would be gone after a restart, and the snapshot it has to
+   * hold off is still sitting in the client's directory.
+   */
+  private async rememberDeletedSignIn(id: string, credential: WorkBuddyCredential): Promise<boolean> {
+    const tombstones = await this.loadDeletedSignIns()
+    const previous = tombstones.get(id)
+    tombstones.set(id, {
+      tokenDigest: tokenDigest(credential.accessToken),
+      lastRefreshAtMs: credential.lastRefreshAtMs ?? 0,
+      deletedAtMs: Date.now(),
+    })
+    if (await this.writeDeletedSignIns()) return true
+    // The write failed, so the delete is not going to happen. Leaving the entry in
+    // the set would hide the account on the next scan anyway, while the panel had
+    // just reported the delete as failed.
+    if (previous === undefined) tombstones.delete(id)
+    else tombstones.set(id, previous)
+    return false
+  }
+
+  /**
+   * Read the tombstones, re-reading when the file changed underneath us.
+   *
+   * Nothing is pruned by age. A deleted sign-in's copy is still lying in the
+   * client's directory until the client overwrites it, so a tombstone that
+   * expired would bring that copy straight back, refresh token included.
+   */
+  private async loadDeletedSignIns(): Promise<Map<string, DeletedSignIn>> {
+    const file = this.deletedSignInsFile()
+    const stamp = file === undefined ? '' : await signInFileStamp(file)
+    if (this.deletedSignIns !== undefined && this.deletedSignInsStamp === stamp) return this.deletedSignIns
+    if (file === undefined) {
+      this.deletedSignInsStamp = ''
+      this.deletedSignIns = new Map()
+      return this.deletedSignIns
+    }
+    try {
+      const tombstones = await readDeletedSignInsFile(file)
+      this.deletedSignInsStamp = stamp
+      this.deletedSignIns = tombstones
+      return tombstones
+    } catch (error: unknown) {
+      // A file that is there but unreadable is not "no deleted sign-ins": keeping
+      // the set we already have is what stops the next scan from adopting every
+      // account the user deleted, and stops the next write from persisting an
+      // empty set over theirs. The stamp is left unrecorded so the read is retried.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.deletedSignInsStamp = stamp
+        this.deletedSignIns = new Map()
+        return this.deletedSignIns
+      }
+      this.logger?.warn?.(`${LOG_PREFIX}: could not read the deleted sign-ins: ${String(error)}`)
+      return this.deletedSignIns ?? new Map()
+    }
+  }
+
+  /**
+   * Persist the tombstone set; the caller has already updated the map.
+   *
+   * What is on disk is merged in first, except for the ids this call is removing:
+   * a second pool over the same data directory writes this same file, and writing
+   * our map verbatim dropped a delete it had already recorded. The removals are the
+   * other half of that: a re-login ends a tombstone and a failed delete rolls one
+   * back, and a pure union put both straight back.
+   *
+   * Answers false when the file could not be written, so a delete can refuse to
+   * report success on a state it could not record.
+   */
+  private async writeDeletedSignIns(removed: readonly string[] = []): Promise<boolean> {
+    const tombstones = this.deletedSignIns
+    const file = this.deletedSignInsFile()
+    if (tombstones === undefined || file === undefined) return true
+    let written = false
+    await withFileLock(`${file}.lock`, async () => {
+      const onDisk = await readDeletedSignInsFile(file).catch(() => new Map<string, DeletedSignIn>())
+      for (const [id, entry] of onDisk) {
+        if (removed.includes(id)) continue
+        const ours = tombstones.get(id)
+        if (ours === undefined || entry.deletedAtMs > ours.deletedAtMs) tombstones.set(id, entry)
+      }
+      const temporary = `${file}.${randomUUID()}.tmp`
+      try {
+        await mkdir(dirname(file), { recursive: true })
+        await writeFile(temporary, JSON.stringify({ version: 1, entries: Object.fromEntries(tombstones) }, null, 2), { mode: 0o600 })
+        await rename(temporary, file)
+        this.deletedSignInsStamp = await signInFileStamp(file)
+        written = true
+      } catch (error: unknown) {
+        await unlink(temporary).catch(() => {})
+        this.logger?.warn?.(`${LOG_PREFIX}: could not record the deleted sign-ins: ${String(error)}`)
+      }
+    })
+    return written
+  }
+
+  private deletedSignInsFile(): string | undefined {
+    const directory = this.dataPath?.()
+    return directory === undefined || directory === '' ? undefined : join(directory, DELETED_SIGN_INS_FILENAME)
+  }
+
+  /** Whether the pool recorded this sign-in as refused by the upstream. */
+  private signInRefused(id: string, token: string): boolean {
+    if (this.refusedSignIns.get(id)?.includes(token) ?? false) return true
+    // A live session hold names the sign-ins it was put there for; those are
+    // exactly the ones a later scan must not prefer over a copy nobody refused.
+    const hold = this.heldIds.get(id)
+    return hold?.reason === 'session' && hold.heldSignIns.includes(token)
+  }
+
+  /**
+   * Every sign-in a refusal could have named for this account.
+   *
+   * The files the last walk read, plus the credential in force when it came from
+   * somewhere else (the archive, or a token this process minted before it was
+   * written to disk). Naming only the files left an account served from the
+   * archive with an empty proof, and a hold with an empty proof is released by
+   * the first scan that follows it.
+   */
+  private refusedSignInsFor(id: string): string[] {
+    const tokens = (this.signInTokens.get(id) ?? []).map(entry => entry.accessToken)
+    const inForce = this.accounts.find(account => account.id === id)?.credential.accessToken
+    if (inForce !== undefined && inForce !== '' && !tokens.includes(inForce)) tokens.push(inForce)
+    return tokens
+  }
+
+  /** Whether `sourcePath` sits inside the directory the plugin writes into. */
+  private isOwnSignInPath(sourcePath: string): boolean {
+    return ownSignInPath(sourcePath, ownSignInDir(this.dataPath?.() ?? ''))
+  }
+
+  /**
+   * Take over the sign-ins the desktop client left behind.
+   *
+   * The client keeps one live sign-in and a stack of superseded snapshots beside
+   * it. A snapshot's token is a session the client itself stopped using, so
+   * nothing renews it: it serves until its access token expires and then the
+   * account is gone, holding a refresh token the client's own rotation already
+   * spent. Copying it into the directory the plugin writes makes it the
+   * plugin's account, renewed by the same age rule a panel-added sign-in gets,
+   * so the account outlives the snapshot it came from.
+   *
+   * Only a superseded snapshot is taken over. The live sign-in stays the
+   * client's: it refreshes it, and a second holder of the same session
+   * refreshing on its own schedule is how both end up with a spent refresh
+   * token. An account the client is signed into is skipped for the same reason.
+   */
+  private async adoptOrphanedSignIns(
+    found: readonly WorkBuddyCredential[],
+    tornDown: ReadonlySet<string>,
+  ): Promise<WorkBuddyCredential[]> {
+    const directory = ownSignInDir(this.dataPath?.() ?? '')
+    if (directory === '') return []
+    const liveIds = new Set<string>()
+    const ownedIds = new Set<string>()
+    for (const credential of found) {
+      const id = workbuddyAccountId(credential)
+      if (isLiveAuthFile(credential.sourcePath)) liveIds.add(id)
+      else if (ownSignInPath(credential.sourcePath, directory)) ownedIds.add(id)
+    }
+    const adopted: WorkBuddyCredential[] = []
+    for (const credential of found) {
+      if (isLiveAuthFile(credential.sourcePath)) continue
+      if (ownSignInPath(credential.sourcePath, directory)) continue
+      const id = workbuddyAccountId(credential)
+      // The client is signed into this account, the plugin already holds a copy of
+      // it, or the user deleted it: either way there is nothing to take over.
+      if (liveIds.has(id) || ownedIds.has(id) || tornDown.has(id)) continue
+      // Without an identity the pool key falls back to the source path, so the
+      // copy would be a different account on every scan and the pool would grow
+      // without bound. Such a snapshot keeps serving from where it lies.
+      if ((credential.uin ?? credential.uid ?? credential.nickname ?? '') === '') continue
+      let file: string
+      try {
+        // The document said nothing about when this token was issued, and this
+        // build must not invent a date for it: the ranking trusts a date on a copy
+        // the plugin wrote, so an invented one made a superseded snapshot outrank
+        // the session the app is signed into once the user went back to it.
+        file = await writeOwnSignIn(directory, { ...ownSignInOf(credential), lastRefreshAtMs: credential.lastRefreshAtMs ?? 0 })
+      } catch (error: unknown) {
+        // A snapshot the plugin could not copy is still a snapshot: it keeps
+        // serving from where it lies, exactly as before.
+        this.logger?.warn?.(`${LOG_PREFIX}: could not take over ${accountLabel(credential)}: ${String(error)}`)
+        continue
+      }
+      ownedIds.add(id)
+      adopted.push({ ...credential, sourcePath: file })
+    }
+    return adopted
+  }
+
+  /**
+   * Write a renewed token back into the sign-in file it was read from.
+   *
+   * Best effort: a failed write costs the renewal its persistence, never the
+   * request already in flight. Anything that did not come from the plugin's own
+   * directory is left alone - the desktop app owns its files.
+   */
+  private async renewOwnSignIn(credential: WorkBuddyCredential): Promise<void> {
+    if (this.isOwnSignInPath(credential.sourcePath)) {
+      try {
+        await renewOwnSignInFile(credential.sourcePath, credential)
+      } catch (error: unknown) {
+        this.logger?.warn?.(
+          `${LOG_PREFIX}: could not write the renewed token back for ${credential.nickname ?? credential.uid}: ${String(error)}`,
+        )
+      }
+      return
+    }
+    // The rotation was just spent on a copy the plugin does not own: a desktop
+    // sign-in it read, or one the archive handed back. Keeping the result in the
+    // archive alone left the plugin's own copy of that account one rotation
+    // behind, and the next scan served that dead copy until the account was
+    // marked as needing a sign-in. Writing the token into the directory the pool
+    // maintains claims the account with the token that was just minted.
+    const directory = ownSignInDir(this.dataPath?.() ?? '')
+    if (directory === '') return
+    try {
+      credential.sourcePath = await writeOwnSignIn(directory, ownSignInOf(credential))
+    } catch (error: unknown) {
+      this.logger?.warn?.(
+        `${LOG_PREFIX}: could not keep the renewed token for ${credential.nickname ?? credential.uid}: ${String(error)}`,
+      )
+    }
   }
 
   /**
@@ -1143,6 +1788,7 @@ export class WorkBuddyAccountPool {
   /** Drop every account, e.g. when the source is switched off. A later `scan()` rebuilds from disk. */
   clear(): void {
     this.accounts = []
+    this.appHeldIds = new Set()
   }
 
   /** Rescan the auth directories and merge newly discovered accounts. */
@@ -1154,7 +1800,7 @@ export class WorkBuddyAccountPool {
     // moment `authFile` is repointed, and a walk that started before that would
     // otherwise end by writing the previous directory's accounts back over the
     // clear.
-    const dirs = [...this.authDirs]
+    const dirs = this.scanDirsFor(this.authDirs)
     if (this.scanInflight !== undefined && sameDirs(this.scanDirs, dirs)) return this.scanInflight
     const inflight = this.scanOnce(dirs).finally(() => {
       // The identity check keeps a superseded walk's exit from clearing the
@@ -1170,6 +1816,22 @@ export class WorkBuddyAccountPool {
   }
 
   /**
+   * The directories a walk reads: the configured ones plus the plugin's own.
+   *
+   * The pool writes sign-ins into its own directory (a renewal it claims, an
+   * account it takes over), so it has to read that directory too, whether or not
+   * the host listed it. Read in both places through this one function: a set that
+   * disagreed with itself read as "the auth directories were repointed mid-walk"
+   * and threw the whole walk away.
+   */
+  private scanDirsFor(authDirs: readonly string[]): string[] {
+    const dirs = [...authDirs]
+    const own = ownSignInDir(this.dataPath?.() ?? '')
+    if (own !== '' && !dirs.some(dir => resolve(dir) === resolve(own))) dirs.push(own)
+    return dirs
+  }
+
+  /**
    * Keep the credentials this walk saw, so an account whose only file the client
    * overwrites on the next sign-in still has a copy to be read back from.
    *
@@ -1178,6 +1840,7 @@ export class WorkBuddyAccountPool {
   private async archiveCredentials(credentials: readonly WorkBuddyCredential[]): Promise<void> {
     const file = this.archiveFile()
     if (file === undefined || credentials.length === 0) return
+    const ownDir = ownSignInDir(this.dataPath?.() ?? '')
     // Serialized: this is a read-modify-write of one document, and two scans can
     // overlap when the auth directories are repointed mid-walk. Interleaved
     // writers overwrite each other's entries, and a half-written archive reads
@@ -1188,7 +1851,7 @@ export class WorkBuddyAccountPool {
       for (const credential of credentials) {
         const id = workbuddyAccountId(credential)
         const previous = stored.get(id)
-        if (previous !== undefined && !isFresher(credential, previous)) continue
+        if (previous !== undefined && !isFresher(credential, previous, ownDir)) continue
         stored.set(id, credential)
         changed = true
       }
@@ -1246,14 +1909,49 @@ export class WorkBuddyAccountPool {
       }
     }
 
-    // Signing in again is a new sign-in file, not the one that was deleted, so it
-    // ends the tombstone: the account is the user's again and has to be archived
-    // like any other.
+    // Nothing below may see a sign-in the user deleted. The desktop client keeps a
+    // superseded snapshot of it and the archive keeps its token, so dropping only
+    // the file the plugin wrote left both of them to put the account straight
+    // back: the row never moved and the delete read as a button that does nothing.
+    // A sign-in the client minted after the delete is a re-login and ends it.
+    const tombstones = await this.loadDeletedSignIns()
+    const tornDown = new Set<string>()
+    const releasedIds: string[] = []
+    const held: WorkBuddyCredential[] = []
+    for (const credential of found) {
+      const id = workbuddyAccountId(credential)
+      const tombstone = tombstones.get(id)
+      if (tombstone === undefined) {
+        held.push(credential)
+        continue
+      }
+      if (!endsTombstone(tombstone, credential)) {
+        tornDown.add(id)
+        continue
+      }
+      tombstones.delete(id)
+      releasedIds.push(id)
+      held.push(credential)
+    }
+    found.length = 0
+    found.push(...held)
+    // A tombstone whose account has no file left holds off the copies the walk
+    // cannot see either: the archive keeps the token the delete purged, and a
+    // purge that raced a scan or lost its write would otherwise put the row back
+    // on a scan where no file exists to carry the tombstone check.
+    for (const id of tombstones.keys()) tornDown.add(id)
+    if (releasedIds.length > 0) await this.writeDeletedSignIns(releasedIds)
+
     // Remember every sign-in this walk saw before anything about it is dropped.
     // The global client keeps no snapshot beside its live file, so a re-login
     // overwrites the previous account's only copy on disk; the archive is what
     // lets that account stay in the pool afterwards.
     await this.archiveCredentials(found)
+
+    // Sign-ins the client left behind become the plugin's own, so something
+    // renews them. After the archive write, so the snapshot being copied is
+    // already kept, and before anything below reads `found`.
+    found.push(...(await this.adoptOrphanedSignIns(found, tornDown)))
 
     // The sign-in each account's own files hold, taken from the walk before the
     // archive's copies join `found`: those carry whatever this process last
@@ -1266,12 +1964,37 @@ export class WorkBuddyAccountPool {
       else held.push(credential)
     }
 
-    // Accounts only the archive still holds. The sign-in file is gone, so their
-    // token gets no renewal from the client, but the token itself is still
-    // valid and keeps serving until it expires.
+    // Accounts the archive still holds, offered as candidates even when the
+    // account also has files. The archive is where this process keeps the token it
+    // renewed last, and a renewal of a sign-in the plugin does not own (the
+    // desktop's own file) lands there and nowhere else. Dropping those entries
+    // whenever a file existed left the stale file in force: the account answered
+    // 401, its refresh token had already been rotated away by the renewal beside
+    // it, and the row asked for a sign-in while a working token sat in the same
+    // directory. Which copy serves is the ranking's call, not this loop's.
+    // "The pool still has a copy of its own": a file the client wrote or one the
+    // plugin wrote. Neither is left, and the archive is the only thing holding the
+    // token, is what the panel's note is about. Counting own copies out put the
+    // note on every account added from the panel, with advice to re-login for a
+    // sign-in the pool renews itself.
     const liveIds = new Set(found.map(credential => workbuddyAccountId(credential)))
+    // Held in the app right now. Read from the files this walk saw, not from the
+    // copy that won: a renewal is written into the pool's own directory and
+    // repoints the serving credential at it, so deriving this from the winner
+    // dropped the account out of the set one scan later and offered a delete for
+    // an account the user never added to the pool.
+    const appHeld = new Set(
+      found.filter(credential => isLiveAuthFile(credential.sourcePath)).map(credential => workbuddyAccountId(credential)),
+    )
     for (const credential of await this.archivedCredentials(readableDirs)) {
-      if (liveIds.has(workbuddyAccountId(credential))) continue
+      const id = workbuddyAccountId(credential)
+      if (tornDown.has(id)) continue
+      // The archive keeps the copy a renewal was written with, and that copy
+      // remembers the path it was read from (the app's live file). Offering it
+      // beside the file that holds the same token made the ranking pick the app's
+      // path back, and the pool stopped renewing an account whose session it had
+      // just taken over, because the age rule only applies to its own copies.
+      if (found.some(entry => workbuddyAccountId(entry) === id && entry.accessToken === credential.accessToken)) continue
       found.push(credential)
     }
 
@@ -1288,7 +2011,8 @@ export class WorkBuddyAccountPool {
           label: accountLabel(credential),
           credential,
           cooldownUntilMs: 0,
-          modelCooldowns: {},
+          modelCooldowns: Object.create(null) as Record<string, number>,
+          modelBlocks: Object.create(null) as Record<string, number>,
           rateLimitHits: 0,
         })
         continue
@@ -1323,10 +2047,34 @@ export class WorkBuddyAccountPool {
       // rather than comparing expiry values directly. The label is not carried
       // over here: every label is rebuilt from the credential in force below,
       // which is also what keeps the prefix from stacking up on a rescan.
-      const refused = this.refusedSignIns.get(id)
-      if (isFresher(credential, existing.credential) && !(refused?.includes(credential.accessToken) ?? false)) {
+      // A copy the upstream already refused never outranks one it did not. The
+      // account was held out on the strength of the dead copy, so without this
+      // the working copy sitting beside it was never picked up and the row kept
+      // asking for a sign-in the pool had no use for. Only a candidate that is
+      // itself untouched by the refusal may replace a refused incumbent; a
+      // second dead copy is no better than the first.
+      if (!this.signInRefused(id, credential.accessToken)
+        && (this.signInRefused(id, existing.credential.accessToken)
+          || isFresher(credential, existing.credential, ownSignInDir(this.dataPath?.() ?? '')))) {
         existing.credential = credential
       }
+    }
+
+    // A copy that works ends the hold: the account was taken out because the
+    // sign-in it was serving had been refused, and the copy now in force is not
+    // one of those. The cooldown this hold wrote is released with it, and only
+    // that one: a rate-limit window belongs to the upstream and outlasts it.
+    for (const [id, account] of byId) {
+      const hold = this.heldIds.get(id)
+      if (hold?.reason !== 'session') continue
+      // A hold that names no sign-in has nothing a scan can release it with: the
+      // account had no file when it was refused, so only a file that appears
+      // later can, through the merge above.
+      if (hold.heldSignIns.length === 0) continue
+      if (this.signInRefused(id, account.credential.accessToken)) continue
+      this.heldIds.delete(id)
+      if (account.cooldownUntilMs > 0 && account.cooldownUntilMs <= hold.until) account.cooldownUntilMs = 0
+      this.logger?.info?.(`${LOG_PREFIX}: ${account.label} has a sign-in the upstream did not refuse; releasing the hold`)
     }
 
     const foundIds = new Set(found.map(credential => workbuddyAccountId(credential)))
@@ -1352,31 +2100,34 @@ export class WorkBuddyAccountPool {
       if (sealedDirs.has(home)) continue
       if (readableDirs.has(home) && !foundIds.has(id)) {
         byId.delete(id)
-        // The warn-once flag is keyed by id, so a re-sign-in later must be able
-        // to warn again.
-        this.noRefreshWarned.delete(id)
-        // Every per-account map the pool keeps, dropped with the account: a
-        // balance and an expiry that outlive their account are inherited by the
-        // next sign-in under the same id, which then reads as unpickable on a
-        // reserve floor nobody set for it.
-        this.creditBalances.delete(id)
-        this.creditExpiries.delete(id)
-        this.heldIds.delete(id)
-        this.signInTokens.delete(id)
-        this.refusedSignIns.delete(id)
+        this.forgetAccount(id)
       }
     }
 
-    // A stable, predictable order is what makes "prefer the first account"
-    // meaningful: a live sign-in leads, then the most recently issued
-    // credential, then the newest expiry. `byId` already preserves the order
-    // accounts were first discovered, so re-scans do not shuffle the queue.
+    // Held in the app right now: the file the client is signed into, as opposed
+    // to a snapshot it left behind. The pool may renew such an account into its
+    // own directory, but the app is the one holding the session, so the panel
+    // must not offer to delete it: those rows are not the pool's to remove.
+    this.appHeldIds = appHeld
+
+    // A stable order is what makes "prefer the first account" meaningful, and it
+    // is a queue order, not the freshness rule: the live sign-in leads so the next
+    // request goes to the account the user is actually in, then the most recently
+    // issued credential, then the newest expiry. It is a key vector rather than
+    // `compareFreshness`, whose mixed date/source rule is only meaningful pairwise
+    // and cycles across three copies, leaving the queue to whatever order the sort
+    // happened to make of an inconsistent comparator.
     const ordered = [...byId.values()]
-    ordered.sort((a, b) => compareFreshness(a.credential, b.credential))
+    ordered.sort((a, b) => compareQueueOrder(a.credential, b.credential, ownSignInDir(this.dataPath?.() ?? '')))
     for (const account of ordered) {
       account.label = accountLabel(account.credential)
       // Recomputed every scan: signing the account back in makes it live again,
-      // and a flag carried over would keep it out of rotation forever.
+      // and a flag carried over would keep it out of rotation forever. A
+      // directory that could not be read or unsealed this time says nothing about
+      // the account, so its previous answer stands: marking it archived told the
+      // user the sign-in was gone while the file was still on disk.
+      const home = resolve(dirname(account.credential.sourcePath))
+      if (!readableDirs.has(home) || sealedDirs.has(home)) continue
       if (liveIds.has(account.id)) delete account.archived
       else account.archived = true
     }
@@ -1384,7 +2135,7 @@ export class WorkBuddyAccountPool {
     // A directory set that changed while this walk was reading is not this
     // walk's answer: `applyConfig` already emptied the pool for the new set, and
     // assigning here would put the previous directory's accounts back.
-    if (!sameDirs(this.authDirs, dirs)) return this.accounts
+    if (!sameDirs(this.scanDirsFor(this.authDirs), dirs)) return this.accounts
     this.accounts = ordered
     // Kept for `penalize`, which records them so a later scan can tell a new
     // sign-in from the one that was refused.
@@ -1401,6 +2152,53 @@ export class WorkBuddyAccountPool {
   }
 
   /**
+   * Why this account cannot serve a request, or null when it can.
+   *
+   * One ladder, two readers: `available` filters with it and
+   * `unavailableReason` prints its answer. Keeping them separate meant every
+   * new disqualifier had to be added in two places, and forgetting one made the
+   * panel call an account available that the rotation would never pick.
+   */
+  private ineligible(
+    account: WorkBuddyAccount,
+    now: number,
+    modelId?: string,
+    region?: WorkBuddyRegion,
+  ): IneligibleReason | null {
+    // Removed for good, or switched off: neither may serve a request. Switched
+    // off is still listed, so the panel can switch it back on.
+    if (this.removedIds.has(account.id)) return 'removed'
+    if (this.disabledIds.has(account.id)) return 'switched off'
+    // Reserved credits: stop at the floor the user set for this account.
+    if (this.reserveHolds(account.id)) return 'under its credit reserve'
+    // An archived account is judged by its credential like any other, below.
+    // The switch that overwrote its sign-in file does not revoke its token, and
+    // the global token lasts a year, so treating it as unusable threw away the
+    // very account the archive exists to keep. A credential whose access token
+    // has died and that carries nothing to refresh it with cannot serve a
+    // request: leading with one spent the turn on a guaranteed 401, and the
+    // refresh-and-retry that follows is spent on a call that cannot change the
+    // answer. One that still has a refresh token stays eligible: `ensureFresh`
+    // renews it on the way through.
+    if (credentialUnusable(account.credential, now)) return 'sign-in expired'
+    // A region-scoped caller (one of the two providers) must never pick an
+    // account that talks to the other region gateway.
+    if (region !== undefined && regionOf(account.credential.domain) !== region) return 'other region'
+    if (account.cooldownUntilMs > now) {
+      // The three holds need different remedies, and the caller prints this
+      // string as the advice: a balance read clears `spent`, only a fresh
+      // sign-in clears `session`, and a vendor restriction needs the account
+      // appealed. One word for all of them sent users to top up an account
+      // whose chats were refused.
+      const reason = this.heldIds.get(account.id)?.reason
+      return reason === 'session' ? 'sign-in refused' : reason === 'restricted' ? 'restricted by the upstream' : 'on hold'
+    }
+    if (modelId !== undefined && (account.modelBlocks[modelId] ?? 0) > now) return 'plan'
+    if (modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now) return 'rate-limited'
+    return null
+  }
+
+  /**
    * Accounts currently eligible to serve a request.
    *
    * With a `modelId`, an account is eligible when it is not account-wide cooled
@@ -1413,34 +2211,21 @@ export class WorkBuddyAccountPool {
    * for.
    */
   available(now: number, modelId?: string, region?: WorkBuddyRegion): WorkBuddyAccount[] {
-    return this.accounts.filter(account => {
-      // Removed for good, or switched off: neither may serve a request.
-      if (this.removedIds.has(account.id)) return false
-      // An archived account is judged by its credential like any other, below.
-      // The switch that overwrote its sign-in file does not revoke its token,
-      // and the global token lasts a year, so treating it as unusable threw away
-      // the very account the archive exists to keep.
-      // Switched off on the panel: never picked, but still listed so the panel
-      // can switch it back on.
-      if (this.disabledIds.has(account.id)) return false
-      // Reserved credits: stop at the floor the user set for this account.
-      if (this.reserveHolds(account.id)) return false
-      // A credential whose access token has died and that carries nothing to
-      // refresh it with cannot serve a request. Leading with one spent the turn
-      // on a guaranteed 401, and the refresh-and-retry that follows is spent on
-      // a call that cannot change the answer. One that still has a refresh
-      // token stays eligible: `ensureFresh` renews it on the way through, which
-      // is the only thing that ever puts it back.
-      if (credentialUnusable(account.credential, now)) return false
-      if (account.cooldownUntilMs > now) return false
-      if (modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now) return false
-      // A region-scoped caller (one of the two providers) must never pick
-      // an account that talks to the other region gateway.
-      if (region !== undefined && regionOf(account.credential.domain) !== region) return false
-      return true
-    })
+    return this.accounts.filter(account => this.ineligible(account, now, modelId, region) === null)
   }
 
+  /**
+   * The pool's own hold on this account, if one is in force right now.
+   *
+   * A caller that is about to spend upstream calls on an account asks first: a
+   * held sign-in cannot answer, so the read is skipped and the hold's reason is
+   * reported instead. Null when no hold applies or the hold has run out.
+   */
+  activeHold(accountId: string): { reason: PoolHoldReason; untilMs: number } | null {
+    const hold = this.heldIds.get(accountId)
+    if (hold === undefined || hold.until <= Date.now()) return null
+    return { reason: hold.reason, untilMs: hold.until }
+  }
   /**
    * Why this account is not being served right now, for a caller that has to
    * explain an empty pool. Returns null when the account is eligible.
@@ -1449,22 +2234,10 @@ export class WorkBuddyAccountPool {
    * timestamps alone, so an expired sign-in was reported as a credit-reserve
    * setting the user never touched.
    */
-  unavailableReason(accountId: string, now: number, modelId?: string): string | null {
+  unavailableReason(accountId: string, now: number, modelId?: string): IneligibleReason | null {
     const account = this.accounts.find(item => item.id === accountId)
     if (account === undefined) return null
-    if (this.removedIds.has(account.id)) return 'removed'
-    if (this.disabledIds.has(account.id)) return 'switched off'
-    if (this.reserveHolds(account.id)) return 'under its credit reserve'
-    if (credentialUnusable(account.credential, now)) return 'sign-in expired'
-    if (account.cooldownUntilMs > now) {
-      // The two holds need different remedies, and the caller prints this
-      // string as the advice: a balance read clears `spent`, while only a fresh
-      // sign-in clears `session`. One word for both sent users to top up an
-      // account whose chats were refused.
-      return this.heldIds.get(account.id)?.reason === 'session' ? 'sign-in refused' : 'on hold'
-    }
-    if (modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now) return 'rate-limited'
-    return null
+    return this.ineligible(account, now, modelId)
   }
 
   /**
@@ -1564,11 +2337,91 @@ export class WorkBuddyAccountPool {
    * token is unchanged, so the caller stops retrying the same dead token.
    */
   async refreshAccount(accountId: string): Promise<boolean> {
+    return await this.refreshForRetry(accountId) === 'refreshed'
+  }
+
+  /**
+   * Refresh after a session-dead answer, keeping a refusal apart from a failure.
+   *
+   * Only the upstream turning the sign-in down justifies a hold. A timeout, a
+   * rate limit or an unreachable host says nothing about the token, and parking
+   * the account for six hours over one bad round trip took a healthy account out
+   * of rotation until a manual reset.
+   */
+  private async refreshForRetry(accountId: string): Promise<'refreshed' | 'refused' | 'failed'> {
     const account = this.accounts.find(item => item.id === accountId)
-    if (account === undefined) return false
+    if (account === undefined) return 'failed'
     const previous = account.credential.accessToken
-    await this.ensureFresh(account, true)
-    return account.credential.accessToken !== previous
+    // A read the upstream just refused is the proof the session is dead. With
+    // nothing to refresh with, waiting on `ensureFresh` would call it `fresh`
+    // because the access token has not expired yet, and the hold that the
+    // refusal earned would never be placed.
+    if (account.credential.refreshToken === '') return 'refused'
+    const outcome = await this.ensureFresh(account, true)
+    // An in-flight refresh may have replaced the token without this call
+    // spending one; the token is what the retry rides, so it decides.
+    if (account.credential.accessToken !== previous) return 'refreshed'
+    return outcome === 'refused' ? 'refused' : 'failed'
+  }
+
+  /**
+   * Hold an account whose sign-in the upstream refuses.
+   *
+   * The chat gateway has answered a refused sign-in with this hold since it was
+   * written; the panel's reads and the scheduled passes had no equivalent, so a
+   * revoked account kept spending its two upstream calls on every poll and every
+   * pass. The hold is what stops that, and it is released the way every other
+   * hold is: a new sign-in for the account, a cooldown reset, or its cap.
+   */
+  holdRefusedSignIn(accountId: string): void {
+    this.penalize(accountId, Date.now() + POOL_HOLD_MS, undefined, 'session')
+  }
+
+  /**
+   * One upstream read that a refused sign-in gets a second chance at.
+   *
+   * The upstream revokes the session a sign-in belongs to without rewriting the
+   * token's own expiry, so an account the user switched away from in the desktop
+   * app keeps a credential that reads as valid for weeks and answers 401 on
+   * every call. A refresh token that still lives recovers the account on the
+   * spot, which is the case the desktop app's own refresh leaves behind; one
+   * that does not leaves the account held instead of retried forever.
+   *
+   * A failure of any other kind is rethrown untouched: a rate limit, a spent
+   * balance and an upstream fault each have their own path, and none of them is
+   * helped by a token this read did not blame.
+   *
+   * While the hold stands the read is not attempted at all. The panel polls
+   * every couple of minutes and the scheduled passes walk the whole pool, and
+   * each of those would otherwise spend the same call on a sign-in that cannot
+   * answer it.
+   */
+  async readAfterRefresh<T>(accountId: string, read: (credential: WorkBuddyCredential) => Promise<T>): Promise<T> {
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined) throw new Error(`${LOG_PREFIX}: no account ${accountId} to read for`)
+    if (this.activeHold(accountId)?.reason === 'session') throw new Error(REFUSED_SIGN_IN_MESSAGE)
+    try {
+      return await read(account.credential)
+    } catch (error) {
+      if (upstreamErrorKind(error) !== 'session_dead') throw error
+      // No retry when the refresh itself was refused: the token the read would
+      // ride is the one the upstream just turned down, so the second attempt
+      // spends a call to learn what the first one already said. A refresh that
+      // failed for any other reason leaves the account in rotation: the token
+      // may still work, and the next read decides.
+      const outcome = await this.refreshForRetry(accountId)
+      if (outcome === 'refreshed') {
+        try {
+          return await read(account.credential)
+        } catch (retry) {
+          if (upstreamErrorKind(retry) !== 'session_dead') throw retry
+          this.holdRefusedSignIn(accountId)
+          throw retry
+        }
+      }
+      if (outcome === 'refused') this.holdRefusedSignIn(accountId)
+      throw error
+    }
   }
 
   /**
@@ -1585,12 +2438,16 @@ export class WorkBuddyAccountPool {
   async ensureFresh(account: WorkBuddyAccount, forced = false): Promise<KeepAliveOutcome> {
     if (this.client === undefined) return 'fresh'
     const credential = account.credential
-    const expiring = forced || credential.expiresAtMs <= 0 || credential.expiresAtMs <= Date.now() + REFRESH_MARGIN_MS
+    const issuedAt = credential.lastRefreshAtMs ?? 0
+    // Age, not just the expiry margin: a token with weeks left is still renewed
+    // once it is old enough, which is what makes the keepalive renew anything at
+    // all on a pool of long-lived tokens.
+    const stale = this.isOwnSignInPath(credential.sourcePath) && issuedAt > 0 && Date.now() - issuedAt >= REFRESH_AFTER_MS
+    const expiring = forced || credential.expiresAtMs <= 0 || credential.expiresAtMs <= Date.now() + REFRESH_MARGIN_MS || stale
     if (!expiring) return 'fresh'
     const existing = this.refreshInflight.get(account.id)
     if (existing !== undefined) {
-      await existing
-      return 'fresh'
+      return await existing
     }
     const run = (async () => {
       if (credential.refreshToken === '') {
@@ -1629,13 +2486,32 @@ export class WorkBuddyAccountPool {
           // rode the revoked one until it was refreshed again.
           lastRefreshAtMs: Date.now(),
         }
-        this.noRefreshWarned.delete(account.id)
-        this.logger?.info?.(`${LOG_PREFIX}: refreshed token for ${account.label}`)
         // Kept in the archive as well. For an account whose sign-in file the
         // client already overwrote, the archive is the only copy that survives a
         // restart: leaving the superseded token there meant the account came back
         // dead and held out until a manual re-login.
         await this.archiveCredentials([account.credential])
+        // A sign-in the plugin wrote is renewed in place. Without this the
+        // refreshed token lived only in memory and in the archive, the next scan
+        // read the old file back, and the renewal was lost: the stored expiry
+        // never moved, so the keepalive looked like it did nothing.
+        await this.renewOwnSignIn(account.credential)
+        this.noRefreshWarned.delete(account.id)
+        // A token the upstream minted is proof the sign-in works again, so a hold
+        // that said otherwise is dropped here rather than at its cap: without this
+        // an account recovered by a refresh still showed as needing a re-login and
+        // stayed out of rotation for the rest of the window. Only a session hold is
+        // released - a rate-limit or balance cooldown says nothing this refresh
+        // contradicts.
+        const sessionHold = this.heldIds.get(account.id)
+        if (sessionHold !== undefined && sessionHold.reason === 'session') {
+          this.heldIds.delete(account.id)
+          // Only the cooldown this hold wrote is cleared; one that outlasts it
+          // belongs to the upstream's own window and stays.
+          if (account.cooldownUntilMs > Date.now() && account.cooldownUntilMs <= sessionHold.until) account.cooldownUntilMs = 0
+          this.logger?.info?.(`${LOG_PREFIX}: ${account.label} refreshed again; releasing the refused sign-in hold`)
+        }
+        this.logger?.info?.(`${LOG_PREFIX}: refreshed token for ${account.label}`)
         return 'refreshed'
       } catch (error: unknown) {
         if (credential.expiresAtMs > Date.now() + 30_000) {
@@ -1643,7 +2519,8 @@ export class WorkBuddyAccountPool {
         } else {
           this.logger?.error?.(`${LOG_PREFIX}: token refresh failed and token expired for ${account.label}`, error)
         }
-        return 'failed'
+        const kind = upstreamErrorKind(error)
+        return kind === 'session_dead' ? 'refused' : 'failed'
       }
     })()
     this.refreshInflight.set(account.id, run)
@@ -1662,9 +2539,9 @@ export class WorkBuddyAccountPool {
    * limit ("可切换其他模型继续使用"). Without a model id the whole account is
    * cooled, which callers should reserve for limits that truly span every model.
    *
-   * `hold` marks a decision of the pool's own rather than a timestamp read off
-   * an upstream answer — a spent account, a dead session. It is bounded by
-   * POOL_HOLD_CAP_MS instead of PENALIZE_CAP_MS, because the two-hour ceiling
+   * `hold` names a decision of the pool's own rather than a timestamp read
+   * off an upstream answer — a spent account, a dead session. It is bounded by
+   * POOL_HOLD_MS instead of PENALIZE_CAP_MS, because the two-hour ceiling
    * exists to stop a mis-parsed reset from parking an account all day, and
    * neither of these conditions clears by itself.
    */
@@ -1672,7 +2549,7 @@ export class WorkBuddyAccountPool {
     accountId: string,
     resetAtMs?: number,
     modelId?: string,
-    hold: boolean | PoolHoldReason = false,
+    hold: false | PoolHoldReason = false,
   ): void {
     const account = this.accounts.find(item => item.id === accountId)
     if (account === undefined) return
@@ -1693,10 +2570,8 @@ export class WorkBuddyAccountPool {
       account.rateLimitStreak = sinceLast > RATE_LIMIT_STREAK_WINDOW_MS ? 1 : (account.rateLimitStreak ?? 0) + 1
       account.rateLimitStreakAtMs = now
     }
-    // `true` is the spent-account shape, which is what a caller that does not
-    // name a reason means.
-    const holdReason: PoolHoldReason | undefined = hold === false ? undefined : hold === true ? 'spent' : hold
-    const cap = holdReason !== undefined ? POOL_HOLD_CAP_MS : PENALIZE_CAP_MS
+    const holdReason: PoolHoldReason | undefined = hold === false ? undefined : hold
+    const cap = holdReason !== undefined ? POOL_HOLD_MS : PENALIZE_CAP_MS
     // A limit with no deadline - the bare "frequency limit" body - is stretched by
     // how often this account has failed in a row, so a persistently limited account
     // stops returning to the queue every configured minute to fail again.
@@ -1722,13 +2597,17 @@ export class WorkBuddyAccountPool {
       const prior = this.heldIds.get(accountId)
       const carried = prior !== undefined && prior.until > now && prior.reason === 'session' ? prior : undefined
       const reason = carried?.reason ?? holdReason
-      // The proof is every sign-in the files hold now, which is what a later scan
-      // compares against. `account.credential` may already be a token this process
-      // minted: recording that alone made a file that had not changed look like a
-      // re-login on the next scan.
+      // The proof is every sign-in this account can be served with: what the files
+      // hold now, plus the copy in force when it came from somewhere the walk does
+      // not read (the archive). Both are what a later scan compares against.
+      //
+      // An empty proof is not "nothing to answer to": it means the account had no
+      // file at all when it was refused, and then only a file that appears later
+      // can end the hold. Recording nothing there let every scan release a dead
+      // account and spend an upstream call rediscovering the refusal.
       const heldSignIns = carried !== undefined
         ? carried.heldSignIns
-        : (this.signInTokens.get(accountId) ?? []).map(entry => entry.accessToken)
+        : this.refusedSignInsFor(accountId)
       this.heldIds.set(accountId, {
         reason,
         until: Math.max(until, carried?.until ?? 0),
@@ -1736,15 +2615,35 @@ export class WorkBuddyAccountPool {
       })
     }
     this.logger?.warn(
-      `${LOG_PREFIX}: account ${account.label} rate-limited; cooling until ${new Date(until).toISOString()}`,
+      holdReason !== undefined
+        ? `${LOG_PREFIX}: account ${account.label} held (${holdReason}); held until ${new Date(until).toISOString()}`
+        : `${LOG_PREFIX}: account ${account.label} rate-limited; cooling until ${new Date(until).toISOString()}`,
     )
+  }
+
+  /**
+   * Keep one model out of one account's rotation for a stated window.
+   *
+   * `penalize` caps what it writes at `PENALIZE_CAP_MS`, which exists so a
+   * mis-parsed rate-limit reset cannot park work all day. A plan refusal names
+   * no upstream window and clears only when the subscription changes, so it
+   * brings its own deadline; routing it through `penalize` silently shortened
+   * it to the rate-limit ceiling and bought one wasted upstream call per two
+   * hours. The account is left alone: every other model on it still serves.
+   */
+  blockModel(accountId: string, modelId: string, untilMs: number): void {
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined || modelId === '' || untilMs <= Date.now()) return
+    pruneModelCooldowns(account, Date.now())
+    account.modelBlocks[modelId] = Math.max(account.modelBlocks[modelId] ?? 0, untilMs)
   }
 
   /** Clear all cooldowns (account-wide and per-model), e.g. from a reset command. */
   resetCooldowns(): void {
     for (const account of this.accounts) {
       account.cooldownUntilMs = 0
-      account.modelCooldowns = {}
+      account.modelCooldowns = Object.create(null) as Record<string, number>
+      account.modelBlocks = Object.create(null) as Record<string, number>
       account.rateLimitHits = 0
       account.rateLimitStreak = 0
       account.rateLimitStreakAtMs = 0

@@ -27,6 +27,10 @@ export type UpstreamErrorKind =
   | 'not_found'
   | 'server'
   | 'client'
+  /** The vendor restricted the account itself: 11140, "request illegal". */
+  | 'account_restricted'
+  /** A model this account's plan does not include: the upstream's 11158 gate. */
+  | 'model_tier'
   /** The network path failed before any upstream answer existed. */
   | 'transport'
   /** The caller hung up before the answer arrived; not an upstream failure. */
@@ -173,23 +177,32 @@ const CN_BILLING_BASE = 'https://www.codebuddy.cn'
 /** Global base for `workbuddy.ai` logins. */
 const GLOBAL_BASE = 'https://www.workbuddy.ai'
 
-/** Chat UA: the official desktop client's three-segment spelling. */
-const CLIENT_UA = 'WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1'
+/**
+ * One client version for every WorkBuddy call.
+ *
+ * The version appears twice in a request: `X-IDE-Version` and the version
+ * segment of the UA. They were three literals (5.8.4 in the header, 5.5.4 in the
+ * CN UA, 5.5.2 for the roster), which is a combination no real client produces.
+ * The 5.8.4 desktop spelling still returns the full 28-model roster from the
+ * global config (verified 2026-10-26), so every call reads from here.
+ */
+const CLIENT_VERSION = '5.8.4'
+const CLI_VERSION = '2.161.0'
+/** CN chat UA: the desktop client's three-segment spelling. */
+const CLIENT_UA = `WorkBuddy/${CLIENT_VERSION} WorkBuddy/${CLIENT_VERSION} CLI/${CLI_VERSION}`
 
 /**
- * The international desktop client's own chat UA, from the 5.8.4 capture.
- *
- * The CN gateway has no capture of its own and reads its roster with the
- * desktop spelling it has always been sent, so CN keeps `CLIENT_UA`.
+ * The international desktop client's own chat UA: the `workbuddy-ai/` segment
+ * only exists on that gateway, and the CN spelling gets the CLI roster there.
  */
-const GLOBAL_CHAT_UA = 'WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0'
+const GLOBAL_CHAT_UA = `WorkBuddy/${CLIENT_VERSION} workbuddy-ai/${CLIENT_VERSION} CLI/${CLI_VERSION}`
 
 /**
  * Desktop app UA. The global gateway serves its product config only to this
  * client channel: the CLI UA gets a truncated roster (or an HTTP 500), which
  * is why the international catalog must be read with the desktop spelling.
  */
-const DESKTOP_UA = 'WorkBuddy/5.5.2'
+const DESKTOP_UA = `WorkBuddy/${CLIENT_VERSION}`
 
 /** CN model catalog. */
 const MODELS_CATALOG_PATH = '/v2/enterprises/personal/models'
@@ -198,7 +211,7 @@ const GLOBAL_CONFIG_PATH = '/v3/config'
 const JSON_TIMEOUT_MS = 30_000
 const ERROR_BODY_LIMIT = 4096
 /** Deadline for a failed response's error body, which no other phase covers. */
-const ERROR_BODY_TIMEOUT_MS = 10_000
+export const ERROR_BODY_TIMEOUT_MS = 10_000
 /** Deadline for the chat POST to reach its response headers. */
 const STREAM_HEADERS_TIMEOUT_MS = 60_000
 /** Longest a relayed chat stream may go without a single byte. */
@@ -211,7 +224,7 @@ const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000
  * comfortably past that margin and far short of any cap, so a token with a
  * real lifetime always replaces it in time.
  */
-export const ASSUMED_TOKEN_LIFETIME_MS = 60 * 60 * 1000
+const ASSUMED_TOKEN_LIFETIME_MS = 60 * 60 * 1000
 
 /** Longest expiry `Date` can represent; anything past it is not a date. */
 const MAX_EXPIRY_MS = 4_102_444_800_000
@@ -397,6 +410,12 @@ const HARD_CREDIT_MARKERS = [
   '积分不足', '额度不足', '余额不足', '积分用完', '额度用尽', '没有积分',
 ]
 
+/** Whether a text names an exhausted balance rather than a rate limit. */
+export function isHardCreditText(body: string): boolean {
+  const lower = body.toLowerCase()
+  return HARD_CREDIT_MARKERS.some(marker => lower.includes(marker.toLowerCase()) || body.includes(marker))
+}
+
 /**
  * Session-invalidation markers that mean "sign in again in the WorkBuddy app".
  *
@@ -406,6 +425,25 @@ const HARD_CREDIT_MARKERS = [
  * cooling the account, so the same limited account is hit on every attempt.
  */
 const SESSION_DEAD_PATTERN = /Offline user session not found|"code"\s*:\s*"?12153\b/u
+
+/**
+ * The plan gate: the account is fine, the model is not included in it.
+ *
+ * Matched as an envelope value rather than a bare substring, for the same
+ * reason as the session marker: `11158` turns up inside ids, and reclassifying
+ * a request error as a plan gate would cool a model that is actually fine.
+ */
+const MODEL_TIER_PATTERN = /"code"\s*:\s*"?11158\b/u
+
+/**
+ * The vendor's account-level restriction: `11140`, "request illegal".
+ *
+ * The body names the account ("your account has been restricted due to unusual
+ * activity") rather than the request, and no retry with the same sign-in can
+ * clear it. Reading it as a plain client error answered 400 and stopped the
+ * rotation, so a second account that could serve the turn was never tried.
+ */
+const ACCOUNT_RESTRICTED_PATTERN = /"code"\s*:\s*"?11140\b/u
 
 /** The two gateways WorkBuddy serves: the domestic one and the international one. */
 export type WorkBuddyRegion = 'cn' | 'global'
@@ -463,6 +501,12 @@ function commonHeaders(credential: WorkBuddyCredential): Record<string, string> 
     // The official client's gate header, on every API request. Missing it
     // marks the caller as something other than the client.
     'X-CodeBuddy-Request': '1',
+    // One connection per request. undici's global pool would otherwise hand a
+    // socket that just carried another account's Authorization to the next
+    // account, and two credentials seen on one connection is a correlation
+    // clue the connection itself carries. fetch exposes no per-request agent,
+    // so the socket is closed instead; a turn pays one handshake for it.
+    'Connection': 'close',
   }
 }
 
@@ -501,7 +545,7 @@ function conversationHeaders(): Record<string, string> {
     'X-Agent-Intent': 'craft',
     'X-Agent-Purpose': 'conversation',
     'X-Agent-Type': 'main',
-    'X-IDE-Version': '5.8.4',
+    'X-IDE-Version': CLIENT_VERSION,
     'X-Private-Data': 'true',
     'X-Trace-ID': traceId,
     'traceparent': `00-${traceId}-${spanId}-01`,
@@ -554,6 +598,12 @@ function billingHeaders(credential: WorkBuddyCredential): Record<string, string>
     'Content-Type': 'application/json',
     // Billing does not go through commonHeaders, so the gate header lands here.
     'X-CodeBuddy-Request': '1',
+    // A request with no UA at all is its own kind of fingerprint: every client
+    // sends one, and leaving it out made the billing family look unlike the
+    // desktop app the rest of the calls imitate.
+    'User-Agent': CLIENT_UA,
+    // Same reason as commonHeaders: one connection, one account.
+    'Connection': 'close',
   }
   if (credential.uid !== '' && credential.uid !== undefined) headers['X-User-Id'] = credential.uid
   if (credential.enterpriseId !== undefined && credential.enterpriseId !== '') {
@@ -618,8 +668,16 @@ function gatewayRejectionText(status: number): string {
  * Never rejects: a read that fails keeps whatever arrived, which is usually the
  * sentence the client needs. Callers on the error path used to let a body that
  * died mid-read replace the upstream's status with a bare abort error.
+ *
+ * `timeoutMs` is a seam for the check: the shipped deadline is ten seconds, and
+ * the case that proves the reader is cancelled should not sit it out.
  */
-export async function readErrorBody(response: Response, limitBytes: number, signal?: AbortSignal): Promise<string> {
+export async function readErrorBody(
+  response: Response,
+  limitBytes: number,
+  signal?: AbortSignal,
+  timeoutMs: number = ERROR_BODY_TIMEOUT_MS,
+): Promise<string> {
   const body = response.body
   if (body === null) return ''
   const reader = body.getReader()
@@ -628,7 +686,7 @@ export async function readErrorBody(response: Response, limitBytes: number, sign
   const abandon = (reason: string): void => {
     void reader.cancel(new Error(reason)).catch(() => {})
   }
-  const deadline = setTimeout(() => { abandon('upstream error body read timed out') }, ERROR_BODY_TIMEOUT_MS)
+  const deadline = setTimeout(() => { abandon('upstream error body read timed out') }, timeoutMs)
   deadline.unref?.()
   const onAbort = (): void => { abandon('upstream error body read cancelled by the caller') }
   if (signal?.aborted === true) onAbort()
@@ -667,7 +725,13 @@ async function readEnvelope(response: Response): Promise<Envelope> {
     // The status is interpolated rather than written: this branch accepts 401
     // and 403, and naming 401 for a 403 sends the reader looking for a
     // credential problem the gateway never reported.
-    throw new Error(gatewayRejectionText(response.status))
+    //
+    // The kind rides on the error because the callers that have to act on it
+    // (a refresh-and-retry, a hold) catch this throw rather than reading a
+    // result object, and matching the sentence would tie them to its wording.
+    throw Object.assign(new Error(gatewayRejectionText(response.status)), {
+      kind: classifyUpstreamError(response.status, text),
+    })
   }
   let parsed: unknown
   try {
@@ -688,8 +752,29 @@ async function readEnvelope(response: Response): Promise<Envelope> {
 
 /** Fail an envelope whose business code is non-zero, classified like HTTP errors. */
 function envelopeError(status: number, envelope: Envelope): Error {
-  const kind = classifyUpstreamError(status, envelope.msg)
-  return new Error(`workbuddy upstream ${kind} (http ${status}): ${redactSecrets(envelope.msg).slice(0, 160)}`)
+  // Classified from the envelope rebuilt as a document, not from `msg` alone:
+  // the business codes that decide a class live in the `code` field, so passing
+  // only the message hid 11140/11158 from every JSON answer and left a refused
+  // roster read looking like a plain client error.
+  const document = JSON.stringify({ code: envelope.code, msg: envelope.msg })
+  const kind = classifyUpstreamError(status, document)
+  return Object.assign(
+    new Error(`workbuddy upstream ${kind} (http ${status}): ${redactSecrets(envelope.msg).slice(0, 160)}`),
+    { kind },
+  )
+}
+
+/**
+ * The classified kind of an upstream failure, for a caller holding the error.
+ *
+ * `chatStream` answers with its kind in the result; every JSON endpoint throws,
+ * and a caller that must tell a refused sign-in from a rate limit would
+ * otherwise match on the message text. Anything without a kind - a local fault,
+ * a bug - reads as undefined rather than being guessed at.
+ */
+export function upstreamErrorKind(error: unknown): UpstreamErrorKind | undefined {
+  const kind = (error as { kind?: unknown } | null | undefined)?.kind
+  return typeof kind === 'string' ? kind as UpstreamErrorKind : undefined
 }
 
 /**
@@ -712,6 +797,18 @@ function envelopeError(status: number, envelope: Envelope): Error {
 export function classifyUpstreamError(status: number, body: string): UpstreamErrorKind {
   if (status === 402) return 'hard_credit'
   if (status === 429) return 'soft_rate'
+  // The vendor restricted the account itself. The body names the account, not
+  // the request, so no retry with this sign-in can clear it; reading it as
+  // `client` answered 400 and left the rotation on the first account.
+  if ((status === 400 || status === 403 || status === 422) && ACCOUNT_RESTRICTED_PATTERN.test(body)) {
+    return 'account_restricted'
+  }
+  // A plan refusal is a verdict on the model, not on the account: the sign-in
+  // is healthy and every other model on it still works. Reading it as `client`
+  // answered a bare 400 and never tried the accounts that can serve the model.
+  if ((status === 400 || status === 403 || status === 422) && MODEL_TIER_PATTERN.test(body)) {
+    return 'model_tier'
+  }
   const aboutSignIn = status === 401 || status === 403
   if (aboutSignIn && SESSION_DEAD_PATTERN.test(body)) return 'session_dead'
   // A 401 carries no other meaning here: the loopback endpoint authenticates
@@ -730,10 +827,7 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   // against, so matching there turned a malformed body into a whole-pool
   // rotation and a 402 that named the wrong problem.
   if (status === 403) {
-    const lower = body.toLowerCase()
-    for (const marker of HARD_CREDIT_MARKERS) {
-      if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
-    }
+    if (isHardCreditText(body)) return 'hard_credit'
   }
   // The three markers refine a status that is itself undecided about rate
   // limiting, and only that. A 400/404/422 is a verdict on the request, and its
@@ -1059,7 +1153,12 @@ export class WorkBuddyUpstreamClient {
       deadline.arrived()
     }
     if (response.ok) {
-      if (response.body === null) return { ok: true, response }
+      // A 200 with no body has nothing to relay. Returning it as success made
+      // the gateway throw inside the relay and answer 500 `internal`, which
+      // reads as a plugin bug instead of an upstream fault.
+      if (response.body === null) {
+        return { ok: false, kind: 'server', status: 502, message: 'upstream returned 200 without a stream' }
+      }
       // The watchdog stream is handed over under the relay key as well: a
       // Response built around a stream this plugin made stops delivering to a
       // `Readable.fromWeb` reader after the first chunks, so the gateway pumps
@@ -1147,15 +1246,19 @@ export class WorkBuddyUpstreamClient {
           ...credential.domain === '' ? {} : { 'X-Domain': credential.domain },
           'X-Product': 'SaaS',
           'X-Requested-With': 'XMLHttpRequest',
+          // The gate header every API request carries, the global roster included.
+          'X-CodeBuddy-Request': '1',
           'Connection': 'close',
           'User-Agent': DESKTOP_UA,
         }
       : {
+          // Built from commonHeaders rather than spelled out: the hand-written
+          // copy was the one WorkBuddy request that missed the gate header and
+          // the per-request connection close, so a roster call could hand a
+          // socket with one account's Authorization to the next account.
+          ...commonHeaders(credential),
           'Authorization': `Bearer ${credential.accessToken}`,
           'Accept': 'application/json',
-          'Origin': billingBase(credential),
-          'Referer': `${billingBase(credential)}/`,
-          'User-Agent': CLIENT_UA,
         }
     if (!global && credential.enterpriseId !== undefined && credential.enterpriseId !== '') {
       headers['X-Enterprise-Id'] = credential.enterpriseId

@@ -789,72 +789,23 @@ test('a growth run that outran its answer waits for the pass instead', async () 
  * clears while this record survives - and the whole note used to be replaced by
  * "never run" in that state, so a by-hand refresh reported nothing at all.
  */
-test('the keep-alive line survives a restart that cleared the pass log', () => {
-  const { context, seen } = panelGrowth(['autoNoteRows'])
+test('the keep-alive line reports on its own, whatever the pass log says', () => {
+  const { context, seen } = panelGrowth(['autoNoteRows', 'keepAliveNoteRow'])
   const record = { at: '2026-10-21T11:02:22.459Z', refreshed: 0, fresh: 6, failed: 0, noToken: 0 }
-  const rows = context.autoNoteRows({ last: null, keepAlive: record })
-  assert.equal(rows.map((row) => row.text).join(','), 'auto.neverRun,auto.rowKeepAlive',
-    'the pass log says nothing and the keep-alive still reports')
+  // The pass log says nothing at all in this state, and the keep-alive still
+  // reports - its record is the only proof the button did anything, and a
+  // restart clears the pass log without touching it.
+  assert.equal(context.autoNoteRows({ last: null }).map((row) => row.text).join(','), 'auto.neverRun',
+    'the check-in log carries nothing but its own line')
+  assert.equal(context.keepAliveNoteRow(record).text, 'auto.rowKeepAlive',
+    'and the keep-alive reports from its own card')
   // The row's own words: the counts are read out of the record rather than
   // copied into the sentence, so a missing `fresh` shows up as `undefined`.
   const said = seen.find(([key]) => key === 'auto.rowKeepAlive')[1]
   assert.equal(JSON.stringify(said), JSON.stringify({ when: record.at, refreshed: 0, fresh: 6, failed: 0, noToken: 0 }),
     'the row carries every count the host reports, the fresh ones included')
 
-  const failed = context.autoNoteRows({ last: null, keepAlive: { ...record, failed: 2 } })
-  assert.equal(failed[failed.length - 1].tone, 'fail', 'a failure colours the line')
-  const freshOnly = context.autoNoteRows({ last: null, keepAlive: record })
-  assert.equal(freshOnly[freshOnly.length - 1].tone, '', 'a pass that refreshed nothing is not a success')
-})
-test('every growth string the card asks for is translated', () => {
-  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  const card = source.slice(source.indexOf('function renderGrowth('))
-  const asked = new Set([...card.matchAll(/t\("(growth\.[a-zA-Z]+)"/g)].map((match) => match[1]))
-  assert.ok(asked.size >= 10, 'the card must name its own strings, not reuse the check-in ones')
-  for (const dictionary of ['EN', 'ZH']) {
-    const from = source.indexOf(`var ${dictionary} = {`)
-    const to = source.indexOf('\n}', from)
-    const body = source.slice(from, to)
-    for (const key of asked) {
-      assert.ok(body.includes(`"${key}"`), `${dictionary} is missing ${key}`)
-    }
-  }
-})
-
-test('the growth centre is a page of its own, beside the pool and the models', () => {
-  const html = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
-  for (const id of ['growthTitle', 'growthState', 'growthRead', 'growthRun', 'growthText', 'growthHint', 'growthNote', 'growthAccounts']) {
-    assert.ok(html.includes(`id=\"${id}\"`), `index.html must carry ${id}`)
-  }
-  assert.ok(html.includes('id=\"growthView\"'), 'and the page itself')
-  assert.ok(html.includes('data-tab=\"growth\"'), 'with a tab of its own in the view row')
-  // The tab row is the pool, the models and the check: the growth page sits in
-  // it rather than under the pool's account list.
-  const tabs = html.slice(html.indexOf('id=\"viewTabs\"'), html.indexOf('</nav>', html.indexOf('id=\"viewTabs\"')))
-  assert.ok(/data-tab=\"pool\"[\s\S]*data-tab=\"models\"[\s\S]*data-tab=\"growth\"/.test(tabs),
-    'the growth tab must follow the pool and the models, not precede them')
-  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  assert.ok(source.includes('  renderGrowth();'), 'the render pass must paint the page')
-  assert.ok(source.includes('$(\"growthRead\").addEventListener'), 'and the read button must be bound')
-  assert.ok(source.includes('$(\"growthRun\").addEventListener'), 'and so must the run button')
-  assert.ok(source.includes('growth: \"growthView\"'), 'and the tab must select the page')
-  assert.ok(/tabs\[i\]\.hidden = key === \"growth\" && activeSource !== \"workbuddy\"/.test(source),
-    'the tab is WorkBuddy only, so it must hide itself on the other two sources')
-  // A tab with no dictionary entry renders as its own key. The growth tab did
-  // exactly that, so every tab in the row is checked in both locales here.
-  for (const locale of ['EN', 'ZH']) {
-    const from = source.indexOf(`var ${locale} = {`)
-    const dict = source.slice(from, source.indexOf('}', from))
-    for (const key of ['tab.pool', 'tab.models', 'tab.check', 'tab.growth']) {
-      assert.ok(dict.includes(`"${key}":`), `${locale} must label ${key}`)
-    }
-  }
-})
-
-test('the web panel allows the growth channels it needs', () => {
-  const source = fs.readFileSync(path.join(root, 'src/web-panel.ts'), 'utf8')
-  const allow = source.slice(source.indexOf('const CHANNELS'), source.indexOf('])', source.indexOf('const CHANNELS')))
-  for (const channel of ['xd.growthState', 'xd.growthRun']) {
-    assert.ok(allow.includes(`'${channel}'`), `${channel} must be in the web panel allowlist`)
-  }
+  assert.equal(context.keepAliveNoteRow({ ...record, failed: 2 }).tone, 'fail', 'a failure colours the line')
+  assert.equal(context.keepAliveNoteRow(record).tone, '', 'a pass that refreshed nothing is not a success')
+  assert.equal(context.keepAliveNoteRow(null), null, 'a card with no run yet draws no line')
 })

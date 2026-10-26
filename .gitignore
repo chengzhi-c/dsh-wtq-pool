@@ -1,5 +1,19 @@
 node_modules/
 *.log
+.env*
+
+# Editor and OS artifacts. None ship today; the rules stop the next one from
+# riding along in a `git add .`.
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# A stray root directory produced by a tool that expanded an absolute path
+# inside the checkout. Windows forbids `:` in a name, so the plain pattern
+# cannot match it; `?` covers the combining character some tools leave behind.
+/C?/
 
 # Build output. The tarball is produced by `pnpm pack` from the tree, so it is a
 # release artifact rather than source: keeping it in history would carry a
@@ -16,9 +30,17 @@ credentials-archive.json
 checkin-slots.json
 doctor.txt
 settings.json
+deleted-signins.json
 .tmp*/
 # The archive is written to `<name>.<uuid>.tmp` and renamed into place, so a
 # process that died between the two leaves a copy of EVERY credential under a
 # name the rule above does not match: `.tmp*/` is a directory pattern.
 credentials-archive.json.*.tmp
 checkin-slots.json.tmp
+deleted-signins.json.*.tmp
+deleted-signins.json.lock
+# Written next to the plugin when the host rewrites its manifest, and the pack
+# outputs put beside the repo by a build. Neither belongs in a commit.
+manifest.json.tmp
+*.piplug
+*.tgz

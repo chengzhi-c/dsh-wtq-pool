@@ -50,10 +50,13 @@ var EN = {
   "region.parkedShort": "disabled",
   "region.global": "Global",
   "region.cnShort": "CN",
-  "region.globalShort": "Global",
   "pool.summary": "{count} account(s) · {cooling} cooling",
   "pool.healthy": "Rate limits automatically switch to another available account.",
   "pool.allCooling": "Every account is rate-limited right now; requests pause until a cooldown lifts.",
+  "pool.refused": "{count} need a new sign-in",
+  "pool.allRefused": "Every account's sign-in was refused by the upstream; add one with Add account and the pool starts working again.",
+  "pool.restricted": "{count} restricted by the upstream",
+  "pool.allRestricted": "Every account was restricted by the upstream; appeal the restriction in the WorkBuddy console, or add another account.",
   "pool.checkinAll": "Check in every account",
   "pool.checkinAllHint": "Collect every account's daily check-in. The streak bonus is collected with it.",
   "pool.checkinAllBusy": "Checking in…",
@@ -106,6 +109,7 @@ var EN = {
   "qoder.fallback": "preferred port {port} is taken; this session serves a spare port, which the provider row follows",
   "badge.next": "next up",
   "badge.cooling": "cooling",
+  "badge.revoked": "re-login needed",
   "badge.healthy": "healthy",
   "acct.token": "token {time}",
   "acct.tokenExpiring": "token expires in {min} min",
@@ -114,13 +118,18 @@ var EN = {
   "time.days": "{count} d",
   "acct.noExpiry": "no token expiry reported",
   "acct.coolUntil": "cooling until {time}",
+  "acct.holdUntil": "held until {time}",
+  "acct.restrictedUntil": "restricted by the upstream until {time}",
+  "acct.restrictedHint": "The upstream restricted this account (11140: unusual activity). The pool leaves it out of rotation six hours at a time and retries afterwards; appeal it in the WorkBuddy console.",
+  "badge.restricted": "restricted",
+  "acct.signInRefused": "The upstream no longer accepts this account's sign-in, and its refresh token is spent. Add the account again from the panel: that sign-in is the plugin's own copy.",
   "acct.hits": "{hits} rate-limit hit(s)",
   "acct.choose": "Use credits from",
   "acct.automatic": "Automatic (follow account usage)",
   "acct.choiceHint": "The picked account goes first; a rate limit switches account until the cooldown lifts. Automatic follows the usage mode.",
   "acct.unavailable": "Selected account unavailable (automatic fallback)",
   "acct.expired": "sign-in expired",
-  "acct.archivedHint": "The global client keeps one sign-in file, so switching accounts overwrites this one. The token was saved: the account keeps serving until it expires. Sign in again in WorkBuddy to renew it.",
+  "acct.archivedHint": "No desktop sign-in file holds this account any more: the token the pool kept is what serves it, until that token expires. Signing the account in again in WorkBuddy renews it.",
   "acct.choiceCredits": "{label} · {credits} credits",
   "badge.preferred": "selected",
   "acct.on": "Enabled",
@@ -128,17 +137,16 @@ var EN = {
   "acct.switchOn": "Use this account again",
   "acct.inPool": "In the rotation",
   "acct.switchOff": "Keep this account out of the pool for now",
-  "acct.offHint": "Switched off: requests never use this account until you switch it back on.",
   "acct.remove": "Remove",
   "acct.removeHint": "Takes the account out of the pool. Restore it under “Removed accounts”.",
   "acct.delete": "Delete",
-  "acct.deleteHint": "Deletes the sign-in file this plugin wrote. The account is gone for good and cannot be restored.",
-  "acct.deleteConfirm": "Delete {name}? The sign-in file is removed and the account cannot be brought back.",
+  "acct.deleteHint": "Takes the account out of the pool and deletes the plugin's saved sign-in and archive; signing the account in again restores it.",
+  "acct.deleteConfirm": "Delete {name}? It leaves the pool and deletes the plugin's saved sign-in and archive; a rescan will not bring it back. Signing the account in again restores it.",
   "acct.deleteConfirmAgain": "Press delete again to confirm",
   "acct.stateError": "Could not change this account: {message}",
   "pool.switchedOff": "{count} switched off",
   "removed.title": "Removed accounts",
-  "removed.hint": "These accounts are never used, and detecting accounts again will not bring them back.",
+  "removed.hint": "Out of the pool; restore one here and it rejoins rotation.",
   "removed.restore": "Restore",
   "acct.modelCool": "{model} cooling until {time}",
   "credits.title": "Credits",
@@ -243,16 +251,16 @@ var EN = {
   "keepAlive.runNow": "Refresh now",
   "keepAlive.running": "Refreshing…",
   "keepAlive.label": "Token keep-alive",
-  "keepAlive.hint": "Renews sign-in tokens that are close to expiry, on demand. An account you rarely use then does not hit an expired token on the turn that needed it. Tokens with plenty of time left are left alone.",
+  "keepAlive.hint": "Renews sign-in tokens on demand: plugin-owned copies refresh once six hours old or close to expiry, and the result is written back into the file the plugin owns, so a refused sign-in shows up the same day. The desktop app renews the sign-in it is using.",
   "growth.title": "Growth centre",
   "growth.ready": "WorkBuddy",
   "growth.running": "Running…",
   "growth.read": "Read state",
   "growth.reading": "Reading…",
-  "growth.readHint": "Reads what the centre holds without claiming anything.",
+  "growth.readHint": "Reads the current tiers and what is due; Run now claims them.",
   "growth.run": "Run now",
-  "growth.runHint": "Runs the growth half of the scheduled check-in on its own, and reports each step.",
-  "growth.hint": "Four steps: the make-up card, the gift and compensation, the activity report, and the streak tiers with their draws. A run consumes the make-up card and the draws; the rest are idempotent and pay nothing a second time.",
+  "growth.runHint": "Runs the growth stage of the scheduled check-in on its own, and reports each step.",
+  "growth.hint": "Four steps: the make-up card, the gift and compensation, the activity report, and the streak tiers with their draws. A run consumes the make-up card and the draws; the rest can run again without paying twice.",
   "growth.stateNone": "No state read yet",
   "growth.stateStale": "The last run made this stale; read the state again",
   "growth.stateSummary": "{accounts} account(s) · {tiers} tier(s) to redeem · {cards} make-up card(s) · {chances} draw(s)",
@@ -267,7 +275,7 @@ var EN = {
   "growth.tierLocked": "locked",
   "growth.rowNothing": "Nothing to collect here",
   "growth.rowFailed": "This account could not be read",
-  "growth.onlyWorkbuddy": "The growth centre belongs to WorkBuddy.",
+  "growth.onlyWorkbuddy": "The growth centre applies to WorkBuddy accounts.",
   "growth.runNone": "Nothing to collect on this pass",
   "growth.runLine": "{when}: make-up {makeup} · gift +{gift} · compensation +{compensation} · activity {activity} · tiers {streak} · draws {lottery} · +{credit} credits",
   "growth.runFailed": "{when}: {failed} step(s) failed",
@@ -299,6 +307,7 @@ var EN = {
   "foot.license": "License",
   "err.bridge": "The panel bridge is unavailable.",
   "err.busy": "The panel is busy with another action; try again in a moment.",
+  "err.stale": "The plugin was reloading; the list below is the last document before the reload. Refresh again.",
   "tag.free": "free",
   "tag.rate": "x{rate}",
   "tag.promoNight": "free until {hour}",
@@ -336,10 +345,13 @@ var ZH = {
   "region.parkedShort": "已停用",
   "region.global": "国际版",
   "region.cnShort": "国内版",
-  "region.globalShort": "国际版",
   "pool.summary": "{count} 个账号 · {cooling} 个冷却中",
   "pool.healthy": "限流时会自动切换到其他可用账号。",
   "pool.allCooling": "所有账号当前都被限流，请求会等到有账号冷却结束。",
+  "pool.refused": "{count} 个需重新登录",
+  "pool.allRefused": "所有账号的登录都已被上游拒绝，用「添加账号」重新登录一个，号池就能继续用。",
+  "pool.restricted": "{count} 个被上游限制",
+  "pool.allRestricted": "所有账号都被上游限制了；请到 WorkBuddy 官方后台申诉，或换一个账号。",
   "pool.checkinAll": "全部签到",
   "pool.checkinAllHint": "一次领完所有账号今天的签到，连登奖励也随这一轮领取。",
   "pool.checkinAllBusy": "签到中…",
@@ -350,7 +362,7 @@ var ZH = {
   "pool.emptyHint": "请在该版本的 WorkBuddy 桌面 App 里登录，再点「重新检测账号」。",
   "pool.sourceOff": "WorkBuddy 来源已在插件设置里关闭。",
   "login.add": "添加账号",
-  "login.addHint": "在浏览器里登录 WorkBuddy。浏览器登完，这个账号就进池子了。",
+  "login.addHint": "在浏览器里登录 WorkBuddy，完成后该账号即加入账号池。",
   "login.openAgain": "再打开一次链接",
   "login.waiting": "在浏览器里完成登录即可，面板会自己把这个账号收进来。",
   "login.timeout": "登录没有完成。重新开始一次拿新链接。",
@@ -392,6 +404,7 @@ var ZH = {
   "badge.next": "下一个",
   "source.claimableAt": "{time} 后可签到",
   "badge.cooling": "冷却中",
+  "badge.revoked": "需重新登录",
   "badge.healthy": "可用",
   "acct.token": "令牌 {time}",
   "acct.tokenExpiring": "令牌将在 {min} 分钟后过期",
@@ -400,13 +413,18 @@ var ZH = {
   "time.days": "{count} 天",
   "acct.noExpiry": "令牌没有报告有效期",
   "acct.coolUntil": "冷却至 {time}",
+  "acct.holdUntil": "暂停至 {time}",
+  "acct.restrictedUntil": "被上游限制，直至 {time}",
+  "acct.restrictedHint": "上游限制了这个账号（11140：账号存在异常行为）。号池每六小时重试一次；请到 WorkBuddy 官方后台提交申诉。",
+  "badge.restricted": "已限制",
+  "acct.signInRefused": "该账号的登录已被上游拒绝，刷新令牌同样失效。在面板上「添加账号」重新登录一次：这份登录由插件自己保管。",
   "acct.hits": "已触发 {hits} 次限流",
   "acct.choose": "使用哪个账号的额度",
   "acct.automatic": "自动选择（按使用方式）",
   "acct.choiceHint": "优先用所选账号，限流时临时换号；自动选择则按使用方式分配。",
   "acct.unavailable": "所选账号暂不可用（自动换号）",
   "acct.expired": "登录已过期",
-  "acct.archivedHint": "国际版只保留一个登录文件，切号时本账号的登录被覆盖。令牌已留存，账号可用到令牌到期。在 WorkBuddy 里重新登录可续期。",
+  "acct.archivedHint": "桌面端已经没有文件持有这个账号：面板上的这份令牌就是它在用的，到期为止。在 WorkBuddy 里重新登录该账号可续期。",
   "acct.choiceCredits": "{label} · {credits} 积分",
   "badge.preferred": "已选",
   "acct.on": "启用中",
@@ -414,17 +432,16 @@ var ZH = {
   "acct.switchOn": "重新使用该账号",
   "acct.inPool": "参与轮换",
   "acct.switchOff": "暂时不使用该账号",
-  "acct.offHint": "已停用：在重新启用之前，请求不会使用该账号。",
   "acct.remove": "移除",
   "acct.removeHint": "把账号移出账号池；可在「已移除的账号」里恢复。",
   "acct.delete": "删除",
-  "acct.deleteHint": "删掉这个插件自己写下的登录文件。账号就此没有了，不能恢复。",
-  "acct.deleteConfirm": "要删除 {name} 吗？登录文件会被删掉，这个账号再也回不来。",
+  "acct.deleteHint": "移出账号池，并删除插件保存的登录与留档；重新登录该账号即可恢复。",
+  "acct.deleteConfirm": "要删除 {name} 吗？它会退出账号池，插件保存的登录与留档一并删除；重新扫描不会再带回，重新登录该账号即可恢复。",
   "acct.deleteConfirmAgain": "再按一次确认删除",
   "acct.stateError": "账号设置失败：{message}",
   "pool.switchedOff": "{count} 个已停用",
   "removed.title": "已移除的账号",
-  "removed.hint": "这些账号不会被使用，重新检测也不会回到池中。",
+  "removed.hint": "已退出账号池；在此恢复后重新参与分发。",
   "removed.restore": "恢复",
   "acct.modelCool": "{model} 冷却至 {time}",
   "credits.title": "积分",
@@ -514,7 +531,7 @@ var ZH = {
   "rewrite.on": "已开启",
   "rewrite.off": "已关闭",
   "rewrite.label": "改写发往国内版的提示词里的客户端名称",
-  "rewrite.hint": "WorkBuddy 国内版会拒绝提示词里把自己称作 DeepSeek Harness 的对话请求（渠道校验 11128）。开启后，提示词里这个名称的每一处都改为 DeepSeek；关闭后恢复原名。",
+  "rewrite.hint": "WorkBuddy 国内版会拒绝提示词里把客户端名称写成 DeepSeek Harness 的对话请求（渠道校验 11128）。开启后，提示词里这个名称的每一处都改为 DeepSeek；关闭后恢复原名。",
   "rewrite.show": "改写名称",
   "rewrite.hide": "恢复原名",
   "growth.title": "成长中心",
@@ -522,12 +539,12 @@ var ZH = {
   "growth.running": "运行中…",
   "growth.read": "读取状态",
   "growth.reading": "读取中…",
-  "growth.readHint": "只读成长中心现在有什么，不领。",
+  "growth.readHint": "读取当前档位与可领取项；领取动作在「立即执行」。",
   "growth.run": "立即执行",
-  "growth.runHint": "单独执行定时签到里那段成长链路，并按步骤报告结果。",
-  "growth.hint": "四项：补签卡、礼包与补偿、活跃上报、连登档位与抽奖。补签卡与抽奖次数在执行后扣减，其余分项可重复执行，不会二次到账。",
+  "growth.runHint": "单独执行定时签到里的成长环节，并按步骤报告结果。",
+  "growth.hint": "四项：补签卡、礼包与补偿、活跃上报、连登档位与抽奖。补签卡与抽奖次数在执行后扣减，其余分项可重复执行，只到账一次。",
   "growth.stateNone": "还没有读过状态",
-  "growth.stateStale": "跑过一趟之后状态就旧了，点「读取状态」更新",
+  "growth.stateStale": "执行后读数已过期，请重新读取",
   "growth.stateSummary": "{accounts} 个账号 · 可兑换 {tiers} 档 · 补签卡 {cards} 张 · 抽奖 {chances} 次",
   "growth.groupCount": "{count} 个账号",
   "growth.stateFailed": "{failed} 个账号读不出来",
@@ -540,8 +557,8 @@ var ZH = {
   "growth.tierLocked": "未解锁",
   "growth.rowNothing": "这里没有可领的",
   "growth.rowFailed": "这个账号读不出来",
-  "growth.onlyWorkbuddy": "成长中心只跟 WorkBuddy 有关。",
-  "growth.runNone": "这一趟没有可领的",
+  "growth.onlyWorkbuddy": "成长中心对 WorkBuddy 账号生效。",
+  "growth.runNone": "本次没有可领取的项",
   "growth.runLine": "{when}：补签 {makeup} · 礼包 +{gift} · 补偿 +{compensation} · 活跃上报 {activity} · 档位 {streak} · 抽奖 {lottery} · 共 +{credit} 积分",
   "growth.runFailed": "{when}：{failed} 个步骤失败",
   "growth.busy": "签到正在跑，等它跑完",
@@ -561,13 +578,13 @@ var ZH = {
   "auto.rowTrae": "Trae",
   "auto.rowCounts": "{label}：领取 {claimed} · 跳过 {skipped} · 失败 {failed}",
   "auto.rowGrowth": "连登：{streak} 档 · +{credit} 积分 · 失败 {failed}",
-  "auto.rowKeepAlive": "令牌保活 {when}：刷新 {refreshed} 个 · 无需处理 {fresh} 个 · 失败 {failed} 个 · 无刷新令牌 {noToken} 个",
+  "auto.rowKeepAlive": "令牌保活 {when}：刷新 {refreshed} 个 · 已是最新 {fresh} 个 · 失败 {failed} 个 · 无刷新令牌 {noToken} 个",
   "auto.rowTravelCounts": "{label}：派出 {departed} · 领奖 {claimed} · 领养 {adopted}",
   "auto.hint": "时间到后一次性领取三家（WorkBuddy / Trae / Qoder）的签到奖励、WorkBuddy 国内账号的连登奖励，并顺带完成猫猫旅行；今天已领过的时段跳过。当天错过的时段在下次启动时补领。",
   "keepAlive.runNow": "立即刷新",
   "keepAlive.running": "刷新中…",
   "keepAlive.label": "登录令牌保活",
-  "keepAlive.hint": "按需续上快到期的登录令牌，久未使用的账号因此不会在下一趟对话上撞到已过期的令牌。有效期还长的令牌不发请求。",
+  "keepAlive.hint": "按需续期登录令牌：插件自管的副本满 6 小时或临近到期即刷新，结果写回插件自己的登录文件，登录被上游拒绝时当天即可发现。桌面端正在使用的登录由桌面端续期。",
   "auto.badHours": "时间请填 0–23 的整数小时，例如 9 或 9,21。",
   "check.title": "连接检查",
   "check.empty": "运行检查可以看到对话能否连上 WorkBuddy、Trae 或 Qoder。",
@@ -582,6 +599,7 @@ var ZH = {
   "foot.license": "许可",
   "err.bridge": "面板桥不可用。",
   "err.busy": "面板正在处理其他操作，请稍候再试。",
+  "err.stale": "插件刚刚重载，当前列表还是重载前的状态，请再刷新一次。",
   "tag.free": "免费",
   "tag.rate": "x{rate}",
   "tag.promoNight": "夜间免费 · 到 {hour}",
@@ -838,12 +856,24 @@ var reserveDrafts = {};
 // ----------------------------------------------------------------- render
 
 function regionLabel(region, short) {
-  if (region === "global") return t(short ? "region.globalShort" : "region.global");
+  if (region === "global") return t("region.global");
   return t(short ? "region.cnShort" : "region.cn");
 }
 
 function accountsOf(region) {
   return (state && state.accounts ? state.accounts : []).filter(function (a) { return a.region === region; });
+}
+
+/**
+ * A rate limit, as opposed to a hold the pool decided on its own.
+ *
+ * `cooling` is set for all three states, so a summary that counts it directly
+ * tells the user to wait out a window that does not exist: a refused sign-in
+ * needs a fresh login and a vendor restriction needs an appeal. Three summary
+ * lines counted it directly and each read "cooling" over a parked account.
+ */
+function isCooling(account) {
+  return account.cooling === true && account.hold !== "session" && account.hold !== "restricted";
 }
 
 
@@ -854,8 +884,18 @@ function modelsOf(region) {
 
 function renderHeader() {
   var accounts = state ? state.accounts || [] : [];
-  var cooling = accounts.filter(function (a) { return a.cooling; }).length;
-  var healthy = accounts.length > 0 && cooling < accounts.length;
+  // A held sign-in is not a rate limit: counting it as cooling understated how
+  // many accounts the pool had actually lost, and the summary read "0 cooling"
+  // over a pool where half the rows could not answer.
+  // Three states, three counts: a refused sign-in, a vendor restriction and a
+  // rate limit all read as `cooling` upstream, and lumping them together told
+  // the user to wait out a window that does not exist.
+  var cooling = accounts.filter(isCooling).length;
+  var refused = accounts.filter(function (a) { return a.hold === "session"; }).length;
+  var restricted = accounts.filter(function (a) { return a.hold === "restricted"; }).length;
+  // A pool whose every account is refused has nobody to serve a turn, so the
+  // dot must not read healthy just because a refused sign-in is not cooling.
+  var healthy = accounts.length > 0 && cooling + refused + restricted < accounts.length;
   var refreshing = state !== null && state.refreshing === true;
   var dot = $("healthDot");
   dot.className = "dot " + (state === null ? "idle" : (healthy ? "ok" : "idle")) + (refreshing ? " busy" : "");
@@ -866,7 +906,9 @@ function renderHeader() {
   $("barTitle").textContent = "WTQ Pool";
   var sub = state === null
     ? t("state.loading")
-    : t("pool.summary", { count: accounts.length, cooling: cooling });
+    : t("pool.summary", { count: accounts.length, cooling: cooling })
+      + (refused > 0 ? " · " + t("pool.refused", { count: refused }) : "")
+      + (restricted > 0 ? " · " + t("pool.restricted", { count: restricted }) : "");
   // The first paint comes from cache while detection runs behind it, so say so
   // instead of leaving the user to wonder why the numbers are not final yet.
   if (state && state.refreshing === true) sub = sub + " · " + t("state.refreshing");
@@ -1129,7 +1171,7 @@ function renderWorkbuddyHead() {
   clear(host);
   if (state === null) return;
   var accounts = state.accounts || [];
-  var cooling = accounts.filter(function (account) { return account.cooling; }).length;
+  var cooling = accounts.filter(isCooling).length;
   var off = accounts.filter(function (account) { return account.disabled === true; }).length;
   host.appendChild(el("strong", null, t("workbuddy.title")));
   host.appendChild(el("span", "muted", t("pool.summary", { count: accounts.length, cooling: cooling })));
@@ -1171,18 +1213,24 @@ function renderPoolStrip() {
   var strip = $("poolStrip");
   clear(strip);
   var accounts = accountsOf(activeRegion);
-  var cooling = accounts.filter(function (a) { return a.disabled !== true && a.cooling; }).length;
+  var refused = accounts.filter(function (a) { return a.hold === "session"; }).length;
+  var restricted = accounts.filter(function (a) { return a.hold === "restricted"; }).length;
   var off = accounts.filter(function (a) { return a.disabled === true; }).length;
-  // Only the accounts that can serve are counted: a switched-off account is not
-  // rate-limited, so counting it here would read "every account is rate-limited"
-  // over a row that also said "1 switched off". A pool whose serving accounts are
-  // all cooling really does pause, and one with nothing switched on says so on
-  // the line below rather than here.
-  var serving = accounts.length - off;
+  // Only the accounts that can serve a turn right now are counted. A
+  // switched-off account is not rate-limited, and a refused sign-in is parked,
+  // so counting either would read "every account is rate-limited" over a row
+  // that also said "1 switched off". A pool whose serving accounts are all
+  // cooling really does pause, and one with nothing switched on says so on the
+  // line below rather than here.
+  var usable = accounts.filter(function (a) { return a.disabled !== true && !a.cooling; }).length;
   var noteText = accounts.length === 0
     ? ""
-    : (serving > 0 && cooling >= serving ? t("pool.allCooling") : t("pool.healthy"));
+    : usable <= 0
+      ? (restricted > 0 && refused === 0 ? t("pool.allRestricted") : refused > 0 ? t("pool.allRefused") : t("pool.allCooling"))
+      : t("pool.healthy");
   if (noteText) strip.appendChild(el("span", "muted", noteText));
+  if (refused > 0) strip.appendChild(el("span", "finding-fail", t("pool.refused", { count: refused })));
+  if (restricted > 0) strip.appendChild(el("span", "finding-fail", t("pool.restricted", { count: restricted })));
   if (off > 0) strip.appendChild(el("span", "muted", t("pool.switchedOff", { count: off })));
 }
 
@@ -1725,16 +1773,19 @@ function renderAutoCheckin() {
   run.disabled = busy !== null;
 
   // The keep-alive row: one button, run by hand. It is a static node, so the
-  // handler lives in `bind`.
+  // handler lives in `bind`. Its own card, its own log: it renews tokens rather
+  // than collecting rewards and has no hour to set, so it shares nothing with
+  // the schedule beside the accounts both walk. The head carries no second
+  // reading of the last run - the row below already says when, and two labels
+  // for one fact is how one of them ends up stale.
   var keepAliveRun = $("tokenKeepAliveRun");
   keepAliveRun.textContent = busy === "keepAlive" ? t("keepAlive.running") : t("keepAlive.runNow");
   keepAliveRun.disabled = busy !== null;
-  $("keepAliveText").textContent = t("keepAlive.label");
+  $("keepAliveTitle").textContent = t("keepAlive.label");
   $("keepAliveHint").textContent = t("keepAlive.hint");
   $("autoHint").textContent = t("auto.hint");
-  // The keep-alive is a sibling of the schedule in the document rather than a
-  // field of it, so the log's reader is handed the two halves it needs.
-  paintAutoNote($("autoNote"), { last: auto.last, keepAlive: state && state.keepAlive });
+  paintAutoNote($("autoNote"), { last: auto.last });
+  paintKeepAliveNote($("keepAliveNote"), state && state.keepAlive);
 }
 
 /**
@@ -1794,38 +1845,14 @@ function renderRewriteClientName() {
  */
 function autoNoteRows(auto) {
   var last = auto.last;
-  // The keep-alive is a duty of its own rather than a stage of the pass, so it
-  // reports on its own line and says when it last ran - on every path, including
-  // the ones that have nothing to say about a check-in pass. Its record is the
-  // only proof the button did anything, and a restart clears the pass log without
-  // touching it.
-  var keepAliveRow = null;
-  if (auto.keepAlive) {
-    keepAliveRow = {
-      text: t("auto.rowKeepAlive", {
-        when: formatStamp(auto.keepAlive.at),
-        refreshed: Number(auto.keepAlive.refreshed) || 0,
-        fresh: Number(auto.keepAlive.fresh) || 0,
-        failed: Number(auto.keepAlive.failed) || 0,
-        noToken: Number(auto.keepAlive.noToken) || 0,
-      }),
-      tone: Number(auto.keepAlive.failed) > 0 || Number(auto.keepAlive.noToken) > 0 ? "fail"
-        : Number(auto.keepAlive.refreshed) > 0 ? "ok" : "",
-    };
-  }
-  // What the pass log has to say, with the keep-alive line kept on the end.
-  var finish = function (rows) {
-    if (keepAliveRow !== null) rows.push(keepAliveRow);
-    return rows;
-  };
-  if (!last) return finish([{ text: t("auto.neverRun"), tone: "" }]);
+  if (!last) return [{ text: t("auto.neverRun"), tone: "" }];
   // Opening stub: sources have not answered yet. A finished "0 accounts" row
   // here is what "run now" painted and then never replaced.
   if (last.pending === true && last.travel == null && last.qoder == null && last.trae == null) {
-    return finish([{ text: t("auto.running"), tone: "" }]);
+    return [{ text: t("auto.running"), tone: "" }];
   }
   var slot = String(last.slot).replace("T", " ");
-  if (last.error) return finish([{ text: t("auto.lastFailedAt", { slot: slot, message: last.error }), tone: "fail" }]);
+  if (last.error) return [{ text: t("auto.lastFailedAt", { slot: slot, message: last.error }), tone: "fail" }];
   var rows = [];
   if (last.pending === true) rows.push({ text: t("auto.running"), tone: "" });
   // The head count is every source's claimed accounts, matching the rows
@@ -1883,7 +1910,50 @@ function autoNoteRows(auto) {
   }
   push(t("auto.rowQoder"), last.qoder);
   push(t("auto.rowTrae"), last.trae);
-  return finish(rows);
+  return rows;
+}
+
+/**
+ * The keep-alive's own line: what its last run did, and when.
+ *
+ * A duty of its own rather than a stage of the check-in pass, so it reports on
+ * its own card and says when it last ran - on every path, including the ones
+ * that have nothing to say about a check-in pass. Its record is the only proof
+ * the button did anything, and a restart clears the pass log without touching
+ * it.
+ */
+function keepAliveNoteRow(keepAlive) {
+  if (!keepAlive) return null;
+  return {
+    text: t("auto.rowKeepAlive", {
+      when: formatStamp(keepAlive.at),
+      refreshed: Number(keepAlive.refreshed) || 0,
+      fresh: Number(keepAlive.fresh) || 0,
+      failed: Number(keepAlive.failed) || 0,
+      noToken: Number(keepAlive.noToken) || 0,
+    }),
+    tone: Number(keepAlive.failed) > 0 || Number(keepAlive.noToken) > 0 ? "fail"
+      : Number(keepAlive.refreshed) > 0 ? "ok" : "",
+  };
+}
+
+/** Paint the keep-alive log as rows, so the caller does not build markup inline. */
+function paintKeepAliveNote(host, keepAlive) {
+  var atBottom = host.scrollTop + host.clientHeight >= host.scrollHeight - 4;
+  var rowCount = host.childElementCount;
+  clear(host);
+  var row = keepAliveNoteRow(keepAlive);
+  // No run yet leaves the box out of the card rather than drawing an empty
+  // frame: the card head already says it has not run, and an empty bordered box
+  // reads as a log that failed to load.
+  host.hidden = row === null;
+  if (row !== null) {
+    var line = el("div", "log-line" + (row.tone ? " " + row.tone : ""));
+    line.appendChild(el("span", "log-dot"));
+    line.appendChild(el("span", "log-text", row.text));
+    host.appendChild(line);
+  }
+  if (host.childElementCount !== rowCount || atBottom) host.scrollTop = host.scrollHeight;
 }
 
 /** Paint the check-in log as rows, so the caller does not build markup inline. */
@@ -2179,7 +2249,7 @@ function runGrowth() {
     });
   }).catch(function (error) {
     var message = String(error && error.message ? error.message : error);
-    note(/BUSY/.test(message) ? t("growth.busy") : message);
+    note(/BUSY|already running/i.test(message) ? t("growth.busy") : message);
   });
 }
 function renderAccounts() {
@@ -2297,6 +2367,11 @@ function renderRemoved(host) {
 
 function accountCard(account) {
   var off = account.disabled === true;
+  // The upstream refused this sign-in and a forced refresh could not save it.
+  // The row says so in its own words: the account is not waiting out a window,
+  // and only a new sign-in brings it back.
+  var refused = account.hold === "session";
+  var restricted = account.hold === "restricted";
 
   // Listed but out of rotation: the app overwrote this account's sign-in with
   // the next one, so the card stays readable but says why it is not picked.
@@ -2312,8 +2387,8 @@ function accountCard(account) {
   if (account.preferred) head.appendChild(el("span", "badge next", t("badge.preferred")));
   // An archived account keeps serving, so its badge reports the same health as
   // any other; the note below the head says where its sign-in now comes from.
-  head.appendChild(el("span", "badge " + (off ? "off" : account.cooling ? "cool" : "ok"),
-    off ? t("acct.off") : account.cooling ? t("badge.cooling") : t("badge.healthy")));
+  head.appendChild(el("span", "badge " + (off ? "off" : refused ? "dead" : restricted || account.cooling ? "cool" : "ok"),
+    off ? t("acct.off") : refused ? t("badge.revoked") : restricted ? t("badge.restricted") : account.cooling ? t("badge.cooling") : t("badge.healthy")));
 
   // "Not right now" and "not mine any more" are different decisions, so they
   // stay separate controls: a switch the user flips, and a plain remove button.
@@ -2415,15 +2490,18 @@ function accountCard(account) {
   card.appendChild(head);
 
   if (archived) card.appendChild(el("div", "hint muted", t("acct.archivedHint")));
-  if (off) card.appendChild(el("div", "hint muted", t("acct.offHint")));
+  if (refused) card.appendChild(el("div", "hint finding-fail", t("acct.signInRefused")));
+  if (restricted) card.appendChild(el("div", "hint finding-fail", t("acct.restrictedHint")));
 
   var meta = el("div", "model-meta");
   // Not beside a badge that already says the token is expired.
   if (account.expired !== true) meta.appendChild(tokenChip(account.expiresAt));
   if (account.cooling && account.cooldownUntil) {
-    meta.appendChild(el("span", "finding-fail", t("acct.coolUntil", { time: formatStamp(account.cooldownUntil) })));
+    // A hold is not a rate limit: it names the moment the pool stops waiting,
+    // not a window the upstream set.
+    meta.appendChild(el("span", "finding-fail", t(refused ? "acct.holdUntil" : restricted ? "acct.restrictedUntil" : "acct.coolUntil", { time: formatStamp(account.cooldownUntil) })));
   }
-  if (num(account.rateLimitHits, 0) > 0) {
+  if (num(account.rateLimitHits, 0) > 0 && !refused && !restricted) {
     meta.appendChild(el("span", null, t("acct.hits", { hits: account.rateLimitHits })));
   }
   card.appendChild(meta);
@@ -2436,6 +2514,9 @@ function accountCard(account) {
   // account's billing data yet, so say so instead of showing nothing.
   if (account.probePending === true) {
     card.appendChild(el("div", "hint muted", t("probe.pending")));
+  } else if (refused) {
+    // No read was spent on this account, so there is no credits figure and no
+    // upstream error to show: the hold above is the whole story.
   } else if (account.creditsError) {
     card.appendChild(el("div", "hint finding-fail", t("credits.unavailable") + ": " + account.creditsError));
   } else if (account.credits) {
@@ -2636,7 +2717,9 @@ function checkinBlock(account) {
   var wrap = el("div", "checkin");
   wrap.appendChild(el("span", "card-title", t("checkin.title")));
 
-  if (account.checkinError) {
+  // A held sign-in is not read at all, so an error here would be the previous
+  // read's; the account card already carries the hold and its remedy.
+  if (account.checkinError && account.hold !== "session") {
     wrap.appendChild(el("span", "hint finding-fail", account.checkinError));
     return wrap;
   }
@@ -3961,7 +4044,8 @@ function runBusy(id, work) {
   return work().then(function (result) {
     busy = null;
     if (result && result.accounts) adopt(result);
-    note(null);
+    if (result && result.stale === true) note(t("err.stale"), "warn");
+    else note(null);
     render();
     pollCheckinLog(0);
     return result;
@@ -4133,7 +4217,7 @@ function rescan() {
   return runBusy("rescan", function () { return invoke("xd.rescan"); })
     .then(function (next) { announce(t("pool.summary", {
       count: (next.accounts || []).length,
-      cooling: (next.accounts || []).filter(function (a) { return a.cooling; }).length,
+      cooling: (next.accounts || []).filter(isCooling).length,
     })); })
     .catch(function () {});
 }

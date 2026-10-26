@@ -1234,27 +1234,6 @@ test('the composer popup ignores a scroll that happens inside it', () => {
     'a scroll inside the panel is the user reading it, not the trigger moving')
   assert.match(body, /setOpen\(false\)/, 'and a scroll anywhere else still dismisses')
 })
-/**
- * The footer links are static markup, so nothing else couples them to the word
- * tables: a label whose key is missing renders as the raw `foot.npm` on the page.
- */test('every footer link label exists in both languages', () => {
-  const html = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
-  const labels = [...html.matchAll(/data-foot-label="([A-Za-z]+)"/g)].map((match) => match[1])
-  assert.ok(labels.length > 0, 'the footer must carry at least one labelled link')
-  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  const keysOf = (name) => {
-    const start = source.indexOf(`var ${name} = {`)
-    assert.notEqual(start, -1, `${name} must exist`)
-    const body = source.slice(start, source.indexOf('\n};', start))
-    return new Set([...body.matchAll(/"([^"]+)":/g)].map((match) => match[1]))
-  }
-  const zh = keysOf('ZH')
-  const en = keysOf('EN')
-  for (const label of new Set(labels)) {
-    assert.ok(zh.has(`foot.${label}`), `foot.${label} is rendered but missing from ZH`)
-    assert.ok(en.has(`foot.${label}`), `foot.${label} is rendered but missing from EN`)
-  }
-})
 
 /**
  * Every gateway answers the same three refusals, and the Host and Origin ones

@@ -29,6 +29,34 @@ registerHooks({
 const encoder = new TextEncoder()
 
 /**
+ * Upstream frames with no client-visible output still keep the client's
+ * connection alive.
+ *
+ * Trae's queue and progress events and Qoder's acknowledgements were decoded
+ * and dropped. The upstream stayed busy and the watchdog kept the request
+ * open, but the downstream socket received no bytes at all until the first
+ * token, so a client with an idle read timeout gave up on a healthy turn.
+ */
+test('queue and progress frames keep the downstream stream alive', async () => {
+  const { bridgeTraeStream } = require('../src/trae-shim.ts')
+  const { bridgeQoderStream } = require('../src/qoder-shim.ts')
+  const cases = [
+    ['trae', bridgeTraeStream,
+      'event: request_wait_in_queue\ndata: {"position":2}\n\n'
+      + 'event: progress_notice\ndata: {"state":"working"}\n\n'
+      + 'event: output\ndata: {"response":"ok","finish_reason":"stop"}\n\n'],
+    ['qoder', bridgeQoderStream,
+      'data: {"foo":"bar"}\n\n'
+      + 'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'],
+  ]
+  for (const [name, bridge, wire] of cases) {
+    const body = await new Response(bridge(new Response(wire).body, 'fixture-model')).text()
+    assert.ok(body.includes(': keepalive'), `${name}: a silent wait must carry a keepalive comment`)
+    assert.ok(body.includes('"content":"ok"'), `${name}: the real output still reaches the client`)
+  }
+})
+
+/**
  * The in-band error frame never carries a credential.
  *
  * A stream that has already sent its 200 cannot change the status, so a failure

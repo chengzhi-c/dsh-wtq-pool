@@ -324,6 +324,16 @@ export function bridgeTraeStream(
   // OpenAI-shaped usage, widened past `number` because the cache breakdown
   // nests under `prompt_tokens_details`.
   let usage: Record<string, number | Record<string, number>> | undefined
+  // Upstream queue and progress frames carry no client-visible delta. Writing a
+  // comment keeps the downstream connection alive and resets client idle
+  // timers while a request waits behind other traffic.
+  let lastKeepaliveAt = 0
+  const keepalive = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
+    const now = Date.now()
+    if (now - lastKeepaliveAt < 10_000) return
+    lastKeepaliveAt = now
+    controller.enqueue(encoder.encode(': keepalive\n\n'))
+  }
 
   const chunk = (delta: Record<string, unknown> | null, finishReason: string | null = null): Uint8Array =>
     encoder.encode(`data: ${JSON.stringify({
@@ -354,7 +364,10 @@ export function bridgeTraeStream(
     // empty turn. The peek looks at all of them for the same reason.
     const failure = traeFailureOf(decoded)
     if (failure !== undefined) throw new Error(describeTraeFailure(failure))
-    if (decoded.type === 'unknown') return
+    if (decoded.type === 'unknown') {
+      keepalive(controller)
+      return
+    }
     if (decoded.type === 'delta') {
       const delta: Record<string, unknown> = {}
       if (decoded.text !== '') delta['content'] = decoded.text
@@ -368,7 +381,10 @@ export function bridgeTraeStream(
         roleChunk(controller)
         controller.enqueue(chunk(delta))
       }
-      if (decoded.finishReason === undefined) return
+      if (decoded.finishReason === undefined) {
+        keepalive(controller)
+        return
+      }
     }
     if (decoded.type === 'usage') {
       // Trae's cache counters are a SUBSET of prompt_tokens (OpenAI convention),
@@ -389,7 +405,10 @@ export function bridgeTraeStream(
       if (emittedFinishReason) controller.enqueue(chunk(null))
       return
     }
-    if (decoded.type !== 'done' && decoded.type !== 'delta') return
+    if (decoded.type !== 'done' && decoded.type !== 'delta') {
+      keepalive(controller)
+      return
+    }
     if (emittedFinishReason) return
     emittedFinishReason = true
     controller.enqueue(chunk({}, openAIFinishReason(decoded.finishReason, sawToolCalls)))

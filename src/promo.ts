@@ -97,12 +97,15 @@ export type PromoStatus =
   | { kind: 'night-later'; nextHour: number }
 
 /** The first hour the window reopens, searching forward from `hour`. */
-function nextWindowHour(rule: PromoRule, hour: number): number | undefined {
+function nextWindowHour(rule: PromoRule, hour: number): number {
   for (let step = 1; step <= 24; step += 1) {
     const candidate = (hour + step) % 24
     if (rule.hours.includes(candidate)) return candidate
   }
-  return undefined
+  // Unreachable while every rule names at least one hour: the 24 steps cover the
+  // whole clock, so one of them is inside the window. A rule with an empty
+  // `hours` is a promotion with no free hour, which no rule below declares.
+  return hour
 }
 
 /** The hour the CURRENT window closes, searching forward from `hour`. */
@@ -147,10 +150,7 @@ export function promoStatusFor(
       }
       return { kind: 'night', untilHour }
     }
-    const nextHour = nextWindowHour(rule, clock.hour)
-    if (nextHour !== undefined) {
-      return { kind: 'night-later', nextHour }
-    }
+    return { kind: 'night-later', nextHour: nextWindowHour(rule, clock.hour) }
   }
   return undefined
 }

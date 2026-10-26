@@ -3,8 +3,7 @@
  *
  * One constant rather than a literal per call site, because those modules are
  * synced byte for byte between the two builds and a literal is what a sync
- * overwrites. The value differs per build on purpose: a log line should name the
- * plugin that wrote it. This file is therefore the one shared module the two
- * builds do not copy.
+ * overwrites. Both builds use the same product name, so the host banner and
+ * these lines agree.
  */
-export const LOG_PREFIX = 'dsh-wtq-pool'
+export const LOG_PREFIX = 'wtq-pool'

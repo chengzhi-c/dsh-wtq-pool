@@ -11,7 +11,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessage, listedModels, pumpToResponse, readRequestBody, relayStreamOf, retryAfterHeader, writeJson, writeOpenAIError } from './loopback'
+import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessage, listedModels, pumpToResponse, readRequestBody, relayStreamOf, requestPathname, retryAfterHeader, writeJson, writeOpenAIError } from './loopback'
 import type { QoderRegion } from './qoder-discovery'
 import type { QoderChatModel, QoderClientCredential, QoderUpstreamErrorKind } from './qoder-client'
 import { QoderUpstreamClient } from './qoder-client'
@@ -359,7 +359,7 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!guardsPass(req, res)) return
-    const url = req.url ?? '/'
+    const url = requestPathname(req.url)
     if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
       const credentials = await options.credentials().catch(() => [])
       writeJson(res, 200, { ok: true, source: 'qoder', credentials: credentials.length, models: cachedModels.length })
