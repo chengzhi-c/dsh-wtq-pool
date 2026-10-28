@@ -287,13 +287,6 @@ var EN = {
   "composer.hint": "When the selected model belongs to this plugin, its account's credits appear on the left of the composer. Click to switch accounts.",
   "composer.show": "Show credits",
   "composer.hide": "Hide credits",
-  "rewrite.title": "Client name",
-  "rewrite.on": "On",
-  "rewrite.off": "Off",
-  "rewrite.label": "Rename the client in the prompt the domestic host receives",
-  "rewrite.hint": "The domestic WorkBuddy host refuses a request whose prompt names DeepSeek Harness as the client (channel check 11128). Turned on, every occurrence of that name is sent as DeepSeek; turned off, the original wording is sent.",
-  "rewrite.show": "Rename client",
-  "rewrite.hide": "Stop renaming",
   "check.title": "Connection check",
   "check.empty": "Run the check to see whether a chat can reach WorkBuddy, Trae or Qoder.",
   "check.pass": "PASS",
@@ -527,13 +520,6 @@ var ZH = {
   "composer.hint": "开启后，选中本插件的模型时，输入框左侧显示正在使用的账号积分。点开可以换号。",
   "composer.show": "显示积分",
   "composer.hide": "隐藏积分",
-  "rewrite.title": "客户端名称",
-  "rewrite.on": "已开启",
-  "rewrite.off": "已关闭",
-  "rewrite.label": "改写发往国内版的提示词里的客户端名称",
-  "rewrite.hint": "WorkBuddy 国内版会拒绝提示词里把客户端名称写成 DeepSeek Harness 的对话请求（渠道校验 11128）。开启后，提示词里这个名称的每一处都改为 DeepSeek；关闭后恢复原名。",
-  "rewrite.show": "改写名称",
-  "rewrite.hide": "恢复原名",
   "growth.title": "成长中心",
   "growth.ready": "WorkBuddy",
   "growth.running": "运行中…",
@@ -969,6 +955,10 @@ function renderSourceTabs() {
   for (var j = 0; j < groups.length; j += 1) {
     groups[j].hidden = groups[j].getAttribute("data-source") !== activeSource;
   }
+  // The keep-alive renews WorkBuddy sign-ins only; leaving the card on Trae or
+  // Qoder made it look as if "Refresh now" would touch that source's tokens.
+  var keepAliveCard = $("keepAliveCard");
+  if (keepAliveCard) keepAliveCard.hidden = activeSource !== "workbuddy";
   // The source tab owns the models view too, and a source tab click does not
   // run the whole render, so the model page and the footer - which names the
   // endpoint of the source on screen - are repainted from here.
@@ -1813,26 +1803,6 @@ function renderComposerPoints() {
 }
 
 /**
- * The client-name switch.
- *
- * Same shape as the credits switch above, and for the same reason: the label says
- * what pressing it will do and which way it currently stands. Off by default -
- * turning it on is the user's decision, because it changes what the prompt tells
- * the upstream about the client.
- */
-function renderRewriteClientName() {
-  var renamed = state !== null && typeof state.replacedClientName === "string";
-  $("rewriteTitle").textContent = t("rewrite.title");
-  $("rewriteState").textContent = renamed ? t("rewrite.on") : t("rewrite.off");
-  var button = $("rewriteClientName");
-  button.textContent = t(renamed ? "rewrite.hide" : "rewrite.show");
-  button.className = "small" + (renamed ? " on" : "");
-  button.disabled = busy !== null;
-  $("rewriteText").textContent = t("rewrite.label");
-  $("rewriteHint").textContent = t("rewrite.hint");
-}
-
-/**
  * The check-in log: one row per source, each with a state dot.
  *
  * A single line with separators was unreadable once three sources reported, so
@@ -1894,7 +1864,10 @@ function autoNoteRows(auto) {
       tone: claimed > 0 || adopted > 0 ? "ok" : "",
     });
   };
-  push(t("auto.rowWorkbuddy"), { claimed: last.claimed, skipped: last.skipped, failed: last.failed });
+  if (last.workbuddy !== false
+    && (last.claimed !== undefined || last.skipped !== undefined || last.failed !== undefined)) {
+    push(t("auto.rowWorkbuddy"), { claimed: last.claimed, skipped: last.skipped, failed: last.failed });
+  }
   pushTravel(last.travel);
   if (last.growth) {
     var growth = last.growth;
@@ -3957,7 +3930,6 @@ function render() {
   renderAutoCheckin();
   renderGrowth();
   renderComposerPoints();
-  renderRewriteClientName();
   renderHostHint();
   renderRegionTabs();
   renderModelRegionTabs();
@@ -4043,7 +4015,15 @@ function runBusy(id, work) {
   render();
   return work().then(function (result) {
     busy = null;
-    if (result && result.accounts) adopt(result);
+    // A host answer may still be detecting behind the click. Adopt it through
+    // the same polling path the initial open uses, but only when it actually
+    // reports that state: most settings/reset answers omit `refreshing`, and
+    // adopting those here must not cancel a poll already running.
+    if (result && result.accounts && typeof result.refreshing === "boolean") {
+      adoptAndMaybePoll(result, 0);
+    } else if (result && result.accounts) {
+      adopt(result);
+    }
     if (result && result.stale === true) note(t("err.stale"), "warn");
     else note(null);
     render();
@@ -4277,12 +4257,6 @@ function setComposerPoints(enabled) {
   }).catch(function () {});
 }
 
-function setRewriteClientName(enabled) {
-  return runBusy("rewrite", function () {
-    return invoke("xd.setRewriteClientName", { enabled: enabled === true });
-  }).catch(function () {});
-}
-
 /** Switch one source (workbuddy / trae / qoder) on or off; the answer is the refreshed document. */
 function setSource(source, enabled) {
   return runBusy("source", function () {
@@ -4496,6 +4470,12 @@ function saveModels() {
   invoke("xd.saveModels", {
     gateway: page.key,
     selection: { enabledModelIds: enabledModelIds, overrides: overrides },
+    // The models this page actually showed. A roster read can be partial (the
+    // static fallback while the live list is still unread, or a directory that
+    // answered with fewer rows), and the host keeps the stored entries for the
+    // ids this page could not display instead of reading their absence as a
+    // deliberate removal.
+    knownModelIds: page.list.map(function (model) { return model.id; }),
   }).then(function (next) {
     busy = null;
     adopt(next);
@@ -4648,14 +4628,6 @@ function bind() {
   if (composerToggle) {
     composerToggle.addEventListener("click", function () {
       setComposerPoints(state === null || state.showComposerPoints !== true);
-    });
-  }
-  // Same shape: a static node, so the listener is bound once and the state is
-  // read at click time rather than captured from the render that drew the label.
-  var rewriteToggle = $("rewriteClientName");
-  if (rewriteToggle) {
-    rewriteToggle.addEventListener("click", function () {
-      setRewriteClientName(state === null || typeof state.replacedClientName !== "string");
     });
   }
   // Bound once, with the state read at click time: this is a static node, so the

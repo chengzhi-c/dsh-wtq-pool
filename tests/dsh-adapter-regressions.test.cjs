@@ -493,6 +493,31 @@ test('a host settings edit that races a write is re-delivered, not dropped', asy
   } finally { await state.dispose() }
 })
 
+test('a host edit that raced a failed write is not mistaken for its echo', async () => {
+  // A rejected mutate emits no echo. Counting the write anyway made the one
+  // push that did arrive look like this plugin's own echo, so a real edit the
+  // host's settings UI made during the failed write was dropped until reload.
+  const activate = indexFixture()
+  let echo = () => {}
+  const settings = {
+    update: SettingsForms.prototype.update,
+    async mutate() {
+      echo()
+      throw new Error('the settings service is unavailable')
+    },
+    async write() {},
+  }
+  const state = activate(settings)
+  try {
+    echo = () => { for (const listener of state.volatileListeners) listener() }
+    let applied = 0
+    state.bridge.onSettingsChanged(() => { applied += 1 })
+    await assert.rejects(state.bridge.setSettings({ showComposerPoints: true }))
+    assert.equal(applied, 1,
+      'the host edit that raced the failed write must still reach the plugin')
+  } finally { await state.dispose() }
+})
+
 /**
  * Every panel route guards the socket it answers on.
  *

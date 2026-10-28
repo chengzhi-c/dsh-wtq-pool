@@ -96,6 +96,22 @@ test('a per-model cooldown leaves the account\'s other models usable', async () 
     'the upstream allows switching models on one account, so the rest stays in')
 })
 
+test('an account that failed its refresh this request is skipped, not retried', async () => {
+  const dir = scratch('exclude')
+  writeSignIn(dir, 'workbuddy-first', '90000000105')
+  writeSignIn(dir, 'workbuddy-second', '90000000106')
+  const pool = poolOf([dir])
+  await pool.scan()
+  const [first, second] = pool.available(Date.now(), undefined, 'cn')
+  assert.ok(first !== undefined && second !== undefined, 'the fixture must hold two accounts')
+
+  const skipped = new Set([first.id])
+  assert.equal((await pool.acquire(undefined, 'cn', undefined, skipped)).id, second.id,
+    'a failed refresh must hand the turn to the next account instead of repeating itself')
+  assert.equal(await pool.acquire(undefined, 'cn', undefined, new Set([first.id, second.id])), undefined,
+    'when every account has been tried the request ends instead of looping')
+})
+
 test('a balance read releases a spent hold and leaves a dead session held', async () => {
   const dir = scratch('holds')
   writeSignIn(dir, 'workbuddy-desktop', '90000000103')

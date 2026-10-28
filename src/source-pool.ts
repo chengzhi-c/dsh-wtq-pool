@@ -53,7 +53,7 @@ export interface SourcePool {
     region: string,
     credentials: readonly T[],
     labelOf: (credential: T) => string,
-    rotate: boolean,
+    rotate: boolean | "peek",
   ): T[]
 }
 
@@ -135,7 +135,7 @@ export function createSourcePool(host: SourcePoolHost): SourcePool {
     region: string,
     credentials: readonly T[],
     labelOf: (credential: T) => string,
-    rotate: boolean,
+    rotate: boolean | "peek",
   ): T[] {
     const now = Date.now()
     const stored = host.preferredSourceAccount(source, region)
@@ -179,13 +179,16 @@ export function createSourcePool(host: SourcePoolHost): SourcePool {
     // out of the shuffled segment entirely rather than being shuffled back into
     // the lead on the turn the cursor lands on it.
     const live = ordered.filter((credential) => !sourceCredentialExpired(credential, now))
-    if (rotate !== true || preferred !== "" || live.length < 2 || host.sourceDistribution(source) !== "round-robin") return ordered
+    const peek = rotate === "peek"
+    if ((rotate !== true && !peek) || preferred !== "" || live.length < 2 || host.sourceDistribution(source) !== "round-robin") return ordered
     const healthy = live.filter((credential) => !sourceFailureActive(source, region, labelOf(credential), now))
     const held = live.filter((credential) => sourceFailureActive(source, region, labelOf(credential), now))
     if (healthy.length < 2) return ordered
     const key = host.sourceRegionKey(source, region)
     const step = (sourceRotation.get(key) ?? 0) % healthy.length
-    sourceRotation.set(key, step + 1)
+    // A preview names the account this request would use without consuming the
+    // turn: a panel read must not decide which account the next chat lands on.
+    if (!peek) sourceRotation.set(key, step + 1)
     const rest = ordered.filter((credential) => sourceCredentialExpired(credential, now))
     return healthy.slice(step).concat(healthy.slice(0, step), held, rest)
   }

@@ -77,7 +77,7 @@ To run the preview locally, clone the repository, run `node docs/serve.cjs`, and
 - Gateway responses are SSE streams of `chat.completion.chunk`; the `stream` field in the request body does not change the format.
 - Credit automation: automatic check-in is off by default. Once enabled, the scheduled run and "Run now" perform the same round: the three check-ins plus the WorkBuddy streak bonus and cat travel. The upstream advances the streak on a conversation, so the round reports one chat activity per account before reading the streak tiers, and a tier that comes due is unlocked and collected without the user opening WorkBuddy to send a message. The streak step also spends a make-up card when yesterday was missed, collects the one-off starter gift and campaign compensation, and spends the draws a redeemed tier awards. These growth steps run for domestic and international accounts alike; cat travel runs for domestic accounts only, because the international host has no such API.
 - Token keep-alive: on demand, on a card of its own. A snapshot the desktop client left behind is adopted into the plugin's own sign-in directory when the pool scans, and the plugin renews it from then on; the desktop app renews the sign-in it is using. "Refresh now" works on the plugin's own copies and judges by issue time: anything signed more than six hours ago is refreshed, and a token within five minutes of expiry takes the same path. The answer is written back into the sign-in file the plugin owns, so a sign-in the upstream refused is found the same day. When one account has sign-ins in several places, the newest issue time wins. Disabled accounts, disabled regions and accounts whose sign-in the upstream refused stay out.
-- Composer credits: with `showComposerPoints` on, the composer toolbar shows the balance of the account behind the current model; click it to switch accounts, and switching the feature off stops the readout's polling.
+- Composer credits: with `showComposerPoints` on, the composer toolbar shows the balance of the account behind the current model; click it to switch accounts. Switching the feature off hides the readout and slows the poll to once every five minutes, so switching it back on recovers without a model change.
 - Panel: account and pool state, model selection, the connection check and the growth centre all live in the account-pool card on the plugin page. The model catalogue loads at startup and refreshes on demand once its cache expires; it does not poll while idle. Disabled accounts and accounts whose sign-in the upstream refused are never probed.
 - Connection check: every finding carries a verdict. A gateway that is not listening, a catalogue that could not be read, a published address that differs from the one actually bound, and a provider the host did not accept all count as failures and say what to change. A gateway whose start failed is reported with the reason, and the panel surfaces address drift as a reload hint. A check that fails on its own becomes a finding, and the rest of the report still appears.
 
@@ -91,6 +91,8 @@ dsh plugin --profile desktop add $package
 ```
 
 Requires DeepSeek Harness on the 0.2.0 line (`engines.dsh` in `package.json`: `>=0.2.0-rc.1 <0.2.1`) and Node `^22.19.0 || >=24.0.0`.
+
+> After upgrading from 1.1.x to 1.2.0, provider ids are `wtqpool-*`; reselect your model once.
 
 Replace `desktop` with the profile name actually in use. If `dsh` is not on `PATH`, use the CLI in its installation directory. The npm name `dsh-wtq-pool` and the repository URL also work as install sources; a repository-URL install builds from source through the `prepare` script, which requires `allowBuilds: dsh-wtq-pool: true` in the profile's `pnpm-workspace.yaml` and a pinned commit.
 
@@ -117,9 +119,7 @@ To back them up, copy the `signins/` directory, which already has the format a b
 
 Check-in runs per account, or for a whole source from the title bar. Automatic check-in is off by default; when on it claims at 09:00 (Beijing time), and a slot missed earlier the same day is still claimed at the next start, while one from a previous day is not. Trae's daily check-in is once per device; Qoder's new round opens at 10:00 (Beijing time). An account whose sign-in the upstream refused is skipped in that round.
 
-The domestic WorkBuddy host refuses conversational requests whose client identifies itself as DeepSeek Harness (11128, channel check failed). Check-in, the growth centre and the keep-alive use their own endpoints.
-
-The panel's **Client name** switch controls that rewrite and is off by default. Turned on, every occurrence of `DeepSeek Harness` in the prompt is sent as `DeepSeek`; turned off, the original wording is sent.
+The domestic WorkBuddy host refuses conversational requests whose client identifies itself as DeepSeek Harness (11128, channel check failed), whether the refusal arrives as HTTP 400 or as a JSON envelope with HTTP 200. When it lands, the plugin folds the system messages into the first user message and retries once; the client name is also removed from assistant history, because the channel check reads assistant turns too. An accepted prompt is remembered per region, so the same prompt does not pay that round trip again. Check-in, the growth centre and the keep-alive use their own endpoints.
 
 "Refresh now" reports refreshed, already fresh, failed and without a refresh token separately.
 
@@ -127,7 +127,7 @@ A read stays in the host process, so reloading the panel still paints the last f
 
 ## Settings
 
-Every key below is editable in the plugin page and saved on confirm:
+Every key below is editable in the plugin page or the DSH settings page and saved on confirm:
 
 | Key | Default (effective) | Meaning |
 | --- | --- | --- |
@@ -135,12 +135,11 @@ Every key below is editable in the plugin page and saved on confirm:
 | `sourceWorkbuddy` / `sourceTrae` / `sourceQoder` | `true` | Off: that source is not scanned, published or requested |
 | `distribution` | `priority` | How the WorkBuddy pool spreads requests: `priority` uses one account first, `round-robin` spreads evenly, `expiry` spends expiring credits first, `sticky` pins one account per conversation |
 | `sourceDistributions` | `{}` | Trae/Qoder distribution: `priority` / `round-robin` / `expiry`; unset behaves as `priority` |
-| `cooldownSeconds` | `60` | Rate-limit cooldown. A reset time the upstream reports takes precedence; with none, consecutive limits double it up to 15 minutes (a longer configured window is left alone) |
+| `cooldownSeconds` | `60` | Rate-limit cooldown. A reset time the upstream reports takes precedence; with none, consecutive limits double it up to 15 minutes (a longer configured window is left alone). A reported reset is capped at two hours; a spent balance or a refused sign-in is held for six hours instead |
 | `creditReserves` | `{}` | Per-account credit floor, keyed by account id; an account at or below its floor is not distributed to |
 | `authFile` | `""` | WorkBuddy sign-in file path; every `.info` sign-in in its directory is scanned. Empty discovers it |
 | `autoCheckin` | `{"enabled":false,"hours":[9]}` | Automatic check-in switch and times; `hours` are Beijing-time hours, empty means 09:00 |
 | `showComposerPoints` | `false` | Show the active account's credits in the composer |
-| `rewriteClientName` | `false` | Send `DeepSeek` in place of the client name `DeepSeek Harness` in the prompt going to the domestic host, so its channel check (11128) passes; the international host accepts either name |
 | `disabledAccountIds` | `[]` | Account ids disabled in the panel |
 | `disabledRegions` | `[]` | Regions disabled on their own, as `source:region` keys |
 | `modelSelection` | `{}` | Which models each gateway publishes, plus display name, context window and other overrides |
@@ -170,7 +169,7 @@ The PI-Desktop edition uses a separate range starting at 41831, so both plugins 
 
 The plugin reads the vendors' local sign-in files. Providers are registered at runtime; the host persists plugin settings in the profile. Tokens are held by the plugin and go only to the relevant vendor endpoints. Gateways listen on `127.0.0.1`; the panel accepts loopback requests only.
 
-The plugin's own data directory, `~/.dsh/dsh-wtq-pool/` (or `$DSH_HOME` when set), holds four files (a `deleted-signins.json.lock` appears for a moment while the delete record is written). `checkin-slots.json` records the check-in slots already collected, kept for three days. `doctor.txt` is the most recent connection report, item by item, and names no account. `credentials-archive.json` keeps the sign-ins a later account switch overwrote, access tokens included, by token expiry, dropping each 30 days after it. `deleted-signins.json` records deleted sign-ins as a token digest, the sign-in's issue time and a delete time, so a scan cannot take the same superseded snapshot back over from the desktop app; the entry lapses once that account signs in again.
+The plugin's own data directory, `~/.dsh/dsh-wtq-pool/` (or `$DSH_HOME` when set), holds four files (a `deleted-signins.json.lock` appears for a moment while the delete record is written). `checkin-slots.json` records the check-in slots already collected and the pending Qoder retry time; slots are kept for three days. `doctor.txt` is the most recent connection report, item by item, and names no account. `credentials-archive.json` keeps the sign-ins a later account switch overwrote, access tokens included, by token expiry, dropping each 30 days after it. `deleted-signins.json` records deleted sign-ins as a token digest, the sign-in's issue time and a delete time, so a scan cannot take the same superseded snapshot back over from the desktop app; the entry lapses once that account signs in again.
 
 Every sign-in the plugin writes lives in `signins/` beside it: ones added from the panel, snapshots adopted from the desktop app, and renewed copies. Each file is named after the account's billing identity and read on the same terms as a desktop sign-in. "Delete" in the panel removes that file together with its archive entry, and the snapshot the desktop app left behind stops being adopted; signing the account in again brings it back. "Remove" only disables the account, and "Removed accounts" restores it.
 

@@ -398,13 +398,13 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
         .then((next) => {
           if (stopped) return
           // The chip is switched off in the panel: `show: false` alone cannot
-          // say that, and without this the poll would keep asking every few
-          // minutes for the rest of the session about a feature nobody is
-          // using. The timer stops here; a route change remounts this effect
-          // and starts it again.
+          // say that, and the readout renders nothing while it stays off. Keep
+          // the slow poll, though: the panel can switch it back on without a
+          // route change, and stopping here for good left the chip hidden until
+          // the user happened to pick another model.
           if (next.enabled === false) {
             setPoints(null)
-            window.clearTimeout(timer)
+            schedule(null)
             return
           }
           const shown = next.show === true ? next : null

@@ -151,7 +151,7 @@ test('a 200 envelope with an account-level code cools the account instead of one
     chatStream: async () => ({
       ok: true,
       response: new Response(JSON.stringify({ code: 6004, msg: '频率限制' }), {
-        status: 200, headers: { 'content-type': 'application/json' },
+        status: 200, headers: { 'content-type': 'application/json', 'retry-after': '120' },
       }),
     }),
   }
@@ -160,7 +160,74 @@ test('a 200 envelope with an account-level code cools the account instead of one
     const answer = await shim.turn()
     assert.equal(answer.status, 429, 'the envelope is the rate limit it says it is')
     const [account] = shim.pool.list()
-    assert.ok(account.modelCooldowns['hy3'] > Date.now(), 'the account is cooled for that model')
+    assert.ok(account.modelCooldowns['hy3'] > Date.now() + 100_000,
+      'the envelope header wait must outrank the default cooldown')
+  } finally {
+    await shim.close()
+  }
+})
+
+test('a 200 envelope reset is honoured without a Retry-After header', async () => {
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async () => ({
+      ok: true,
+      response: new Response(JSON.stringify({
+        code: 6004, msg: '频率限制', resetAt: Date.now() + 300_000,
+      }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    }),
+  }
+  const shim = await workbuddyShim({ client, models: ['hy3'] })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 429)
+    const [account] = shim.pool.list()
+    assert.ok(account.modelCooldowns['hy3'] > Date.now() + 200_000,
+      'the structured reset in the envelope must outrank the default cooldown')
+  } finally {
+    await shim.close()
+  }
+})
+
+test('a shorter body reset does not undercut a longer Retry-After', async () => {
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async () => ({
+      ok: true,
+      response: new Response(JSON.stringify({ code: 6004, msg: '频率限制', resetAt: Date.now() + 1_000 }), {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'retry-after': '120' },
+      }),
+    }),
+  }
+  const shim = await workbuddyShim({ client, models: ['hy3'] })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 429)
+    const [account] = shim.pool.list()
+    assert.ok(account.modelCooldowns['hy3'] > Date.now() + 100_000,
+      'the longer header wait must keep the account out for its full window')
+  } finally {
+    await shim.close()
+  }
+})
+
+test('a prose-only 200 rate limit cools instead of answering 502', async () => {
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async () => ({
+      ok: true,
+      response: new Response(JSON.stringify({ msg: '频率限制，请稍后再试' }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      }),
+    }),
+  }
+  const shim = await workbuddyShim({ client, models: ['hy3'] })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 429, 'a limit sentence without a code is still a limit')
+    const [account] = shim.pool.list()
+    assert.ok(account.modelCooldowns['hy3'] > Date.now(), 'and it cools the account')
   } finally {
     await shim.close()
   }
@@ -247,6 +314,40 @@ test('a 200 session envelope refreshes the token before holding the account', as
   }
 })
 
+test('a 200 session envelope whose refresh fails is not held for six hours', async () => {
+  let chats = 0
+  let refreshes = 0
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    refreshToken: async () => {
+      refreshes += 1
+      throw new Error('refresh endpoint unreachable')
+    },
+    chatStream: async () => {
+      chats += 1
+      return {
+        ok: true,
+        response: new Response(JSON.stringify({ code: 12153, msg: 'Offline user session not found' }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        }),
+      }
+    },
+  }
+  const shim = await workbuddyShim({ client, models: ['hy3'] })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 502, 'an unanswered refresh is an upstream failure, not a dead sign-in')
+    assert.equal(chats, 1, 'the account is not retried after its refresh failed')
+    assert.equal(refreshes, 1, 'one refresh attempt per account per request')
+    const [account] = shim.pool.list()
+    assert.equal(shim.pool.activeHold(account.id), null, 'a transient refresh failure must not write a session hold')
+    assert.equal(shim.pool.available(Date.now(), 'hy3', 'cn').length, 1,
+      'the account stays available for the next request')
+  } finally {
+    await shim.close()
+  }
+})
+
 test('a 200 envelope that names an exhausted balance holds the account', async () => {
   const client = {
     prepareChatBody: (raw) => JSON.parse(raw),
@@ -307,9 +408,10 @@ test('a 200 carrying a refusal envelope keeps the refusal and the status honest'
   const shim = await workbuddyShim({ client, models: ['hy3'] })
   try {
     const answer = await shim.turn()
-    assert.equal(answer.status, 502, 'an envelope is not a stream')
+    assert.equal(answer.status, 400, 'the prompt screen is the request fault, not a server fault')
     assert.match(answer.text, /11128/)
-    assert.match(answer.text, /unapproved channel/)
+    assert.match(answer.text, /Trae|Qoder|international/)
+    assert.doesNotMatch(answer.text, /unapproved channel/, 'the vendor tips are not what the user reads')
   } finally {
     await shim.close()
   }

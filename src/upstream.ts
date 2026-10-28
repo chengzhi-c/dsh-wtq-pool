@@ -12,10 +12,10 @@
  * @module dsh-wtq-pool/upstream
  */
 
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 
 import type { WorkBuddyCredential } from './accounts'
-import { CHECKIN_TIME_ZONE, zonedDay } from './checkin-time'
+import { zonedDay } from './checkin-time'
 import { boundedRetryAfterSeconds, redactSecrets, withRelayStream } from './loopback'
 
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
@@ -178,31 +178,35 @@ const CN_BILLING_BASE = 'https://www.codebuddy.cn'
 const GLOBAL_BASE = 'https://www.workbuddy.ai'
 
 /**
- * One client version for every WorkBuddy call.
+ * Client versions the two gateways see, and the headers that carry them.
  *
- * The version appears twice in a request: `X-IDE-Version` and the version
- * segment of the UA. They were three literals (5.8.4 in the header, 5.5.4 in the
- * CN UA, 5.5.2 for the roster), which is a combination no real client produces.
- * The 5.8.4 desktop spelling still returns the full 28-model roster from the
- * global config (verified 2026-10-26), so every call reads from here.
+ * CN desktop 5.9.3 (2026-10-27) sends `X-Agent-Runtime: local-agent` and the
+ * same `X-Stainless-*` family as the bundled CLI. The international desktop is
+ * still 5.8.4. Keeping one literal for both was one version behind on CN and
+ * produced a combination no installed client sends.
  */
-const CLIENT_VERSION = '5.8.4'
-const CLI_VERSION = '2.161.0'
+const CN_CLIENT_VERSION = '5.9.3'
+const CN_CLI_VERSION = '2.165.0'
+const GLOBAL_CLIENT_VERSION = '5.8.4'
+const GLOBAL_CLI_VERSION = '2.161.0'
 /** CN chat UA: the desktop client's three-segment spelling. */
-const CLIENT_UA = `WorkBuddy/${CLIENT_VERSION} WorkBuddy/${CLIENT_VERSION} CLI/${CLI_VERSION}`
+const CN_CHAT_UA = `WorkBuddy/${CN_CLIENT_VERSION} WorkBuddy/${CN_CLIENT_VERSION} CLI/${CN_CLI_VERSION}`
+/** CN desktop UA, used by the endpoints the desktop process calls directly. */
+const CN_DESKTOP_UA = `WorkBuddy/${CN_CLIENT_VERSION}`
 
 /**
- * The international desktop client's own chat UA: the `workbuddy-ai/` segment
- * only exists on that gateway, and the CN spelling gets the CLI roster there.
+ * The international desktop client's UA. The `workbuddy-ai/` segment only
+ * exists on that gateway, and the CN spelling gets the CLI roster there.
  */
-const GLOBAL_CHAT_UA = `WorkBuddy/${CLIENT_VERSION} workbuddy-ai/${CLIENT_VERSION} CLI/${CLI_VERSION}`
+const GLOBAL_CHAT_UA = `WorkBuddy/${GLOBAL_CLIENT_VERSION} workbuddy-ai/${GLOBAL_CLIENT_VERSION} CLI/${GLOBAL_CLI_VERSION}`
 
 /**
- * Desktop app UA. The global gateway serves its product config only to this
- * client channel: the CLI UA gets a truncated roster (or an HTTP 500), which
- * is why the international catalog must be read with the desktop spelling.
+ * Desktop app UA for the global gateway. It serves its product config only to
+ * this client channel: the CLI UA gets a truncated roster (or an HTTP 500),
+ * which is why the international catalog must be read with the desktop
+ * spelling.
  */
-const DESKTOP_UA = `WorkBuddy/${CLIENT_VERSION}`
+const GLOBAL_DESKTOP_UA = `WorkBuddy/${GLOBAL_CLIENT_VERSION}`
 
 /** CN model catalog. */
 const MODELS_CATALOG_PATH = '/v2/enterprises/personal/models'
@@ -436,6 +440,16 @@ const SESSION_DEAD_PATTERN = /Offline user session not found|"code"\s*:\s*"?1215
 const MODEL_TIER_PATTERN = /"code"\s*:\s*"?11158\b/u
 
 /**
+ * The prompt-screen refusal: `11128`.
+ *
+ * The host returns it for a system or assistant turn whose wording belongs to a
+ * client it does not serve. It is a property of the request body, not the
+ * account, so the rotation must not spend another sign-in on it; `chatStream`
+ * moves the system prompt into the first user turn and retries once instead.
+ */
+const CHANNEL_CHECK_PATTERN = /"code"\s*:\s*"?11128\b/u
+
+/**
  * The vendor's account-level restriction: `11140`, "request illegal".
  *
  * The body names the account ("your account has been restricted due to unusual
@@ -444,6 +458,16 @@ const MODEL_TIER_PATTERN = /"code"\s*:\s*"?11158\b/u
  * rotation, so a second account that could serve the turn was never tried.
  */
 const ACCOUNT_RESTRICTED_PATTERN = /"code"\s*:\s*"?11140\b/u
+
+/**
+ * The upstream's rate-limit marker.
+ *
+ * The same envelope is returned with HTTP 200 by JSON endpoints and by the
+ * chat screen, so the status alone cannot decide it. The code is matched as an
+ * envelope value rather than as a bare number for the reason above; the text
+ * forms cover the older deployments that answer with prose only.
+ */
+const SOFT_RATE_PATTERN = /"code"\s*:\s*"?6004\b|soft_rate|频率限制/u
 
 /** The two gateways WorkBuddy serves: the domestic one and the international one. */
 export type WorkBuddyRegion = 'cn' | 'global'
@@ -466,6 +490,41 @@ export function regionOf(domain: string): 'cn' | 'global' {
     if (lowered === host || lowered.endsWith(`.${host}`)) return 'global'
   }
   return 'cn'
+}
+
+/** The client version that gateway expects in `X-IDE-Version`. */
+function clientVersion(region: 'cn' | 'global'): string {
+  return region === 'global' ? GLOBAL_CLIENT_VERSION : CN_CLIENT_VERSION
+}
+
+/** The full chat UA for the credential's gateway. */
+function chatUa(region: 'cn' | 'global'): string {
+  return region === 'global' ? GLOBAL_CHAT_UA : CN_CHAT_UA
+}
+
+/** The desktop-process UA for endpoints outside the chat path. */
+function desktopUa(region: 'cn' | 'global'): string {
+  return region === 'global' ? GLOBAL_DESKTOP_UA : CN_DESKTOP_UA
+}
+
+/**
+ * The OpenAI Node SDK's fingerprint headers, as the current desktop client sends
+ * them. OS, architecture and runtime version follow the host so a macOS or Linux
+ * install does not claim to be a Windows client; the rest mirror the bundled CLI.
+ */
+function stainlessHeaders(): Record<string, string> {
+  const os = process.platform === 'win32' ? 'Windows'
+    : process.platform === 'darwin' ? 'MacOS' : 'Linux'
+  return {
+    'x-stainless-lang': 'js',
+    'x-stainless-package-version': '6.25.0',
+    'x-stainless-os': os,
+    'x-stainless-arch': process.arch,
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': process.version,
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '1200',
+  }
 }
 
 /**
@@ -497,7 +556,7 @@ function commonHeaders(credential: WorkBuddyCredential): Record<string, string> 
     'X-Requested-With': 'XMLHttpRequest',
     'Origin': billingBase(credential),
     'Referer': `${billingBase(credential)}/`,
-    'User-Agent': CLIENT_UA,
+    'User-Agent': desktopUa(regionOf(credential.domain)),
     // The official client's gate header, on every API request. Missing it
     // marks the caller as something other than the client.
     'X-CodeBuddy-Request': '1',
@@ -531,7 +590,7 @@ function commonHeaders(credential: WorkBuddyCredential): Record<string, string> 
  * one - so there is nothing to gain from deriving it, and a stable value would
  * be one more thing for the channel check to notice.
  */
-function conversationHeaders(): Record<string, string> {
+function conversationHeaders(region: 'cn' | 'global'): Record<string, string> {
   const turn = randomUUID().replace(/-/g, '')
   const message = randomUUID().replace(/-/g, '')
   const traceId = randomUUID().replace(/-/g, '')
@@ -545,7 +604,7 @@ function conversationHeaders(): Record<string, string> {
     'X-Agent-Intent': 'craft',
     'X-Agent-Purpose': 'conversation',
     'X-Agent-Type': 'main',
-    'X-IDE-Version': CLIENT_VERSION,
+    'X-IDE-Version': clientVersion(region),
     'X-Private-Data': 'true',
     'X-Trace-ID': traceId,
     'traceparent': `00-${traceId}-${spanId}-01`,
@@ -558,9 +617,11 @@ function conversationHeaders(): Record<string, string> {
 
 /** Chat request headers, including the X-No-* conventions the official CLI uses. */
 function chatHeaders(credential: WorkBuddyCredential): Record<string, string> {
+  const region = regionOf(credential.domain)
   return {
     ...commonHeaders(credential),
-    ...conversationHeaders(),
+    ...conversationHeaders(region),
+    ...stainlessHeaders(),
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${credential.accessToken}`,
     ...credential.uid === '' || credential.uid === undefined
@@ -571,9 +632,9 @@ function chatHeaders(credential: WorkBuddyCredential): Record<string, string> {
       : { 'X-Enterprise-Id': credential.enterpriseId },
     ...credential.domain === '' ? { 'X-No-Department-Info': '1' } : { 'X-Domain': credential.domain },
     'X-Product': 'SaaS',
-    // The international gateway answers the CN spelling of the UA with the
-    // roster it gives the CLI, so the captured desktop one is used there.
-    ...regionOf(credential.domain) === 'global' ? { 'User-Agent': GLOBAL_CHAT_UA } : {},
+    // CN 5.9 names its agent runtime; the international build does not.
+    ...region === 'cn' ? { 'X-Agent-Runtime': 'local-agent' } : {},
+    'User-Agent': chatUa(region),
   }
 }
 
@@ -601,7 +662,7 @@ function billingHeaders(credential: WorkBuddyCredential): Record<string, string>
     // A request with no UA at all is its own kind of fingerprint: every client
     // sends one, and leaving it out made the billing family look unlike the
     // desktop app the rest of the calls imitate.
-    'User-Agent': CLIENT_UA,
+    'User-Agent': desktopUa(regionOf(credential.domain)),
     // Same reason as commonHeaders: one connection, one account.
     'Connection': 'close',
   }
@@ -743,8 +804,18 @@ async function readEnvelope(response: Response): Promise<Envelope> {
     throw new Error(`workbuddy upstream returned an unexpected document (http ${response.status})`)
   }
   const document = parsed as Record<string, unknown>
+  // The business code arrives as a number on the chat path and as a numeric
+  // string on some JSON endpoints. Reading only the number turned `"12153"`
+  // into success, so the refusal was never classified and the sign-in was
+  // served again on the next request.
+  const rawCode = document['code']
+  const code = typeof rawCode === 'number' && Number.isFinite(rawCode)
+    ? rawCode
+    : typeof rawCode === 'string' && /^-?\d+$/u.test(rawCode.trim())
+      ? Number(rawCode.trim())
+      : 0
   return {
-    code: typeof document['code'] === 'number' ? document['code'] : 0,
+    code,
     msg: typeof document['msg'] === 'string' ? document['msg'] : '',
     data: 'data' in document ? document['data'] : undefined,
   }
@@ -788,15 +859,28 @@ export function upstreamErrorKind(error: unknown): UpstreamErrorKind | undefined
  * fires on any other status, or a rate limit whose text happens to carry
  * the code would rotate without cooling the account.
  *
- * The credit markers are read only on statuses the upstream itself uses for
- * "this account cannot pay": 402 and 403. A 400 or 422 is a verdict on the
- * REQUEST, and its body routinely quotes the quota it measured against, so
- * matching there turned a malformed body into a whole-pool rotation and a
- * 402 that named the wrong problem.
+ * The credit markers are read on the statuses the upstream itself uses for
+ * "this account cannot pay": 402, 403, and an HTTP 200 business envelope. A
+ * 400 or 422 is a verdict on the REQUEST, and its body routinely quotes the
+ * quota it measured against, so matching there turned a malformed body into a
+ * whole-pool rotation and a 402 that named the wrong problem.
  */
 export function classifyUpstreamError(status: number, body: string): UpstreamErrorKind {
   if (status === 402) return 'hard_credit'
   if (status === 429) return 'soft_rate'
+  // JSON endpoints answer a refusal as HTTP 200 with a business code. Reading
+  // the status as success left a dead sign-in unheld, a rate limit rotating
+  // without a cooldown, and a plan gate looking like a client error.
+  if (status === 200) {
+    if (ACCOUNT_RESTRICTED_PATTERN.test(body)) return 'account_restricted'
+    if (MODEL_TIER_PATTERN.test(body)) return 'model_tier'
+    if (SESSION_DEAD_PATTERN.test(body)) return 'session_dead'
+    // The business code outranks prose here, matching the chat path: a rate
+    // limit that quotes quota text is still a rate limit, not a spent account.
+    if (SOFT_RATE_PATTERN.test(body)) return 'soft_rate'
+    if (isHardCreditText(body)) return 'hard_credit'
+    return 'client'
+  }
   // The vendor restricted the account itself. The body names the account, not
   // the request, so no retry with this sign-in can clear it; reading it as
   // `client` answered 400 and left the rotation on the first account.
@@ -834,10 +918,7 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   // body routinely quotes the quota it measured against; a 5xx is an upstream
   // fault that stays one. Both matched here once, and either turned a bad
   // request or an outage into a whole-pool rotation answered as 429.
-  if (status === 503
-    && (body.includes('soft_rate') || body.includes('"code":6004') || body.includes('频率限制'))) {
-    return 'soft_rate'
-  }
+  if (status === 503 && SOFT_RATE_PATTERN.test(body)) return 'soft_rate'
   // A 403 with no business envelope is the gateway's WAF page (HTML, empty or
   // plain text), not an answer about the request: it clears with time and
   // another account, so it must not read as a terminal client error. A 403
@@ -1045,6 +1126,161 @@ function withLeadingSystemPrompt(prepared: string): string {
   return JSON.stringify(obj)
 }
 
+/**
+ * System prompts the host has already refused at its channel check.
+ *
+ * WorkBuddy's prompt screen reads system and assistant roles, not user turns, and
+ * it matches more than one client's wording: the DSH opening line, the DSH GUI
+ * pair, and several lines shared with other agent harnesses. A fixed rewrite list
+ * is therefore always one upstream change behind. The first turn that is refused
+ * pays one 400, its system prompt is folded into the first user message, and the
+ * same prompt is folded before sending from then on. Bounded so a process that
+ * sees many one-off prompts keeps only recent ones.
+ */
+const FOLDED_PROMPTS_MAX = 32
+const foldedPrompts = new Set<string>()
+
+/** The fingerprint of every system message in a prepared body, if it has one. */
+function systemPromptFingerprint(prepared: string): string | undefined {
+  let body: unknown
+  try {
+    body = JSON.parse(prepared)
+  } catch {
+    return undefined
+  }
+  const messages = (body as { messages?: unknown } | null)?.messages
+  if (!Array.isArray(messages)) return undefined
+  const texts: string[] = []
+  for (const value of messages) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+    const message = value as Record<string, unknown>
+    if (message['role'] !== 'system' && message['role'] !== 'developer') continue
+    texts.push(contentText(message['content']))
+  }
+  if (texts.length === 0) return undefined
+  return createHash('sha256').update(texts.join('\u0000')).digest('hex')
+}
+
+/** The text parts of a message content value, joined for the fingerprint and fold. */
+function contentText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  const parts: string[] = []
+  for (const part of content) {
+    if (typeof part === 'string') parts.push(part)
+    else if (typeof part === 'object' && part !== null && typeof (part as Record<string, unknown>)['text'] === 'string') {
+      parts.push((part as Record<string, unknown>)['text'] as string)
+    }
+  }
+  return parts.join('\n')
+}
+
+/**
+ * Move every system message into the first user message, and take the client
+ * name out of assistant turns.
+ *
+ * The host accepts the same instructions in a user turn; a system turn is what
+ * its channel check inspects. Assistant turns are inspected too, so a reply that
+ * quoted the client name would fail the next request; that copy is renamed. A
+ * neutral system message stays first so a gateway that insists on one still sees
+ * it. Returns undefined when there is nothing to move or rename, which is also
+ * what keeps an empty system message from looping.
+ */
+export function foldSystemIntoUser(prepared: string): string | undefined {
+  let body: unknown
+  try {
+    body = JSON.parse(prepared)
+  } catch {
+    return undefined
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return undefined
+  const obj = body as Record<string, unknown>
+  const messages = obj['messages']
+  if (!Array.isArray(messages)) return undefined
+
+  const prompts: string[] = []
+  const rest: unknown[] = []
+  let renamed = false
+  for (const value of messages) {
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      const message = value as Record<string, unknown>
+      if (message['role'] === 'system' || message['role'] === 'developer') {
+        const text = contentText(message['content'])
+        if (text.trim() !== '') prompts.push(text)
+        continue
+      }
+      if (message['role'] === 'assistant' && 'content' in message) {
+        const content = renameInContent(message['content'])
+        if (content !== message['content']) {
+          renamed = true
+          rest.push({ ...message, content })
+          continue
+        }
+      }
+    }
+    rest.push(value)
+  }
+  if (prompts.length === 0 && !renamed) return undefined
+  if (prompts.length === 0) {
+    obj['messages'] = rest
+    return JSON.stringify(obj)
+  }
+
+  const instructions = prompts.join('\n\n')
+  const firstUser = rest.findIndex((value) =>
+    typeof value === 'object' && value !== null && !Array.isArray(value)
+    && (value as Record<string, unknown>)['role'] === 'user')
+  if (firstUser === -1) {
+    rest.unshift({ role: 'user', content: instructions })
+  } else {
+    const message = rest[firstUser] as Record<string, unknown>
+    const content = message['content']
+    rest[firstUser] = {
+      ...message,
+      content: typeof content === 'string'
+        ? `${instructions}\n\n${content}`
+        : [{ type: 'text', text: instructions }, ...(Array.isArray(content) ? content : [])],
+    }
+  }
+  obj['messages'] = [{ role: 'system', content: '' }, ...rest]
+  return JSON.stringify(obj)
+}
+
+/**
+ * Rename the client in one message content, preserving every other field.
+ *
+ * Matched case-insensitively because the host's screen is, and only the product
+ * name is replaced: the rest of the sentence still reads naturally, and the
+ * model sees the same instructions.
+ */
+function renameInContent(content: unknown): unknown {
+  const rename = (text: string): string => text.replace(/DeepSeek Harness/gi, 'DeepSeek')
+  if (typeof content === 'string') return rename(content)
+  if (!Array.isArray(content)) return content
+  return content.map((part) => {
+    if (typeof part === 'string') return rename(part)
+    if (typeof part !== 'object' || part === null || Array.isArray(part)) return part
+    const record = part as Record<string, unknown>
+    if (typeof record['text'] !== 'string') return part
+    const text = rename(record['text'])
+    return text === record['text'] ? part : { ...record, text }
+  })
+}
+
+function rememberFoldedPrompt(fingerprint: string): void {
+  if (foldedPrompts.has(fingerprint)) return
+  if (foldedPrompts.size >= FOLDED_PROMPTS_MAX) {
+    const oldest = foldedPrompts.values().next().value
+    if (oldest !== undefined) foldedPrompts.delete(oldest)
+  }
+  foldedPrompts.add(fingerprint)
+}
+
+/** Whether a 400 body is the host's prompt screen rather than a bad request. */
+function isChannelCheckText(text: string): boolean {
+  return CHANNEL_CHECK_PATTERN.test(text)
+}
+
 export class WorkBuddyUpstreamClient {
   private readonly fetchImpl: typeof fetch
 
@@ -1074,6 +1310,14 @@ export class WorkBuddyUpstreamClient {
         if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
         const message = value as Record<string, unknown>
         if (message['role'] === 'developer') message['role'] = 'system'
+        // The host's prompt screen reads assistant turns as well as system
+        // ones, so a reply that quoted the client name would fail every later
+        // turn of the same conversation. Renaming the product in history is
+        // local to this copy; the conversation the user sees is unchanged.
+        if (message['role'] === 'assistant' && 'content' in message) {
+          const content = renameInContent(message['content'])
+          if (content !== message['content']) message['content'] = content
+        }
       }
     }
     const choice = obj['tool_choice']
@@ -1115,81 +1359,143 @@ export class WorkBuddyUpstreamClient {
     signal?: AbortSignal,
     timeouts?: { headersMs?: number; idleMs?: number },
   ): Promise<ChatStreamResult> {
-    let response: Response
-    // The caller's signal only covers a hang-up; an upstream that accepts the
-    // POST and then goes quiet held the turn until the host's own fetch
-    // timeout. The headers phase gets a deadline of its own, and the stream an
-    // idle watchdog: a healthy stream sends something every few seconds.
-    const deadline = headersDeadline(signal, timeouts?.headersMs ?? STREAM_HEADERS_TIMEOUT_MS)
+    const fingerprint = systemPromptFingerprint(prepared)
+    const region = regionOf(credential.domain)
     // The international gateway also insists the first message be a system
     // prompt. This is the one place the credential is known, so it is the one
     // place the region can be decided; CN pays nothing for it.
-    const body = regionOf(credential.domain) === 'global'
-      ? withLeadingSystemPrompt(prepared)
-      : prepared
-    try {
-      response = await this.fetchImpl(`${chatBase(credential)}/v2/chat/completions`, {
-        redirect: 'error',
-        method: 'POST',
-        headers: chatHeaders(credential),
-        body,
-        signal: deadline.signal,
-      })
-    } catch (error: unknown) {
-      // The caller hanging up is not an upstream failure. Answering it as one
-      // made every cancelled turn look like a network fault in the log, and
-      // spent a rotation on a request the client had already dropped.
-      if (signal?.aborted === true) {
-        return { ok: false, kind: 'aborted', status: 0, message: 'cancelled by the caller' }
-      }
-      // A transport failure (DNS, reset, TLS, a 30x under `redirect: 'error'`)
-      // is a property of the network path, not of this account: the next
-      // sign-in may well reach the host. Classing it as `server` had the shim
-      // break out of the rotation and answer 502 with the healthy accounts
-      // behind it still untried.
-      return { ok: false, kind: 'transport', status: 0, message: `transport error: ${String(error)}` }
-    } finally {
-      // Only the headers phase was on the clock: the body is the watchdog's.
-      deadline.arrived()
+    let body = region === 'global' ? withLeadingSystemPrompt(prepared) : prepared
+    // A prompt this process has already seen refused is folded before sending,
+    // so only the first turn of a conversation pays the channel check. Keyed by
+    // region: a CN refusal says nothing about what the international host wants.
+    const cacheKey = fingerprint === undefined ? undefined : `${region}:${fingerprint}`
+    if (cacheKey !== undefined && foldedPrompts.has(cacheKey)) {
+      body = foldSystemIntoUser(body) ?? body
     }
-    if (response.ok) {
-      // A 200 with no body has nothing to relay. Returning it as success made
-      // the gateway throw inside the relay and answer 500 `internal`, which
-      // reads as a plugin bug instead of an upstream fault.
-      if (response.body === null) {
-        return { ok: false, kind: 'server', status: 502, message: 'upstream returned 200 without a stream' }
+    // Remembered only once the folded request is accepted: a retry that fails
+    // again must leave the prompt unfolded for the next turn instead of caching
+    // a rewrite that does not work.
+    let rememberOnSuccess: string | undefined
+    // One retry, and only for the prompt screen: the host answers 11128 on the
+    // system role, and the same instructions in the first user message pass.
+    for (let attempt = 0; ; attempt++) {
+      let response: Response
+      // The caller's signal only covers a hang-up; an upstream that accepts the
+      // POST and then goes quiet held the turn until the host's own fetch
+      // timeout. The headers phase gets a deadline of its own, and the stream an
+      // idle watchdog: a healthy stream sends something every few seconds.
+      const deadline = headersDeadline(signal, timeouts?.headersMs ?? STREAM_HEADERS_TIMEOUT_MS)
+      try {
+        response = await this.fetchImpl(`${chatBase(credential)}/v2/chat/completions`, {
+          redirect: 'error',
+          method: 'POST',
+          headers: chatHeaders(credential),
+          body,
+          signal: deadline.signal,
+        })
+      } catch (error: unknown) {
+        // The caller hanging up is not an upstream failure. Answering it as one
+        // made every cancelled turn look like a network fault in the log, and
+        // spent a rotation on a request the client had already dropped.
+        if (signal?.aborted === true) {
+          return { ok: false, kind: 'aborted', status: 0, message: 'cancelled by the caller' }
+        }
+        // A transport failure (DNS, reset, TLS, a 30x under `redirect: 'error'`)
+        // is a property of the network path, not of this account: the next
+        // sign-in may well reach the host. Classing it as `server` had the shim
+        // break out of the rotation and answer 502 with the healthy accounts
+        // behind it still untried.
+        return { ok: false, kind: 'transport', status: 0, message: `transport error: ${String(error)}` }
+      } finally {
+        // Only the headers phase was on the clock: the body is the watchdog's.
+        deadline.arrived()
       }
-      // The watchdog stream is handed over under the relay key as well: a
-      // Response built around a stream this plugin made stops delivering to a
-      // `Readable.fromWeb` reader after the first chunks, so the gateway pumps
-      // this stream directly instead.
-      const relayed = withIdleWatchdog(response.body, timeouts?.idleMs, signal)
+      if (response.ok) {
+        // A 200 is not automatically a stream: the prompt screen can answer the
+        // refusal as a JSON envelope with HTTP 200. Treating that as success
+        // skipped the fold/retry and cached nothing, so every turn paid the same
+        // refusal. Read the small JSON body here and run the same one-retry path.
+        const contentType = (response.headers.get('content-type') ?? '').toLowerCase()
+        // A refusal is not required to arrive as `application/json`: some
+        // deployments label the same envelope `text/plain`. A declared small
+        // body cannot be a live event stream, so it is safe to read and inspect;
+        // a stream with no length stays untouched.
+        const declaredLength = Number(response.headers.get('content-length') ?? '')
+        const smallDeclaredBody = Number.isFinite(declaredLength) && declaredLength > 0
+          && declaredLength <= ERROR_BODY_LIMIT
+        if (contentType.includes('application/json')
+          || (smallDeclaredBody && !contentType.includes('text/event-stream'))) {
+          const text = await readErrorBody(response, ERROR_BODY_LIMIT, signal)
+          if (attempt === 0 && isChannelCheckText(text)) {
+            const folded = foldSystemIntoUser(body)
+            if (folded !== undefined) {
+              rememberOnSuccess = cacheKey
+              body = folded
+              continue
+            }
+          }
+          if (rememberOnSuccess !== undefined && !isChannelCheckText(text)) {
+            rememberFoldedPrompt(rememberOnSuccess)
+          }
+          const envelopeResponse = new Response(text, {
+            status: response.status,
+            headers: response.headers,
+          })
+          const envelopeBody = envelopeResponse.body
+          if (envelopeBody === null) {
+            return { ok: false, kind: 'server', status: 502, message: 'upstream returned 200 without a body' }
+          }
+          return { ok: true, response: withRelayStream(envelopeResponse, envelopeBody) }
+        }
+        // The folded request was accepted: from now on this prompt skips the
+        // refused round trip.
+        if (rememberOnSuccess !== undefined) rememberFoldedPrompt(rememberOnSuccess)
+        // A 200 with no body has nothing to relay. Returning it as success made
+        // the gateway throw inside the relay and answer 500 `internal`, which
+        // reads as a plugin bug instead of an upstream fault.
+        if (response.body === null) {
+          return { ok: false, kind: 'server', status: 502, message: 'upstream returned 200 without a stream' }
+        }
+        // The watchdog stream is handed over under the relay key as well: a
+        // Response built around a stream this plugin made stops delivering to a
+        // `Readable.fromWeb` reader after the first chunks, so the gateway pumps
+        // this stream directly instead.
+        const relayed = withIdleWatchdog(response.body, timeouts?.idleMs, signal)
+        return {
+          ok: true,
+          response: withRelayStream(new Response(relayed, {
+            status: response.status,
+            headers: response.headers,
+          }), relayed),
+        }
+      }
+      const text = (await readErrorBody(response, ERROR_BODY_LIMIT, signal))
+      const retryAfter = retryAfterSeconds(response.headers)
+      if (attempt === 0 && response.status === 400 && isChannelCheckText(text)) {
+        const folded = foldSystemIntoUser(body)
+        if (folded !== undefined) {
+          rememberOnSuccess = cacheKey
+          body = folded
+          continue
+        }
+      }
       return {
-        ok: true,
-        response: withRelayStream(new Response(relayed, {
-          status: response.status,
-          headers: response.headers,
-        }), relayed),
+        ok: false,
+        kind: classifyUpstreamError(response.status, text),
+        status: response.status,
+        // A gateway page is answered with the sentence that says what to do
+        // about it. The page itself is the other half of the same refusal, and
+        // relaying it put a screenful of openresty HTML in front of the user
+        // where one instruction belonged.
+        message: isGatewayHtmlRejection(response.status, text)
+          ? gatewayRejectionText(response.status)
+          : text,
+        // The upstream states the wait in the standard header as well as in the
+        // body, and the body parse only covers the spellings it knows. Handing
+        // the header through lets the shim honour the upstream's own window
+        // instead of guessing `cooldownSeconds` for every 429.
+        ...retryAfter === undefined ? {} : { retryAfter },
       }
-    }
-    const text = (await readErrorBody(response, ERROR_BODY_LIMIT, signal))
-    const retryAfter = retryAfterSeconds(response.headers)
-    return {
-      ok: false,
-      kind: classifyUpstreamError(response.status, text),
-      status: response.status,
-      // A gateway page is answered with the sentence that says what to do
-      // about it. The page itself is the other half of the same refusal, and
-      // relaying it put a screenful of openresty HTML in front of the user
-      // where one instruction belonged.
-      message: isGatewayHtmlRejection(response.status, text)
-        ? gatewayRejectionText(response.status)
-        : text,
-      // The upstream states the wait in the standard header as well as in the
-      // body, and the body parse only covers the spellings it knows. Handing
-      // the header through lets the shim honour the upstream's own window
-      // instead of guessing `cooldownSeconds` for every 429.
-      ...retryAfter === undefined ? {} : { retryAfter },
     }
   }
 
@@ -1222,8 +1528,9 @@ export class WorkBuddyUpstreamClient {
    *
    * The two gateways are read differently, because they answer differently:
    *
-   * - **CN** serves the roster at `/v2/enterprises/personal/models` and expects
-   *   the CLI client spelling.
+   * - **CN** serves the roster at `/v2/enterprises/personal/models`. Like the
+   *   desktop process that calls it directly, it expects the desktop client
+   *   spelling; this is not the chat endpoint's three-segment UA.
    * - **Global** serves it as part of the product config at `/v3/config`, and
    *   only to the DESKTOP client channel. Asking the global host with the CLI UA
    *   yields a truncated roster, and the CN path answers HTTP 500 there — which
@@ -1249,7 +1556,7 @@ export class WorkBuddyUpstreamClient {
           // The gate header every API request carries, the global roster included.
           'X-CodeBuddy-Request': '1',
           'Connection': 'close',
-          'User-Agent': DESKTOP_UA,
+          'User-Agent': GLOBAL_DESKTOP_UA,
         }
       : {
           // Built from commonHeaders rather than spelled out: the hand-written

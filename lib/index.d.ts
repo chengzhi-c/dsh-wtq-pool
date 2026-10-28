@@ -73,8 +73,6 @@ interface Config {
   removedAccounts?: unknown[];
   /** Whether the credits readout is shown beside the composer. */
   showComposerPoints?: boolean;
-  /** Whether the client name is rewritten for the domestic host's channel check. */
-  rewriteClientName?: boolean;
   /** How each Trae/Qoder region spreads requests. */
   sourceDistributions?: Record<string, string>;
 }

@@ -94,14 +94,14 @@ for (const source of ['trae', 'qoder']) {
 test('a partial startup keeps the row of a warming gateway and drops an answered one', () => {
   const source = fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')
   const fn = source.match(/^function syncDeclaration\(\) \{[^]*?^\}/m)[0]
-  const old = { id: 'xdpool-qoder-cn', models: [{ id: 'saved-qoder' }] }
+  const old = { id: 'wtqpool-qoder-cn', models: [{ id: 'saved-qoder' }] }
   const byWarming = [
     // A Qoder gateway whose directory has not answered yet is the one case a row
     // is republished for; everything else that cannot publish drops its row.
-    { warming: ['xdpool-qoder-cn'], kept: ['xdpool-cn', 'xdpool-qoder-cn'], reason: 'a gateway still warming keeps the row it saved' },
+    { warming: ['wtqpool-qoder-cn'], kept: ['wtqpool-cn', 'wtqpool-qoder-cn'], reason: 'a gateway still warming keeps the row it saved' },
     // Nothing is warming: the Qoder directory has answered, and the row it saved
     // is all that is left of a sign-in that is gone.
-    { warming: [], kept: ['xdpool-cn'], reason: 'a gateway that has answered drops the row it saved' },
+    { warming: [], kept: ['wtqpool-cn'], reason: 'a gateway that has answered drops the row it saved' },
   ]
   for (const { warming, kept, reason } of byWarming) {
     const writes = []
@@ -109,8 +109,8 @@ test('a partial startup keeps the row of a warming gateway and drops an answered
       runtimes: new Map([['cn', { signedIn: true }]]),
       activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => ['cn'],
       declarationModels: () => [{ id: 'workbuddy' }], traeDeclarationModels: () => [], qoderDeclarationModels: () => [],
-      PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn' }, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: { cn: old.id },
-      descriptorFor: () => ({ id: 'xdpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder() {},
+      PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' }, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: { cn: old.id },
+      descriptorFor: () => ({ id: 'wtqpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder() {},
       manifestProviders: () => [old], declaredProviders: () => [old], writeDeclaration: rows => { writes.push(rows); return { ok: true } }, runtimeState: {},
       warmingGatewayIds: () => new Set(warming),
     })
@@ -136,7 +136,7 @@ test('a runtime still connecting is warming and a settled signed-out one is not'
     runtimes: new Map(),
     gatewayStartFailures: new Map(),
     activeRegions: () => ['cn'],
-    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn' },
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' },
     traeGateways: new Map(), activeTraeRegions: () => [], TRAE_PROVIDER_ID_BY_REGION: {},
     qoderGateways: new Map(), activeQoderRegions: () => [], QODER_PROVIDER_ID_BY_REGION: {},
   })
@@ -146,7 +146,7 @@ test('a runtime still connecting is warming and a settled signed-out one is not'
   // Mid-connect: the roster is still on its way, so dropping the row would cost
   // a roster the gateway already had.
   context.runtimes = new Map([['cn', { signedIn: false, connecting: Promise.resolve() }]])
-  assert.deepEqual(warming(), ['xdpool-cn'],
+  assert.deepEqual(warming(), ['wtqpool-cn'],
     'a runtime that has not finished connecting must read as warming')
   // Settled: the connect answered and the sign-in is gone, which is a verdict
   // rather than a wait.
@@ -154,7 +154,7 @@ test('a runtime still connecting is warming and a settled signed-out one is not'
   assert.deepEqual(warming(), [], 'a runtime that has settled signed out must not read as warming')
   // No runtime at all is still a roster on its way - the same row is at stake.
   context.runtimes = new Map()
-  assert.deepEqual(warming(), ['xdpool-cn'],
+  assert.deepEqual(warming(), ['wtqpool-cn'],
     'a region with no runtime yet is still waiting for its first roster')
   // A region whose start failed is not waiting for anything: its shim could not
   // bind, and nothing will bring the row it saved back to life.
@@ -181,7 +181,7 @@ test('a gateway that could not bind is reported as address drift', () => {
     sourceStartFailures: new Map(),
     publishedIds: new Set(),
     activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => [],
-    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn' },
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' },
     TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: {},
     traeGateways: new Map(), qoderGateways: new Map(),
     // The host holds a row for this region, and this run has nothing bound.
@@ -196,7 +196,7 @@ test('a gateway that could not bind is reported as address drift', () => {
   context.gatewayStartFailures = new Map([['cn', 'listen EADDRINUSE']])
   assert.equal(drift(), false,
     'a first start that failed before any row was registered has nothing to drift from')
-  context.publishedIds = new Set(['xdpool-cn'])
+  context.publishedIds = new Set(['wtqpool-cn'])
   assert.equal(drift(), true,
     'once the host holds the row, a gateway with no shim is drift')
 
@@ -205,7 +205,7 @@ test('a gateway that could not bind is reported as address drift', () => {
   context.gatewayStartFailures = new Map()
   context.publishedIds = new Set()
   context.activeTraeRegions = () => ['cn']
-  context.TRAE_PROVIDER_ID_BY_REGION = { cn: 'xdpool-trae-cn' }
+  context.TRAE_PROVIDER_ID_BY_REGION = { cn: 'wtqpool-trae-cn' }
   context.sourceStartFailures = new Map([['trae:cn', 'listen EADDRINUSE']])
   assert.equal(drift(), false, 'a Trae first start that failed has nothing to drift from yet')
   context.declaredSourceBaseUrl = () => 'http://127.0.0.1:42851'
@@ -237,7 +237,7 @@ test('DSH publishes the live gateway after its preferred port is occupied', asyn
   try {
     await plugin.onLoad()
     const state = await plugin.onPanelInvoke('xd.state')
-    const row = rows.find(row => row.id === 'xdpool-cn')
+    const row = rows.find(row => row.id === 'wtqpool-cn')
     assert.ok(row)
     assert.equal(row.baseUrl, state.shims.cn.baseUrl, 'runtime registration must name the gateway that actually bound')
     assert.equal((await fetch(row.baseUrl.replace(/\/v1$/, '') + '/healthz')).status, 200)
@@ -323,10 +323,10 @@ test('WorkBuddy composer starts a background probe for cold credits without a pa
     scheduleRefresh: () => { scheduled++; setImmediate(() => { total = 500 }) },
   })
   vm.runInContext(fn, context)
-  assert.equal(context.composerPoints({ chip: 'fixture', provider: 'xdpool-cn', model: 'fixture' }).total, null)
+  assert.equal(context.composerPoints({ chip: 'fixture', provider: 'wtqpool-cn', model: 'fixture' }).total, null)
   assert.equal(scheduled, 1, 'cache-only composer reads must start the existing background refresh when cold')
   await new Promise(resolve => setImmediate(resolve))
-  assert.equal(context.composerPoints({ chip: 'fixture', provider: 'xdpool-cn', model: 'fixture' }).total, 500)
+  assert.equal(context.composerPoints({ chip: 'fixture', provider: 'wtqpool-cn', model: 'fixture' }).total, 500)
   assert.equal(scheduled, 1, 'fresh credits must not start another probe')
 })
 

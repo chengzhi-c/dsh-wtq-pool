@@ -53,6 +53,7 @@ function loadHost(options = {}) {
   let settingsDocument = options.settings ?? {}
   let readFails = false
   let gate = null
+  let writeGate = null
   const ownRequire = createRequire(path.join(root, 'src/host.ts'))
   const bridge = {
     getSettings: async () => {
@@ -65,7 +66,10 @@ function loadHost(options = {}) {
       if (readFails) throw new Error('settings service unavailable')
       return snapshot
     },
-    setSettings: async (patch) => { settingsDocument = { ...settingsDocument, ...patch } },
+    setSettings: async (patch) => {
+      if (writeGate !== null) await writeGate
+      settingsDocument = { ...settingsDocument, ...patch }
+    },
     getDataPath: () => temporary,
     declareProviders: () => ({ ok: true, changed: false }),
   }
@@ -79,14 +83,17 @@ function loadHost(options = {}) {
   context.exports = context.module.exports
   // The internals under test are module-scope bindings, so they are published
   // alongside the module's own exports rather than reached by name.
-  const internals = ['loadSettings', 'adoptHostSettings', 'saveSettings', 'mutateSettings', 'normalizeSelection', 'parseSelection',
+  const internals = ['loadSettings', 'adoptHostSettings', 'saveSettings', 'mutateSettings', 'onHostSettingsChanged', 'normalizeSelection', 'parseSelection',
+    'parseKnownModelIds', 'mergeSelectionForPartialRoster',
     'orderSourceCredentials', 'traeClaimFor', 'gatewaySelectionFor', 'sourceDistribution',
     'sourceRosterFor', 'traeNativeOf', 'traeDeclarationModels', 'traeGateways',
     'creditReserves', 'isSelectableSourceModel', 'gatewayEnabledIds', 'sourceModelView']
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8'))
     + `\nmodule.exports.__internals = { ${internals.join(', ')} }\n`
     + '\nmodule.exports.__settings = (next) => { settings = next }\n'
-    + '\nmodule.exports.__readSettings = () => settings\n', context)
+    + '\nmodule.exports.__readSettings = () => settings\n'
+    + '\nmodule.exports.__setCorePool = (pool) => { core.pool = pool; core.client = {} }\n'
+    + '\nmodule.exports.__start = () => { serviceStopped = false }\n', context)
   const internalsApi = context.module.exports.__internals
   return {
     logs,
@@ -100,6 +107,16 @@ function loadHost(options = {}) {
       gate = new Promise((resolve) => { release = resolve })
       return release
     },
+    /** Keep every later write pending until the returned release is called. */
+    holdWrite() {
+      let release
+      writeGate = new Promise((resolve) => { release = resolve })
+      return release
+    },
+    readSettings() { return context.module.exports.__readSettings() },
+    setCorePool(pool) { context.module.exports.__setCorePool(pool) },
+    start() { context.module.exports.__start() },
+    stop() { return context.module.exports.onUnload() },
     cleanup() { fs.rmSync(temporary, { recursive: true, force: true }) },
   }
 }
@@ -140,6 +157,87 @@ test('a failed settings read keeps the last known document instead of wiping it'
       'a credit floor must not be dropped because a read failed')
     assert.deepEqual(stored.preferredAccountIds, { cn: 'account-one' })
     assert.deepEqual(stored.modelSelection, { cn: { enabledModelIds: ['model-a'] } })
+  } finally {
+    host.cleanup()
+  }
+})
+
+/**
+ * A host edit that raced a local save is re-read, not dropped with the stale
+ * event payload.
+ *
+ * The host announces its stored document, and an announcement already in flight
+ * when this process saves carries the pre-save copy. Dropping it left an edit
+ * made in the host settings page unapplied until something else re-read the
+ * file. The host's copy after the save is the merge of both.
+ */
+test('a host edit that raced a local save is re-read, not dropped', async () => {
+  const host = loadHost({
+    settings: {
+      enabled: false, sourceWorkbuddy: false, sourceTrae: false, sourceQoder: false,
+      cooldownSeconds: 60,
+    },
+  })
+  try {
+    await host.internals.adoptHostSettings()
+    host.start()
+    host.setCorePool({
+      applyConfig: () => false, applyRemoved: () => {}, prefer: () => {},
+      list: () => [], isDisabled: () => false,
+    })
+    const release = host.holdWrite()
+    const saving = host.internals.saveSettings({ showComposerPoints: true })
+    // The host stored its own edit while the save was in flight. The event it
+    // already sent carries the document from before the save.
+    host.setDocument({ sourceTrae: false, cooldownSeconds: 120, showComposerPoints: true })
+    const changed = host.internals.onHostSettingsChanged({ sourceTrae: false, cooldownSeconds: 120 })
+    release()
+    await saving
+    await changed
+    const current = host.readSettings()
+    assert.equal(current.showComposerPoints, true, 'the local save must survive the host event')
+    assert.equal(current.cooldownSeconds, 120, 'the host edit that raced the save must land too')
+  } finally {
+    await host.stop()
+    host.cleanup()
+  }
+})
+
+/**
+ * A save from a partial roster keeps what the page could not show.
+ *
+ * The panel cannot display a model the current roster read did not list, so it
+ * cannot offer to keep or drop it. Treating its absence from the payload as a
+ * deliberate removal wiped that model's tick and edits whenever the static
+ * fallback stood in for a live list, or a source directory answered with fewer
+ * rows than it would carry later.
+ */
+test('a save from a partial roster keeps the models the page did not show', async () => {
+  const host = loadHost({
+    settings: {
+      modelSelection: {
+        cn: {
+          enabledModelIds: ['shown', 'hidden'],
+          overrides: { shown: { contextWindow: 8000 }, hidden: { alias: 'Hidden' } },
+        },
+      },
+    },
+  })
+  try {
+    assert.equal(await host.internals.adoptHostSettings(), true)
+    const prior = host.internals.gatewaySelectionFor('cn')
+    // What the panel sends after the user cleared `shown`'s window edit and
+    // unticked `hidden`, while only `shown` was on the page.
+    const selection = host.internals.parseSelection({ enabledModelIds: ['shown'], overrides: {} })
+    const merged = host.internals.mergeSelectionForPartialRoster(
+      selection, prior, host.internals.parseKnownModelIds(['shown']))
+
+    assert.deepEqual([...merged.enabledModelIds], ['shown', 'hidden'], 'the unseen model stays enabled')
+    assert.equal(merged.overrides.hidden.alias, 'Hidden', 'and keeps its per-model edits')
+    assert.equal(merged.overrides.shown, undefined, 'an edit cleared on the page is still removed')
+    // An older panel sends no id list: its payload is the whole selection, so
+    // nothing is carried over.
+    assert.deepEqual(host.internals.mergeSelectionForPartialRoster(selection, prior, undefined), selection)
   } finally {
     host.cleanup()
   }

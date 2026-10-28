@@ -525,6 +525,7 @@ test('a Qoder round that is not open yet is collected when its window opens', as
     disabledRegions: [], autoCheckin: { enabled: true, hours: [9] },
   }
   const lines = []
+  let opened = false
   const { QoderUpstreamClient } = require('../src/qoder-client.ts')
   const qoder = require('../src/qoder-credentials.ts')
   t.mock.method(qoder, 'discoverQoderCredentials', async () => ({
@@ -532,9 +533,13 @@ test('a Qoder round that is not open yet is collected when its window opens', as
     failures: [],
   }))
   // A round that exists but has not opened: exactly what an 09:00 pass sees.
+  // The client reads the real clock, unlike the host's fake one, so the
+  // deferred call flips this to a round already open and proves the claim.
   t.mock.method(QoderUpstreamClient.prototype, 'fetchCampaigns', async () => ({
-    campaigns: [{ actionType: 'CLAIM_BENEFIT', campaignId: 'today', startAt: opensAt }],
+    campaigns: [{ actionType: 'CLAIM_BENEFIT', campaignId: 'today',
+      startAt: opened ? Date.now() - 1000 : opensAt }],
   }))
+  t.mock.method(QoderUpstreamClient.prototype, 'claimCampaign', async () => ({ success: true, grantId: 'claim-1' }))
   t.mock.method(QoderUpstreamClient.prototype, 'fetchUsage', async () => ({ userQuota: { remaining: 5, total: 10 }, dedicatedPackages: [] }))
   const { installPi, startRegisteredService, stopRegisteredService } = require('../src/pi-compat.ts')
   installPi({ getSettings: () => ({ ...settings }), setSettings: patch => Object.assign(settings, patch), getDataPath: () => temporary,
@@ -565,14 +570,22 @@ test('a Qoder round that is not open yet is collected when its window opens', as
       lines.filter((line) => line.includes('deferred Qoder check-in')), [],
       'a round that has not opened must not be reported as a deferred collection yet',
     )
+    // A source-only click must not cancel the deferral the full pass just set.
+    // The old unconditional write replaced it with the placeholder's zero.
+    await plugin.onPanelInvoke('xd.checkinAll', { source: 'trae' })
+    const slots = JSON.parse(fs.readFileSync(path.join(temporary, 'checkin-slots.json'), 'utf8'))
+    assert.equal(slots._qoderRetryAt, opensAt,
+      'the deferred Qoder time must survive another source and be written for a reload')
     // Now the window opens: the tick that was already scheduled must collect Qoder.
+    opened = true
     now = opensAt + 1000
     for (const timer of timers) if (timer.at <= now) timer.callback()
     await new Promise((resolve) => setTimeout(resolve, 200))
-    assert.equal(
-      lines.filter((line) => line.includes('deferred Qoder check-in')).length, 1,
-      'the tick must come back for Qoder at the opening time it was told about',
-    )
+    const deferred = lines.filter((line) => line.includes('deferred Qoder check-in'))
+    assert.equal(deferred.length, 1,
+      'the tick must come back for Qoder at the opening time it was told about')
+    assert.match(deferred[0], /"claimed":1/,
+      'the deferred round must actually claim, not merely report another wait')
   } finally {
     await stopRegisteredService()
     await plugin.onUnload()
@@ -773,7 +786,7 @@ test('switching to an account the pool cannot serve is reported, not silently ac
     const model = state.models.find((item) => item.region === 'cn')
     assert.ok(model !== undefined, 'the cn gateway must publish a model to switch against')
 
-    const points = await plugin.onPanelInvoke('xd.composerPoints', { provider: 'xdpool-cn', model: model.id })
+    const points = await plugin.onPanelInvoke('xd.composerPoints', { provider: 'wtqpool-cn', model: model.id })
     assert.equal(points.show, true)
     assert.equal(points.accounts.length, 4)
     const fourth = points.accounts[3]
@@ -783,7 +796,7 @@ test('switching to an account the pool cannot serve is reported, not silently ac
     await plugin.onPanelInvoke('xd.setAccountState', { region: 'cn', accountId: fourth.id, state: 'disabled' })
 
     const refused = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'xdpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: fourth.id, accountLabel: fourth.label,
+      provider: 'wtqpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: fourth.id, accountLabel: fourth.label,
     })
     assert.equal(refused.show, true, 'the click is answered, not dropped')
     assert.equal(refused.unavailable, true, 'an account the pool skips must be reported as unavailable')
@@ -794,7 +807,7 @@ test('switching to an account the pool cannot serve is reported, not silently ac
     // A servable account is the control: it switches and is not flagged.
     const first = points.accounts[0]
     const switched = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'xdpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: first.id, accountLabel: first.label,
+      provider: 'wtqpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: first.id, accountLabel: first.label,
     })
     assert.equal(switched.unavailable, undefined, 'a servable account must not be flagged')
     assert.equal(switched.accounts.find((account) => account.active === true)?.id, first.id)
@@ -868,13 +881,13 @@ test('an account cooling on the selected model is reported, not silently accepte
     const model = state.models.find((item) => item.region === 'cn')
     assert.ok(model !== undefined, 'the cn gateway must publish a model to switch against')
 
-    const points = await plugin.onPanelInvoke('xd.composerPoints', { provider: 'xdpool-cn', model: model.id })
+    const points = await plugin.onPanelInvoke('xd.composerPoints', { provider: 'wtqpool-cn', model: model.id })
     assert.equal(points.show, true)
     assert.equal(points.accounts.length, 4)
     const fourth = points.accounts[3]
 
     const chosen = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'xdpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: fourth.id, accountLabel: fourth.label,
+      provider: 'wtqpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: fourth.id, accountLabel: fourth.label,
     })
     assert.equal(chosen.unavailable, undefined, 'a live account switches without a flag')
     assert.equal(chosen.accounts.find((account) => account.active === true)?.id, fourth.id)
@@ -889,12 +902,12 @@ test('an account cooling on the selected model is reported, not silently accepte
     assert.equal(answer.status, 200, 'the healthy accounts behind the cooled one must still serve')
     assert.equal(attempts, 2, 'the request must rotate exactly once, past the cooled account')
 
-    const cooled = await plugin.onPanelInvoke('xd.composerPoints', { provider: 'xdpool-cn', model: model.id })
+    const cooled = await plugin.onPanelInvoke('xd.composerPoints', { provider: 'wtqpool-cn', model: model.id })
     assert.equal(cooled.accounts.find((account) => account.id === fourth.id).active, false,
       'a model-cooled account must not be marked as serving')
 
     const refused = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'xdpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: fourth.id, accountLabel: fourth.label,
+      provider: 'wtqpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: fourth.id, accountLabel: fourth.label,
     })
     assert.equal(refused.show, true, 'the click is answered, not dropped')
     assert.equal(refused.unavailable, true, 'an account the pool skips for this model must be reported as unavailable')
@@ -904,7 +917,7 @@ test('an account cooling on the selected model is reported, not silently accepte
     // The control: an account live on this same model switches and is not flagged.
     const other = points.accounts[0]
     const switched = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'xdpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: other.id, accountLabel: other.label,
+      provider: 'wtqpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: other.id, accountLabel: other.label,
     })
     assert.equal(switched.unavailable, undefined, 'an account live on this model must not be flagged')
     assert.equal(switched.accounts.find((account) => account.active === true)?.id, other.id)
@@ -1000,10 +1013,10 @@ test('switching accounts during a reply does not cut the stream', async (t) => {
 
     // The user clicks another account mid-answer. That stores the preference and
     // the host echoes the document back, exactly as the desktop app does.
-    const points = await plugin.onPanelInvoke("xd.composerPoints", { provider: "xdpool-cn", model: model.id })
+    const points = await plugin.onPanelInvoke("xd.composerPoints", { provider: "wtqpool-cn", model: model.id })
     const target = points.accounts.find((account) => account.active === false)
     const switched = await plugin.onPanelInvoke("xd.composerPrefer", {
-      provider: "xdpool-cn", model: model.id, source: "workbuddy", region: "cn", accountId: target.id, accountLabel: target.label,
+      provider: "wtqpool-cn", model: model.id, source: "workbuddy", region: "cn", accountId: target.id, accountLabel: target.label,
     })
     assert.equal(switched.unavailable, undefined, "a live account switches while a reply is streaming")
     await onSettings({ ...settings, preferredAccountIds: { ...(settings.preferredAccountIds ?? {}), cn: target.id } })
@@ -1179,7 +1192,7 @@ test('a stored account choice is never reported as a refusal', async (t) => {
     // channel, because the plugin keeps its own copy of the settings.
     await plugin.onPanelInvoke('xd.setComposerPoints', { enabled: false })
     const answered = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'xdpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: fourth.id, accountLabel: fourth.label,
+      provider: 'wtqpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: fourth.id, accountLabel: fourth.label,
     })
     assert.equal(answered.saved, true, 'a stored choice must be reported as stored')
     assert.notEqual(answered.show, true, 'the snapshot really is unavailable, or this proves nothing')
@@ -1188,7 +1201,7 @@ test('a stored account choice is never reported as a refusal', async (t) => {
     // And a refusal still reports as one: the control.
     await plugin.onPanelInvoke('xd.setComposerPoints', { enabled: true })
     const refused = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'xdpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: 'no-such-account', accountLabel: 'x',
+      provider: 'wtqpool-cn', model: model.id, source: 'workbuddy', region: 'cn', accountId: 'no-such-account', accountLabel: 'x',
     })
     assert.equal(refused.saved, undefined, 'a refused click must not claim anything was stored')
     assert.equal(refused.show, false, 'a refused click must show nothing')
@@ -1415,8 +1428,8 @@ test('a file the registry scan names is only run when its signature is valid', (
  *
  * The claim under test: with all three sources running, each one has a
  * `published address` finding; and when one source's preferred port is held by
- * another process, that source's finding is the failed one and names the port
- * it wanted, which is the one action that clears it.
+ * another process, that source still passes because its published row names
+ * the fallback it actually bound, and the finding says which port was taken.
  */
 test('the doctor reports a published address for all three sources and names the port a held one fell back from', async (t) => {
   const net = require('node:net')
@@ -1496,9 +1509,9 @@ test('the doctor reports a published address for all three sources and names the
       assert.ok(byId.has(name + ': published address'), `${name} must have a published address row`)
     }
     const held = byId.get('WTQ Pool Trae (CN): published address')
-    assert.equal(held.ok, false, 'a source whose preferred port is held is drift, not a pass')
+    assert.equal(held.ok, true, 'a gateway serving the address it published is not drift')
     assert.ok(held.detail.includes('42851'), 'the fallback text must name the port it wanted')
-    assert.ok(held.detail.includes('is held by another process'), 'the fallback text must say why')
+    assert.ok(held.detail.includes('is held'), 'the fallback text must say why')
     // Control: the other two sources kept their own slots, so their rows pass and
     // name the address actually bound. Without this the Trae row could be the
     // only row left and the test would not notice two of them disappearing.
@@ -1540,7 +1553,10 @@ test('a source account preference is stored only for a label that exists', async
   const trae = require('../src/trae-discovery.ts')
   const { TraeSoloUpstreamClient } = require('../src/trae-upstream.ts')
   t.mock.method(trae, 'discoverTraeCredentials', async () => ({
-    credentials: [{ accessToken: 'trae-token', userId: 'trae-user', edition: 'cn', host: '', source: 'desktop', expiresAtMs: Date.now() + 3600000 }],
+    credentials: [
+      { accessToken: 'trae-token', userId: 'trae-user', edition: 'cn', host: '', source: 'desktop', expiresAtMs: Date.now() + 3600000 },
+      { accessToken: 'trae-token-2', userId: 'trae-user-2', edition: 'cn', host: '', source: 'desktop', expiresAtMs: Date.now() + 3600000 },
+    ],
     failures: [],
   }))
   t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ code: 0, enable: true, checkedIn: false }))
@@ -1577,13 +1593,23 @@ test('a source account preference is stored only for a label that exists', async
     assert.ok(modelId, 'the gateway must publish the model the composer matches against')
 
     const stored = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'xdpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountLabel: label,
+      provider: 'wtqpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountLabel: label,
     })
     assert.equal(stored.saved, true, 'a listed label must be reported as stored')
     assert.equal(settings.preferredSourceAccounts['trae:cn'], label, 'the choice must really have been stored')
 
+    // A sign-in the gateway just refused is still listed and may still be
+    // stored, but this session keeps serving another account. The popup has to
+    // learn that instead of closing as though the switch took effect.
+    vm.runInContext(`noteSourceFailure("trae", "cn", ${JSON.stringify(label)}, "60")`, context)
+    const held = await plugin.onPanelInvoke('xd.composerPrefer', {
+      provider: 'wtqpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountLabel: label,
+    })
+    assert.equal(held.saved, true, 'the choice is still worth storing for when the hold ends')
+    assert.equal(held.unavailable, true, 'a held source account must be reported as unavailable')
+
     const refused = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'xdpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountLabel: 'no-such-label',
+      provider: 'wtqpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountLabel: 'no-such-label',
     })
     assert.equal(refused.show, false, 'a label nothing can match must be refused')
     assert.equal(refused.saved, undefined, 'a refused click must not claim anything was stored')

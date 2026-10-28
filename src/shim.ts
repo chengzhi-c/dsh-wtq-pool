@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { POOL_HOLD_MS, type WorkBuddyAccount, type WorkBuddyAccountPool } from './accounts'
 import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog'
-import { isHardCreditText, parseRateLimitReset, WorkBuddyUpstreamClient, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream'
+import { classifyUpstreamError, isHardCreditText, parseRateLimitReset, retryAfterSeconds, WorkBuddyUpstreamClient, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream'
 import { SseDecoder } from './trae-sse'
 
 export interface ShimLogger {
@@ -66,7 +66,7 @@ export interface WorkBuddyShimOptions {
  * Loopback guards, the request body bound and the server shell live in
  * `./loopback` — one copy, shared with the Trae and Qoder gateways.
  */
-import { boundedRetryAfterSeconds, createLoopbackServer, guardsPass, isJsonContentType, listedModels, PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, readRequestBody, relayStreamOf, requestPathname, safeMessage, unapprovedChannelRefusal, writeChunk, writeJson, writeOpenAIError } from './loopback'
+import { boundedRetryAfterSeconds, channelCheckRefusal, createLoopbackServer, guardsPass, isJsonContentType, listedModels, PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, readRequestBody, relayStreamOf, requestPathname, safeMessage, unapprovedChannelRefusal, writeChunk, writeJson, writeOpenAIError } from './loopback'
 import { LOG_PREFIX } from './log'
 
 /** Whether one SSE data frame carries a non-null `finish_reason`. */
@@ -85,7 +85,7 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   soft_rate: 429,
   session_dead: 401,
   waf_block: 502,
-  not_found: 502,
+  not_found: 404,
   server: 502,
   client: 400,
   model_tier: 400,
@@ -118,7 +118,11 @@ function classifyEnvelopeCode(code: string | undefined, text: string): UpstreamE
   if (code === '11140') return 'account_restricted'
   if (code === '12153') return 'session_dead'
   if (isHardCreditText(text)) return 'hard_credit'
-  return undefined
+  // A prose-only refusal carries no business code; the status is 200, so the
+  // shared classifier would otherwise only see success. Its 200 branch already
+  // knows the limit and session sentences the older deployments send.
+  const kind = classifyUpstreamError(200, text)
+  return kind === 'client' ? undefined : kind
 }
 
 
@@ -155,7 +159,7 @@ function conversationKeyOf(raw: string): string | undefined {
  */
 async function peekAnswerHead(
   reader: ReadableStreamDefaultReader<Uint8Array>,
-): Promise<{ head: Uint8Array[]; ended: boolean; refusal?: string; code?: string }> {
+): Promise<{ head: Uint8Array[]; ended: boolean; refusal?: string; code?: string; body?: string }> {
   const head: Uint8Array[] = []
   const decoder = new TextDecoder()
   let text = ''
@@ -199,13 +203,22 @@ async function peekAnswerHead(
     return {
       head,
       ended,
+      // The raw envelope is kept for the reset-time reader: `refusal` is a
+      // rewritten sentence, so a structured `resetAt` field would be lost before
+      // the rate-limit branch could see it.
+      body: trimmed,
       refusal: sentence === ''
         ? 'workbuddy answered 200 with a JSON body where a stream was expected'
         : `workbuddy answered 200 with ${sentence}`,
       ...named === '' ? {} : { code: String(code) },
     }
   } catch {
-    return { head, ended, refusal: `workbuddy answered 200 with a body that is neither a stream nor an envelope: ${safeMessage(trimmed.slice(0, 200))}` }
+    return {
+      head,
+      ended,
+      body: trimmed,
+      refusal: `workbuddy answered 200 with a body that is neither a stream nor an envelope: ${safeMessage(trimmed.slice(0, 200))}`,
+    }
   }
 }
 
@@ -462,6 +475,10 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     }
 
     const tried: string[] = []
+    // Accounts whose sign-in could not be refreshed during this request. They
+    // stay available for later requests, but retrying one here only repeats the
+    // same failed round trip and starves the healthy accounts behind it.
+    const skipped = new Set<string>()
     let last: { kind: UpstreamErrorKind; status: number; message: string } | undefined
     let exhaustedByRateLimit = false
     // Built on first use: the retry below is the only caller, and the answer does
@@ -473,7 +490,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (controller.signal.aborted) return
 
-      const account = await pool.acquire(modelId, region, conversationKey)
+      const account = await pool.acquire(modelId, region, conversationKey, skipped)
       if (account === undefined) {
         // Distinguish "never signed in" from "every account is rate-limited":
         // they need opposite remedies, so they must not share a status code.
@@ -552,7 +569,27 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       tried.push(account.label)
 
       let result = await client.chatStream(account.credential, prepared, controller.signal)
-      if (!result.ok && result.kind === 'session_dead' && await pool.refreshAccount(account.id)) {
+      let refreshOutcome: 'refreshed' | 'refused' | 'failed' | undefined
+      if (!result.ok && result.kind === 'session_dead') {
+        const failure = result
+        refreshOutcome = await pool.refreshAccountOutcome(account.id)
+        if (refreshOutcome === 'failed') {
+          // The refresh endpoint did not answer; that says nothing about this
+          // sign-in. Parking the account for six hours over one bad round trip
+          // took a healthy account out of rotation, so the next account gets
+          // the turn and this one stays available.
+          logger?.warn?.(`${LOG_PREFIX}: ${account.label} could not refresh its sign-in; trying the next account without holding it`)
+          skipped.add(account.id)
+          last = {
+            kind: 'transport',
+            status: 502,
+            message: `could not refresh the sign-in: ${failure.message}`,
+          }
+          exhaustedByRateLimit = true
+          continue
+        }
+      }
+      if (refreshOutcome === 'refreshed') {
         // A caller that hung up while the refresh was in flight has already
         // stopped waiting: the retry would spend one more upstream call on a
         // turn nobody reads, and come back classed as `aborted` anyway.
@@ -667,6 +704,12 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
             if (peeked.refusal !== undefined) {
               await reader.cancel().catch(() => {})
               logger?.warn?.(`${LOG_PREFIX}: ${account.label} answered 200 with no stream: ${peeked.refusal}`)
+              // A prompt-screen refusal is the request's, not the account's:
+              // rotating spends every sign-in and still answers the same way.
+              if (peeked.code === '11128' || unapprovedChannelRefusal(peeked.refusal) !== undefined) {
+                writeOpenAIError(res, 400, 'upstream_channel_check', channelCheckRefusal())
+                return
+              }
               const envelopeKind = classifyEnvelopeCode(peeked.code, peeked.refusal)
               // A 200 envelope can still be an account-level refusal (a rate
               // limit, a spent balance, a dead session, the 11158 plan gate).
@@ -680,17 +723,38 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                 exhaustedByRateLimit = true
                 envelopeFailure = envelopeKind
                 if (envelopeKind === 'soft_rate') {
-                  pool.penalize(account.id, undefined, modelId)
+                  // The 200 envelope is the same rate-limit answer the 429 path
+                  // receives, so its later header/body reset outranks the
+                  // default cooldown here too. Ignoring them brought the account
+                  // back while the window was still standing.
+                  const bodyReset = parseRateLimitReset(peeked.body ?? peeked.refusal)
+                  const headerReset = resetFromRetryAfter(retryAfterSeconds(result.response.headers))
+                  const resetAtMs = bodyReset !== undefined && bodyReset > Date.now()
+                    ? (headerReset === undefined ? bodyReset : Math.max(bodyReset, headerReset))
+                    : headerReset
+                  pool.penalize(account.id, resetAtMs, modelId)
                 } else if (envelopeKind === 'model_tier') {
                   pool.blockModel(account.id, modelId, Date.now() + MODEL_TIER_HOLD_MS)
-                } else if (envelopeKind === 'session_dead' && await pool.refreshAccount(account.id)) {
-                  // The refresh token still worked, so the account is not dead:
-                  // the next attempt rides the new access token, exactly as the
-                  // non-200 session-dead path does.
+                } else if (envelopeKind === 'session_dead') {
+                  const refreshOutcome = await pool.refreshAccountOutcome(account.id)
+                  if (refreshOutcome === 'refused') {
+                    pool.penalize(account.id, holdUntil(), undefined, 'session')
+                  } else if (refreshOutcome === 'failed') {
+                    // A refresh endpoint that did not answer says nothing about
+                    // this sign-in. Parking it for six hours took a healthy
+                    // account out of rotation; skip it for this request instead.
+                    skipped.add(account.id)
+                    last = {
+                      kind: 'transport',
+                      status: 502,
+                      message: `could not refresh the sign-in: ${peeked.refusal.slice(0, 200)}`,
+                    }
+                  }
+                  // `refreshed`: the next attempt rides the new access token,
+                  // exactly as the non-200 session-dead path does.
                 } else {
                   pool.penalize(account.id, holdUntil(), undefined,
-                    envelopeKind === 'hard_credit' ? 'spent'
-                      : envelopeKind === 'session_dead' ? 'session' : 'restricted')
+                    envelopeKind === 'hard_credit' ? 'spent' : 'restricted')
                 }
                 return
               }
@@ -822,18 +886,20 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       if (result.kind === 'soft_rate') {
         // Cool only this model on this account; the account's other models stay
         // usable (the upstream explicitly allows switching to another model).
-        // The upstream's own `Retry-After` outranks the body parse, and both
-        // outrank the configured window: guessing short meant the account came
-        // back into rotation while the limit was still standing.
+        // The later of the upstream's own `Retry-After` and its body reset is
+        // the one that keeps the account out for the whole window. Taking a
+        // shorter body value over a longer header brought it back while the
+        // limit was still standing.
         //
         // A body reset that has already passed is not an answer, though — it is
         // a stale or clock-skewed timestamp, and taking it over a live header
         // dropped the account onto the 60 s default while the upstream had
         // named a window of minutes.
         const bodyReset = parseRateLimitReset(result.message)
+        const headerReset = resetFromRetryAfter(result.retryAfter)
         const resetAtMs = bodyReset !== undefined && bodyReset > Date.now()
-          ? bodyReset
-          : resetFromRetryAfter(result.retryAfter)
+          ? (headerReset === undefined ? bodyReset : Math.max(bodyReset, headerReset))
+          : headerReset
         pool.penalize(account.id, resetAtMs, modelId)
       } else if (result.kind === 'model_tier') {
         // The plan gate clears only when the subscription changes, so this model

@@ -353,6 +353,39 @@ test('a marker in the body only refines a status that is itself undecided', () =
  * attached once as well: re-running that branch attached a fresh pair per
  * chunk, so a long upload grew the listener list without bound.
  */
+/**
+ * A JSON endpoint can answer a refused sign-in as HTTP 200 with a business
+ * code, and some spell that code as a string. Reading the status as success
+ * served the dead sign-in again on every request; reading only the numeric
+ * code left the string form unclassified.
+ */
+test('a JSON endpoint business code is classified on HTTP 200', async () => {
+  const upstream = require('../src/upstream.ts')
+  const credential = {
+    accessToken: 't', refreshToken: 'r', expiresAtMs: 0, uid: 'u',
+    domain: 'www.workbuddy.cn', sourcePath: '',
+  }
+  const answer = (body) => new upstream.WorkBuddyUpstreamClient({
+    fetchImpl: async () => new Response(JSON.stringify(body), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    }),
+  })
+  await assert.rejects(
+    () => answer({ code: '12153', msg: 'Offline user session not found' }).fetchCheckinStatus(credential),
+    (error) => upstream.upstreamErrorKind(error) === 'session_dead',
+    'a string session code must hold the sign-in instead of reading as success',
+  )
+  await assert.rejects(
+    () => answer({ code: 6004, msg: '频率限制' }).fetchCredits(credential),
+    (error) => upstream.upstreamErrorKind(error) === 'soft_rate',
+    'a rate limit in a 200 envelope must stay a rate limit',
+  )
+  assert.equal(upstream.classifyUpstreamError(200, '{"code":"11140"}'), 'account_restricted')
+  assert.equal(upstream.classifyUpstreamError(200, '{"code":"11158"}'), 'model_tier')
+  assert.equal(upstream.classifyUpstreamError(200, '{"code":6004,"msg":"quota exceeded"}'), 'soft_rate',
+    'the rate-limit business code outranks quota prose')
+})
+
 test('an oversized body is refused without destroying the socket or piling up listeners', async () => {
   const { readRequestBody } = require('../src/loopback.ts')
   const listeners = new Map()
@@ -2378,6 +2411,16 @@ test('round-robin rotates only among the sign-ins that can still answer', () => 
   const single = orderingContext({ sourceDistribution: () => 'round-robin' })
   assert.deepEqual(single.orderSourceCredentials('trae', 'cn', [dead, a], sourceLabel, true).map(sourceLabel), ['a', 'dead'],
     'a single live account leads and rotation is a no-op')
+  // The composer chip names the account the next chat will use, so it has to see
+  // the current cursor step - but reading it must not consume that step.
+  const preview = orderingContext({ sourceDistribution: () => 'round-robin' })
+  assert.equal(preview.orderSourceCredentials('trae', 'cn', [a, b], sourceLabel, 'peek')[0].name, 'a')
+  assert.equal(preview.orderSourceCredentials('trae', 'cn', [a, b], sourceLabel, 'peek')[0].name, 'a',
+    'a preview never advances the cursor')
+  assert.equal(preview.orderSourceCredentials('trae', 'cn', [a, b], sourceLabel, true)[0].name, 'a',
+    'and the next chat still starts where the cursor was')
+  assert.equal(preview.orderSourceCredentials('trae', 'cn', [a, b], sourceLabel, 'peek')[0].name, 'b',
+    'after the chat, the preview names the account the following one would use')
 })
 
 /** The balanced block that starts at `from`, for the extractions above. */
@@ -3707,6 +3750,160 @@ test('the panel keeps polling while every account is cooling', () => {
 })
 
 /**
+ * A check-in read for a cooling account must not erase the balance a full read
+ * already cached.
+ *
+ * The panel serves the cache first, so the check-in-only entry looked fresh for
+ * the rest of the TTL and the credits stayed blank. Keeping the old credits in
+ * the merged entry also keeps `probesStale` from deciding there is nothing left
+ * to read.
+ */
+test('a check-in-only probe keeps the cached balance and cannot satisfy a full read', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'host.ts'), 'utf8')
+  const start = source.indexOf('async function accountProbe(')
+  assert.ok(start > 0, 'accountProbe is where it is expected')
+  const mod = { exports: {} }
+  const account = { id: 'a' }
+  const probeCache = new Map()
+  let creditReads = 0
+  const core = {
+    pool: {
+      list: () => [account],
+      readAfterRefresh: async (_id, read) => read({}),
+      setCreditBalance: () => {},
+    },
+    client: {
+      fetchCredits: async () => {
+        creditReads += 1
+        return { total: 7, packages: [] }
+      },
+      fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false }),
+    },
+  }
+  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'signInRefused', 'safeMessage',
+    balanced(source, start) + '\nmodule.exports = { accountProbe }',
+  )(mod, mod.exports, core, probeCache, 60000, () => false, (error) => String(error?.message ?? error))
+
+  try {
+    const full = await mod.exports.accountProbe(account, true, false)
+    assert.equal(full.credits.total, 7, 'the full read stores the balance')
+    assert.equal(creditReads, 1)
+
+    // Age the entry so the check-in-only pass runs, as a cooling account does.
+    probeCache.get(account.id).atMs = 0
+    const only = await mod.exports.accountProbe(account, true, true)
+    assert.equal(only.credits.total, 7, 'the check-in-only pass must keep the previous balance')
+    assert.equal(only.checkin.active, true, 'and must still refresh the check-in state')
+    assert.equal(creditReads, 1, 'it must not spend a balance read')
+
+    // An entry that has only a check-in answer is fresh for the check-in view
+    // but not for the balance view; a full read must go and get one.
+    probeCache.set(account.id, { atMs: Date.now(), value: { checkin: { active: true } } })
+    creditReads = 0
+    const again = await mod.exports.accountProbe(account, true, false)
+    assert.equal(again.credits.total, 7, 'a full read refills a balance the cache never had')
+    assert.equal(creditReads, 1, 'and does not serve the check-in-only entry as a balance')
+  } finally {
+    probeCache.clear()
+  }
+})
+
+/**
+ * A probe that started before a claim must not restore the pre-claim answer.
+ *
+ * The claim handlers delete the cache entry and read again. Without a check at
+ * write time the older probe can finish afterwards and put "not checked in"
+ * back for a whole TTL, bringing the claim button back just after a success.
+ */
+test('a probe invalidated by a claim does not write its pre-claim answer back', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'host.ts'), 'utf8')
+  const start = source.indexOf('async function accountProbe(')
+  assert.ok(start > 0, 'accountProbe is where it is expected')
+  const mod = { exports: {} }
+  const account = { id: 'a' }
+  const probeCache = new Map()
+  let releaseCheckin
+  let checkinStarted
+  const started = new Promise((resolve) => { checkinStarted = resolve })
+  const core = {
+    pool: {
+      list: () => [account],
+      readAfterRefresh: async (_id, read) => read({}),
+      setCreditBalance: () => {},
+    },
+    client: {
+      fetchCredits: async () => ({ total: 7, packages: [] }),
+      fetchCheckinStatus: async () => {
+        checkinStarted()
+        return new Promise((resolve) => { releaseCheckin = resolve })
+      },
+    },
+  }
+  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'signInRefused', 'safeMessage',
+    balanced(source, start) + '\
+module.exports = { accountProbe }',
+  )(mod, mod.exports, core, probeCache, 60000, () => false, (error) => String(error?.message ?? error))
+
+  const old = mod.exports.accountProbe(account, true, false)
+  await started
+  // The claim invalidates the entry and writes the post-claim state.
+  probeCache.delete(account.id)
+  const postClaim = { atMs: Date.now(), value: { checkin: { active: true, todayCheckedIn: true } } }
+  probeCache.set(account.id, postClaim)
+  releaseCheckin({ active: true, todayCheckedIn: false })
+
+  const result = await old
+  assert.equal(result.checkin.todayCheckedIn, true, 'the older probe must return the newer claim state')
+  assert.equal(probeCache.get(account.id).value.checkin.todayCheckedIn, true,
+    'and must not overwrite the fresh entry')
+  assert.equal(probeCache.get(account.id), postClaim)
+
+  // A check-in-only entry must not satisfy a full read even when it kept the
+  // previous balance; only a full read can refresh credits.
+  let creditReads = 0
+  core.client.fetchCredits = async () => {
+    creditReads += 1
+    return { total: 9, packages: [] }
+  }
+  core.client.fetchCheckinStatus = async () => ({ active: true, todayCheckedIn: true })
+  probeCache.set(account.id, {
+    atMs: Date.now(),
+    checkinOnly: true,
+    value: { checkin: { active: true, todayCheckedIn: true }, credits: { total: 1, packages: [] } },
+  })
+  const refreshed = await mod.exports.accountProbe(account, true, false)
+  assert.equal(creditReads, 1, 'a full read must refresh credits from a check-in-only entry')
+  assert.equal(refreshed.credits.total, 9)
+  assert.equal(probeCache.get(account.id).checkinOnly, false)
+
+  // A check-in-only failure that lands while a full read is fetching credits
+  // must not outlive the full read's successful check-in.
+  probeCache.clear()
+  let releaseCredits
+  let creditsStarted
+  const creditsGate = new Promise((resolve) => { releaseCredits = resolve })
+  const creditsBegan = new Promise((resolve) => { creditsStarted = resolve })
+  core.client.fetchCredits = async () => {
+    creditsStarted()
+    await creditsGate
+    return { total: 11, packages: [] }
+  }
+  core.client.fetchCheckinStatus = async () => ({ active: true, todayCheckedIn: true })
+  const full = mod.exports.accountProbe(account, true, false)
+  await creditsBegan
+  probeCache.set(account.id, {
+    atMs: Date.now(),
+    checkinOnly: true,
+    value: { checkinError: 'old check-in failure' },
+  })
+  releaseCredits()
+  const merged = await full
+  assert.equal(merged.checkin.todayCheckedIn, true, 'the full read check-in is the newer answer')
+  assert.equal(merged.checkinError, undefined)
+  assert.equal(probeCache.get(account.id).checkinOnly, false)
+})
+
+/**
  * A chat request carries the conversation header family.
  *
  * The international gateway runs a channel check that refuses a request
@@ -3782,11 +3979,9 @@ test('a chat request carries the conversation header family', async () => {
   }, JSON.stringify({ model: 'hy3', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
     undefined, { headersMs: 50 })
   assert.ok(cnHeaders['X-Conversation-ID'], 'the CN request carries the family too')
-  // CN keeps the UA it has always been sent: the gateway reads its roster with
-  // that spelling, and there is no capture to align it to.
-  // One client build, named the same way in the header and in the UA.
-  assert.equal(cnHeaders['User-Agent'], 'WorkBuddy/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0')
-  assert.equal(cnHeaders['X-IDE-Version'], '5.8.4')
+  // CN 5.9 names its agent runtime; the international build does not.
+  assert.equal(cnHeaders['User-Agent'], 'WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0')
+  assert.equal(cnHeaders['X-IDE-Version'], '5.9.3')
   assert.equal(headers['User-Agent'], 'WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0',
     'the international request uses the captured desktop UA')
 })
@@ -4150,6 +4345,7 @@ test('a service stop releases the refresh slot', async () => {
     checkinAbort: { abort: () => stopped.push('checkinAbort') },
     runtimes: new Map(),
     runtimeStarts: new Map(),
+    sourceGatewayStarts: new Map(),
     traeGateways: new Map(),
     qoderGateways: new Map(),
     // The teardown also drops the start failures of the activation it ends.
@@ -4188,8 +4384,8 @@ test('the channel refusal names its cause and the way forward', () => {
   const body = '{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayTips":{"zh":"这次调用没通过渠道校验"}}'
   const sentence = unapprovedChannelRefusal(body)
   assert.ok(typeof sentence === 'string', 'the refusal has to be recognised')
-  assert.match(sentence, /DeepSeek Harness/, 'it names the identity the vendor rejected')
-  assert.match(sentence, /international|Trae|Qoder/, 'and the sources that do serve it')
+  assert.match(sentence, /11128/, 'it names the check that refused')
+  assert.match(sentence, /Trae|Qoder|international/, 'and the sources that do serve it')
   assert.doesNotMatch(sentence, /unapproved channel|displayTips/, 'the vendor block of tips is not what the user reads')
   // A 400 that is not this one keeps the ordinary sentence, or the mapping would
   // swallow every real client error.

@@ -17,7 +17,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { isIP } from 'node:net'
+import { BlockList, isIP } from 'node:net'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
@@ -63,7 +63,6 @@ const CHANNELS = new Set([
   'xd.distribution',
   'xd.setAutoCheckin',
   'xd.setComposerPoints',
-  'xd.setRewriteClientName',
   'xd.setCreditReserve',
   'xd.setRegionEnabled',
   'xd.setSource',
@@ -132,62 +131,19 @@ export interface WebServerSeam {
 }
 
 
-/**
- * The eight 16-bit groups of an IPv6 address, in any spelling.
- *
- * Handles the compressed (`::1`), expanded (`0:0:0:0:0:0:0:1`) and dotted-quad
- * (`::ffff:127.0.0.1`) forms, because a peer address arrives in whichever of
- * them the client's stack printed. Returns undefined for anything malformed.
- */
-function ipv6Groups(address: string): number[] | undefined {
-  const text = address.toLowerCase()
-  const halves = text.split('::')
-  if (halves.length > 2) return undefined
-  const expand = (side: string | undefined): string[] | undefined => {
-    if (side === undefined || side === '') return []
-    const groups = side.split(':')
-    const last = groups[groups.length - 1] ?? ''
-    if (!last.includes('.')) return groups
-    // A dotted-quad tail carries the last 32 bits as two hex groups.
-    const octets = last.split('.')
-    if (octets.length !== 4) return undefined
-    if (!octets.every(octet => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)) return undefined
-    const high = (Number(octets[0]) << 8) + Number(octets[1])
-    const low = (Number(octets[2]) << 8) + Number(octets[3])
-    return [...groups.slice(0, -1), high.toString(16), low.toString(16)]
-  }
-  const head = expand(halves[0])
-  const tail = halves.length === 2 ? expand(halves[1]) : []
-  if (head === undefined || tail === undefined) return undefined
-  const missing = 8 - head.length - tail.length
-  if (missing < 0) return undefined
-  const values = [...head, ...Array<string>(missing).fill('0'), ...tail]
-    .map(group => Number.parseInt(group, 16))
-  return values.length === 8 && values.every(value => Number.isInteger(value)) ? values : undefined
-}
+const LOOPBACK = new BlockList()
+LOOPBACK.addSubnet('127.0.0.0', 8, 'ipv4')
+LOOPBACK.addAddress('::1', 'ipv6')
+LOOPBACK.addSubnet('::ffff:127.0.0.0', 104, 'ipv6')
 
-/**
- * Whether the request's peer is this machine.
- *
- * Read off the address's own groups rather than off Node's serialised form of
- * it: the regex this replaces matched `[::ffff:7f00:1]`, which is what the
- * current Node prints for `::ffff:127.0.0.1`, and a check that depends on a
- * serialisation detail is one Node release away from refusing a legitimate
- * peer. Every address in 127/8, `::1`, and the `::ffff:127/8` mapping of that
- * range is this machine; nothing else is.
- */
+/** Whether the request's peer is this machine. */
 function peerIsLoopback(req: IncomingMessage): boolean {
   const address = req.socket.remoteAddress
   if (address === undefined) return false
-  if (isIP(address) === 4) return address.startsWith('127.')
-  if (isIP(address) !== 6) return false
-  const groups = ipv6Groups(address)
-  if (groups === undefined) return false
-  const leading = groups.slice(0, 6).every(value => value === 0)
-  if (leading && groups[6] === 0 && groups[7] === 1) return true
-  const mapped = groups.slice(0, 5).every(value => value === 0) && groups[5] === 0xffff
-  // The mapped address's first octet is the high byte of the seventh group.
-  return mapped && (groups[6] ?? 0) >> 8 === 0x7f
+  const family = isIP(address)
+  if (family === 4) return LOOPBACK.check(address, 'ipv4')
+  if (family === 6) return LOOPBACK.check(address, 'ipv6')
+  return false
 }
 
 /**

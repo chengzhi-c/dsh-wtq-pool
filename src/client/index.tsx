@@ -309,9 +309,7 @@ const MISSING_STYLE: React.CSSProperties = {
  */
 export function apply(ctx: XdPoolClientContext): void {
   // The copy is registered first and on its own: a locale that will not bind
-  // must cost the labels, not the seats. Everything below still mounts, and
-  // `t` falls back to the key so the panel keeps working with bare strings.
-  let t = (key: string): string => key
+  // must cost the labels, not the seats. PanelCard is given the host's binder.
   try {
     ctx.effect(
       () => ctx.locale.register(NAMESPACE, {
@@ -320,10 +318,6 @@ export function apply(ctx: XdPoolClientContext): void {
       }),
       'dsh-wtq-pool: copy',
     )
-    // Bound inside the same guard as the registration it reads from: a binder
-    // that throws here would otherwise take down the seats below with it, which
-    // is the opposite of what this block is for.
-    t = ctx.locale.bind(NAMESPACE)
   } catch (error: unknown) {
     console.error('[dsh-wtq-pool] the copy did not register (the labels fall back to their keys):', error)
   }

@@ -898,50 +898,56 @@ export class QoderUpstreamClient {
       if (!response.ok) throw new Error(`Qoder usage failed: HTTP ${response.status} ${await readErrorBody(response, 300, signal)}`)
       return await response.json() as unknown
     }
-    let payload: unknown
-    let source: QoderUsage['source'] = 'presentation'
+    /**
+     * Turn one route's document into the panel shape.
+     *
+     * Validation is part of parsing, not a key-presence check before it: a
+     * document carrying only `expiresAt`, or an empty quota object, used to pass
+     * `usable()` and then throw after the fallback had already been skipped.
+     */
+    const parse = (value: unknown, source: QoderUsage['source']): QoderUsage => {
+      const envelope = value === null || typeof value !== 'object' ? {} : value as Record<string, unknown>
+      const usage = (envelope['qoderUsage'] ?? envelope['data'] ?? value) as unknown
+      if (usage === null || typeof usage !== 'object') throw new Error('Qoder usage answered no usable document')
+      const record = usage as Record<string, unknown>
+      const userQuota = qoderQuotaBucket(record['user_quota'] ?? record['userQuota'])
+      const addOnQuota = qoderQuotaBucket(record['add_on_quota'] ?? record['addOnQuota'])
+      const rawExpiry = record['expiresAt'] ?? record['expires_at']
+      const expiresAtMs = qoderEpochMs(rawExpiry)
+      // "No expiry at all" arrives as the largest date the API can write rather
+      // than as an absent field, so a value that is there but cannot be a date
+      // means exactly that — and saying so beats both a date centuries away and
+      // an unexplained blank.
+      const neverExpires = expiresAtMs === undefined
+        && rawExpiry !== undefined && rawExpiry !== null && rawExpiry !== ''
+      const rawPackages = record['dedicated_resource_packages'] ?? record['dedicatedResourcePackages']
+      const now = Date.now()
+      const dedicatedPackages = Array.isArray(rawPackages)
+        // A package past its own expiry is not a package the user can spend, and
+        // Qoder keeps reporting one with credits left on it. WorkBuddy drops the
+        // same shape upstream (`src/upstream.ts`), so without this the panel showed
+        // an expired row with a red "expiring soon" badge that never went away.
+        ? rawPackages.map(qoderDedicatedPackage)
+          .filter((entry): entry is QoderDedicatedPackage => entry !== undefined)
+          .filter((entry) => entry.expiresAtMs === undefined || entry.expiresAtMs > now)
+        : []
+      if (userQuota === undefined && addOnQuota === undefined && dedicatedPackages.length === 0) {
+        throw new Error('Qoder usage contained no usable quota')
+      }
+      return {
+        ...userQuota === undefined ? {} : { userQuota },
+        ...addOnQuota === undefined ? {} : { addOnQuota },
+        dedicatedPackages,
+        ...expiresAtMs === undefined ? {} : { expiresAtMs },
+        ...neverExpires ? { neverExpires: true } : {},
+        source,
+      }
+    }
     try {
-      payload = await read(QODER_USAGE_PRESENTATION_PATH)
+      return parse(await read(QODER_USAGE_PRESENTATION_PATH), 'presentation')
     } catch (error) {
       if (signal?.aborted) throw error
-      source = 'quota'
-      payload = await read(QODER_USAGE_PATH)
-    }
-    const envelope = payload === null || typeof payload !== 'object' ? {} : payload as Record<string, unknown>
-    const usage = (envelope['qoderUsage'] ?? envelope['data'] ?? payload) as unknown
-    if (usage === null || typeof usage !== 'object') throw new Error('Qoder usage answered no usable document')
-    const record = usage as Record<string, unknown>
-    const userQuota = qoderQuotaBucket(record['user_quota'] ?? record['userQuota'])
-    const addOnQuota = qoderQuotaBucket(record['add_on_quota'] ?? record['addOnQuota'])
-    const rawExpiry = record['expiresAt'] ?? record['expires_at']
-    const expiresAtMs = qoderEpochMs(rawExpiry)
-    // "No expiry at all" arrives as the largest date the API can write rather
-    // than as an absent field, so a value that is there but cannot be a date
-    // means exactly that — and saying so beats both a date centuries away and
-    // an unexplained blank.
-    const neverExpires = expiresAtMs === undefined
-      && rawExpiry !== undefined && rawExpiry !== null && rawExpiry !== ''
-    const rawPackages = record['dedicated_resource_packages'] ?? record['dedicatedResourcePackages']
-    const now = Date.now()
-    const dedicatedPackages = Array.isArray(rawPackages)
-      // A package past its own expiry is not a package the user can spend, and
-      // Qoder keeps reporting one with credits left on it. WorkBuddy drops the
-      // same shape upstream (`src/upstream.ts`), so without this the panel showed
-      // an expired row with a red "expiring soon" badge that never went away.
-      ? rawPackages.map(qoderDedicatedPackage)
-        .filter((entry): entry is QoderDedicatedPackage => entry !== undefined)
-        .filter((entry) => entry.expiresAtMs === undefined || entry.expiresAtMs > now)
-      : []
-    if (userQuota === undefined && addOnQuota === undefined && dedicatedPackages.length === 0) {
-      throw new Error('Qoder usage contained no usable quota')
-    }
-    return {
-      ...userQuota === undefined ? {} : { userQuota },
-      ...addOnQuota === undefined ? {} : { addOnQuota },
-      dedicatedPackages,
-      ...expiresAtMs === undefined ? {} : { expiresAtMs },
-      ...neverExpires ? { neverExpires: true } : {},
-      source,
+      return parse(await read(QODER_USAGE_PATH), 'quota')
     }
   }
   /**

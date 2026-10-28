@@ -131,8 +131,6 @@ export interface Config {
   removedAccounts?: unknown[]
   /** Whether the credits readout is shown beside the composer. */
   showComposerPoints?: boolean
-  /** Whether the client name is rewritten for the domestic host's channel check. */
-  rewriteClientName?: boolean
   /** How each Trae/Qoder region spreads requests. */
   sourceDistributions?: Record<string, string>
 }
@@ -202,7 +200,6 @@ export const Config: z<Config> = z.object({
   preferredSourceAccounts: asVolatile(z.any().description('Picked Trae/Qoder account per region')),
   removedAccounts: asVolatile(z.any().description('Accounts removed from the pool for good')),
   showComposerPoints: asVolatile(z.boolean().default(false).description('Show the active account credits beside the composer')),
-  rewriteClientName: asVolatile(z.boolean().default(false).description('Rename the client in the prompt WorkBuddy receives (domestic channel check 11128)')),
   sourceDistributions: asVolatile(z.any().description('How each Trae/Qoder region spreads requests')),
 }) as z<Config>
 
@@ -602,10 +599,16 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
   if (mutate === undefined) throw new Error('this host exposes no settings mutate()')
   writesStarted += 1
   writesInFlight += 1
+  let echoed = false
   try {
     await mutate.call(settingsService, settingsNamespace,
       Object.entries(patch).map(([key, value]) => ({ op: 'set', path: [key], value })))
+    echoed = true
   } finally {
+    // A rejected mutate emits no echo. Counting it as one made a real host edit
+    // that raced the failed write look like an echo, so the edit was dropped
+    // for the rest of the activation.
+    if (!echoed) writesStarted -= 1
     writesInFlight -= 1
     if (writesInFlight === 0) {
       if (droppedPushes > writesStarted) {

@@ -1020,8 +1020,12 @@ async function readArchivedCredentials(file: string): Promise<Map<string, WorkBu
     // Retention is measured from when the credential stops being usable at all,
     // not from when this file was last written: every archive write rewrites
     // the whole document, so a write-time stamp would never expire anything.
-    const expiresAt = typeof record['expiresAtMs'] === 'number' ? record['expiresAtMs'] : 0
-    const refreshExpiresAt = typeof record['refreshExpiresAtMs'] === 'number' ? record['refreshExpiresAtMs'] : 0
+    // Every timestamp is clamped through expiryToMs: a hand-edited or garbled
+    // value past the Date range used to reach the panel's toISOString() and
+    // fail the whole account document, not just this row.
+    const expiresAt = typeof record['expiresAtMs'] === 'number' ? expiryToMs(record['expiresAtMs']) : 0
+    const refreshExpiresAt = typeof record['refreshExpiresAtMs'] === 'number' ? expiryToMs(record['refreshExpiresAtMs']) : 0
+    const lastRefreshAt = typeof record['lastRefreshAtMs'] === 'number' ? expiryToMs(record['lastRefreshAtMs']) : 0
     // Zero is the sentinel for "the sign-in document did not say", not a date in
     // 1970. Treating it as one dropped every credential without a stated expiry,
     // which is precisely the kind it is unsafe to drop: nothing else holds a copy.
@@ -1030,9 +1034,9 @@ async function readArchivedCredentials(file: string): Promise<Map<string, WorkBu
     stored.set(record['id'], {
       accessToken: record['accessToken'],
       refreshToken: typeof record['refreshToken'] === 'string' ? record['refreshToken'] : '',
-      expiresAtMs: typeof record['expiresAtMs'] === 'number' ? record['expiresAtMs'] : 0,
-      ...typeof record['refreshExpiresAtMs'] !== 'number' ? {} : { refreshExpiresAtMs: record['refreshExpiresAtMs'] },
-      ...typeof record['lastRefreshAtMs'] !== 'number' ? {} : { lastRefreshAtMs: record['lastRefreshAtMs'] },
+      expiresAtMs: expiresAt,
+      ...refreshExpiresAt === 0 ? {} : { refreshExpiresAtMs: refreshExpiresAt },
+      ...lastRefreshAt === 0 ? {} : { lastRefreshAtMs: lastRefreshAt },
       ...typeof record['nickname'] !== 'string' || record['nickname'] === '' ? {} : { nickname: record['nickname'] },
       ...typeof record['uin'] !== 'string' || record['uin'] === '' ? {} : { uin: record['uin'] },
       ...typeof record['uid'] !== 'string' || record['uid'] === '' ? {} : { uid: record['uid'] },
@@ -2262,12 +2266,21 @@ export class WorkBuddyAccountPool {
    * Scans on first use, and rescans when every known account is cooling down: a
    * fresh desktop login is the usual way out of an exhausted pool.
    */
-  async acquire(modelId?: string, region?: WorkBuddyRegion, conversationKey?: string): Promise<WorkBuddyAccount | undefined> {
+  async acquire(
+    modelId?: string,
+    region?: WorkBuddyRegion,
+    conversationKey?: string,
+    excludeIds?: ReadonlySet<string>,
+  ): Promise<WorkBuddyAccount | undefined> {
+    const eligibleNow = (): WorkBuddyAccount[] => {
+      const list = this.available(Date.now(), modelId, region)
+      return excludeIds === undefined ? list : list.filter(item => !excludeIds.has(item.id))
+    }
     if (this.accounts.length === 0) await this.scan()
-    let pool = this.available(Date.now(), modelId, region)
+    let pool = eligibleNow()
     if (pool.length === 0) {
       await this.scan()
-      pool = this.available(Date.now(), modelId, region)
+      pool = eligibleNow()
     }
     if (pool.length === 0) return undefined
 
@@ -2279,7 +2292,7 @@ export class WorkBuddyAccountPool {
     // A cooldown that landed while the refresh was in flight must not be
     // ridden: the pick above happened before it, and the request would spend
     // its turn on an account that is already cooling.
-    const eligible = this.available(Date.now(), modelId, region)
+    const eligible = eligibleNow()
     if (eligible.includes(account)) return account
     const next = eligible.find(item => item.id === preferredId) ?? this.pick(eligible, conversationKey)
     if (next === undefined) return undefined
@@ -2337,7 +2350,18 @@ export class WorkBuddyAccountPool {
    * token is unchanged, so the caller stops retrying the same dead token.
    */
   async refreshAccount(accountId: string): Promise<boolean> {
-    return await this.refreshForRetry(accountId) === 'refreshed'
+    return await this.refreshAccountOutcome(accountId) === 'refreshed'
+  }
+
+  /**
+   * The same refresh, keeping a refusal apart from a failure.
+   *
+   * The caller needs the difference: only the upstream turning the sign-in down
+   * justifies a six-hour hold, while a timeout or an unreachable host says
+   * nothing about the token and must leave the account in rotation.
+   */
+  async refreshAccountOutcome(accountId: string): Promise<'refreshed' | 'refused' | 'failed'> {
+    return await this.refreshForRetry(accountId)
   }
 
   /**
@@ -2361,7 +2385,10 @@ export class WorkBuddyAccountPool {
     // An in-flight refresh may have replaced the token without this call
     // spending one; the token is what the retry rides, so it decides.
     if (account.credential.accessToken !== previous) return 'refreshed'
-    return outcome === 'refused' ? 'refused' : 'failed'
+    // A refresh that answered without minting a new token leaves the refused
+    // token in force. That is still the upstream turning this sign-in down, not
+    // a dead refresh endpoint, so the caller holds it instead of retrying it.
+    return outcome === 'failed' ? 'failed' : 'refused'
   }
 
   /**
@@ -2553,7 +2580,10 @@ export class WorkBuddyAccountPool {
   ): void {
     const account = this.accounts.find(item => item.id === accountId)
     if (account === undefined) return
-    account.rateLimitHits += 1
+    // The row's "rate-limit hits" counts actual limits, not holds: a spent
+    // balance or a refused sign-in never saw a 429, and counting it there told
+    // the user to wait out a window that was never the problem.
+    if (hold === false) account.rateLimitHits += 1
     // Cap even a caller-supplied reset: the parse layer already caps, but a
     // raw timestamp passed straight in must not sleep an account all day. The
     // configured window is the user's own choice and is not capped.

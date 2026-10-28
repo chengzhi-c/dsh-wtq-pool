@@ -82,19 +82,6 @@
       </div>
       <div class="card">
         <div class="card-head">
-          <span class="card-title" id="rewriteTitle"></span>
-          <span class="muted" id="rewriteState"></span>
-        </div>
-        <div class="switch-row">
-          <button type="button" class="small" id="rewriteClientName"></button>
-          <span class="switch-copy">
-            <span class="switch-lead" id="rewriteText"></span>
-            <span class="hint" id="rewriteHint"></span>
-          </span>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-head">
           <span class="card-title" id="autoTitle"></span>
           <span class="muted" id="autoState"></span>
         </div>
@@ -114,7 +101,7 @@
       <!-- A card of its own: the keep-alive renews tokens rather than collecting
            rewards and has no hour to set, so sharing the check-in card made both
            harder to read. -->
-      <div class="card">
+      <div class="card" id="keepAliveCard">
         <div class="card-head">
           <span class="card-title" id="keepAliveTitle"></span>
         </div>

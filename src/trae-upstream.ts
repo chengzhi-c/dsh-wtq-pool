@@ -921,7 +921,6 @@ function traeCheckinStatusOf(payload: unknown): TraeCheckinStatus {
 export interface TraeSoloClientOptions {
   credential(): Promise<TraeCredential>
   identity(): Promise<TraeIdentity>
-  baseUrl?: string
   fetchImpl?: typeof fetch
 }
 
@@ -947,7 +946,7 @@ export class TraeSoloUpstreamClient {
   async fetchModels(signal?: AbortSignal): Promise<TraeDirectoryRead> {
     const [credential, identity] = await Promise.all([this.options.credential(), this.options.identity()])
     const region = traeRegionOfCredential(credential)
-    const base = this.options.baseUrl ?? REGION_GATEWAYS[region].chat
+    const base = REGION_GATEWAYS[region].chat
     const headers = { ...buildTraeHeaders(credential, identity), Accept: 'application/json' }
     const byId = new Map<string, TraeSoloModel>()
     const failures: string[] = []
@@ -1083,7 +1082,7 @@ export class TraeSoloUpstreamClient {
     const [credential, identity] = await Promise.all([this.options.credential(), this.options.identity()])
     const region = traeRegionOfCredential(credential)
     if (region !== 'ai') throw new Error('Trae pay status exists on the international region only')
-    const response = await this.fetchImpl(traeEndpoint(this.options.baseUrl ?? REGION_GATEWAYS[region].pay, TRAE_PAY_STATUS_PATH), {
+    const response = await this.fetchImpl(traeEndpoint(REGION_GATEWAYS[region].pay, TRAE_PAY_STATUS_PATH), {
       redirect: 'error',
       method: 'POST',
       headers: traeCheckinHeaders(credential, identity, region),
@@ -1150,7 +1149,7 @@ export class TraeSoloUpstreamClient {
       return { ok: false, status: 503, kind: 'server', message: `identity read failed: ${String(error instanceof Error ? error.message : error)}` }
     }
     const headers = buildTraeHeaders(credential, identity)
-    const base = this.options.baseUrl ?? REGION_GATEWAYS[traeRegionOfCredential(credential)].chat
+    const base = REGION_GATEWAYS[traeRegionOfCredential(credential)].chat
     let response: Response
     // Headers on a clock of their own, the body on the idle watchdog: a signal
     // handed to fetch stays attached to the body, so a whole-stream deadline

@@ -225,21 +225,27 @@ export function redactSecrets(text: string): string {
 /**
  * The vendor's channel check, answered as what it is.
  *
- * WorkBuddy's upstream refuses a request whose prompt names DeepSeek Harness as
- * the client, with code 11128 and "Illegal API invocation from an unapproved
- * channel". The refusal is about the caller's identity rather than the account:
- * every account of that region answers it the same way, so rotating cannot clear
- * it, and the body is a wall of mixed Chinese and English tips that names no
- * cause a user can act on. The sentence below says what happened and what does
- * work. Verified 2026-10-21 on the domestic host: the same prompt is served by
- * the international WorkBuddy accounts, by Trae and by Qoder.
+ * WorkBuddy's upstream inspects the system and assistant turns for wording that
+ * belongs to a client it does not serve, and answers business code 11128. The
+ * plugin already moves the system prompt into the first user turn and retries
+ * once (`chatStream`); a second refusal means the blocked wording is somewhere
+ * that move does not reach, or the host changed its screen again. Every account
+ * of that region answers the same way, so rotation cannot clear it, and the
+ * vendor body is a wall of mixed Chinese and English tips that names no cause a
+ * user can act on. The sentence below says what happened and what does work.
  */
 export function unapprovedChannelRefusal(text: string): string | undefined {
-  if (!/"code"\s*:\s*11128\b/.test(text)) return undefined
+  if (!/"code"\s*:\s*"?11128\b/u.test(text) && !/\bcode 11128\b/u.test(text)) return undefined
+  return channelCheckRefusal()
+}
+
+/** The sentence a refused prompt is answered with, whatever shape the body has. */
+export function channelCheckRefusal(): string {
   return (
-    'the domestic WorkBuddy host refuses requests that name DeepSeek Harness as the client ' +
-    '(channel check 11128), on every account of that region. Use a model served by the ' +
-    'international WorkBuddy accounts, Trae or Qoder here.'
+    'the WorkBuddy host refused this conversation at its client check (11128). That ' +
+    'screen reads system and assistant turns for wording that belongs to a client it ' +
+    'does not serve, so remove client-identifying text from the conversation, start a ' +
+    'new one, or use Trae or Qoder for this prompt.'
   )
 }
 
@@ -581,19 +587,8 @@ export async function pumpToResponse(source: ReadableStream<Uint8Array>, res: Se
       if (next.done) break
       // A close can land between the read and the write; writing a destroyed
       // response raises ERR_STREAM_DESTROYED and reads as a mid-write failure.
+      await writeChunk(res, next.value)
       if (res.destroyed || res.writableEnded) break
-      if (!res.write(Buffer.from(next.value))) {
-        if (res.destroyed) break
-        await new Promise<void>((resolve) => {
-          const wake = (): void => {
-            res.off('drain', wake)
-            res.off('close', wake)
-            resolve()
-          }
-          res.once('drain', wake)
-          res.once('close', wake)
-        })
-      }
     }
   } finally {
     res.off('close', cancel)

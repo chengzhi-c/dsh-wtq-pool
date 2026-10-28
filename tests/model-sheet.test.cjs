@@ -264,6 +264,8 @@ test('saving a draft ends the session, so the row is not marked afterwards', asy
 
   await context.saveModels()
   assert.equal(saved.length, 1, 'the save reached the host')
+  assert.deepEqual(saved[0].payload.knownModelIds, [model.id],
+    'the host is told which models this page could show, so its merge keeps the rest')
   assert.equal(context.selectedSheet, null, 'and it drops the record that reopens the sheet')
   assert.equal(context.draft, null, 'the pending draft goes with it')
   // What the panel rebuilds from here: a fresh entry, closed.

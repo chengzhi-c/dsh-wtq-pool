@@ -98,11 +98,20 @@ test('every region sends one client version, in the header and in the UA', async
       `${url} does not hand a pooled socket to the next account`)
   }
   const [cn, global] = seen
+  assert.equal(uaVersion(cn.headers.get('user-agent')), '5.9.3',
+    'the CN desktop is 5.9.3')
+  assert.equal(cn.headers.get('x-agent-runtime'), 'local-agent',
+    'CN 5.9 names its agent runtime')
   assert.match(cn.headers.get('user-agent'), /^WorkBuddy\/[\d.]+ WorkBuddy\/[\d.]+ CLI\//u)
+  assert.equal(uaVersion(global.headers.get('user-agent')), '5.8.4',
+    'the international desktop is still 5.8.4')
   assert.match(global.headers.get('user-agent'), /workbuddy-ai\//u,
     'the international spelling is the one that carries the roster')
-  assert.equal(uaVersion(cn.headers.get('user-agent')), uaVersion(global.headers.get('user-agent')),
-    'both regions are the same client build')
+  assert.equal(global.headers.get('x-agent-runtime'), null,
+    'the runtime header does not belong to the international build')
+  for (const { headers } of seen) {
+    assert.equal(headers.get('x-stainless-lang'), 'js', 'the SDK fingerprint family is present')
+  }
 })
 
 test('the roster call does not claim a different build from the chat call', async () => {
@@ -124,7 +133,14 @@ test('the roster call does not claim a different build from the chat call', asyn
     assert.equal(headers.get('connection'), 'close', `${url} closes its own connection`)
   }
   const versions = new Set(seen.map(({ headers }) => uaVersion(headers.get('user-agent'))))
-  assert.deepEqual([...versions], ['5.8.4'], 'roster, refresh and billing all claim the chat build')
+  assert.deepEqual([...versions].sort(), ['5.8.4', '5.9.3'],
+    'each region claims its own desktop build on roster, refresh and billing')
+  const globalRoster = seen.find(({ url }) => url.includes('/v3/config'))
+  const cnRoster = seen.find(({ url }) => url.includes('/personal/models'))
+  assert.equal(globalRoster?.headers.get('user-agent'), 'WorkBuddy/5.8.4',
+    'the global product config is read with the global desktop UA')
+  assert.equal(cnRoster?.headers.get('user-agent'), 'WorkBuddy/5.9.3',
+    'the CN roster is read with the CN desktop UA, not the chat endpoint CLI spelling')
 })
 
 test('a plan refusal is a verdict on the model, not on the request', () => {
