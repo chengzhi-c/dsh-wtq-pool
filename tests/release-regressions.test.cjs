@@ -284,7 +284,7 @@ test('WorkBuddy closes at a split terminal frame without treating content as a m
     cancel() { released = true },
   })
   const gateway = createWorkBuddyShim({ port: 0,
-    pool: { acquire: async () => ({ label: 'fixture', credential: {} }) }, catalog: { visible: () => [] },
+    pool: { acquire: async () => ({ label: 'fixture', credential: {} }), list: () => [] }, catalog: { visible: () => [] },
     client: { prepareChatBody: raw => raw, chatStream: async () => ({ ok: true, response: new Response(upstream) }) },
   })
   const abort = new AbortController()

@@ -58,11 +58,12 @@ import { TraeSoloUpstreamClient, TRAE_CHECKIN_DEVICE_CLAIMED, traeVariantFor } f
 import { discoverQoderCredentials, resetQoderCredentialCache } from './qoder-credentials'
 import { createQoderGateway } from './qoder-gateway'
 import { QoderUpstreamClient, qoderClaimableCampaignIdOf, qoderCheckinStateFrom, qoderNormalizeClaimResult, qoderRewardExpiryMs, qoderRewardValidityDaysOf } from './qoder-client'
-import { safeMessage } from './loopback'
+import { redactSecrets, safeMessage } from './loopback'
 import { startDeviceLogin, pollDeviceLogin } from './login'
 import { createSourcePool } from './source-pool'
 import { atRestKeyFailure } from './at-rest'
 import { pi } from './pi-compat'
+import { accountLogTag } from './log'
 
 /** The one background service this plugin registers. */
 const SERVICE_ID = "provider-host";
@@ -538,7 +539,10 @@ const travelAdoptTried = new Map();
 
 function log(level, message) {
   try {
-    console.log("[wtq-pool] " + level + ": " + message);
+    // Logs leave the process and are routinely pasted into reports. The shared
+    // redactor strips credentials, paths and addresses before this point.
+    const text = redactSecrets(String(message));
+    console.log("[wtq-pool] " + level + ": " + text);
   } catch {
     /* logging must never break a request */
   }
@@ -2612,7 +2616,13 @@ function refreshNeeded() {
 function cooldownPending() {
   const now = Date.now();
   for (const account of core.pool.list()) {
-    if (account.cooldownUntilMs > now) return true;
+    if (account.cooldownUntilMs <= now) continue;
+    // A cooling account that is switched off, or whose region is off, is never
+    // probed, so its cooldown end would never refresh anything the panel shows.
+    // Counting it held the panel's poll open for the whole cooldown.
+    if (core.pool.isDisabled(account.id)
+      || !regionEnabled("workbuddy", regionOf(account.credential.domain))) continue;
+    return true;
   }
   return false;
 }
@@ -4752,6 +4762,7 @@ async function onPanelInvoke(channel, payload) {
       // was still talking to the upstream.
       const work = (async () => {
         const outcome = source === "trae" ? await traeClaimOne(label, region) : await qoderClaimOne(label, region);
+        markSourceCheckinRow(source, label, region, outcome);
         return { state: await statusDocument({ allowNetwork: true, budgetMs: DOCUMENT_BUDGET_MS }), result: outcome };
       })();
       const answered = await settleWithin(work.finally(() => {
@@ -5402,11 +5413,11 @@ async function redeemAccountStreak(account) {
       const yesterday = zonedDay(-1);
       await core.client.useMakeupCard(account.credential, yesterday);
       detail.makeup += 1;
-      log("info", "streak " + account.label + ": make-up card spent on " + yesterday);
+      log("info", "streak " + accountLogTag(account.label) + ": make-up card spent on " + yesterday);
     }
   } catch (error) {
     detail.failed += 1;
-    log("warn", "streak " + account.label + ": make-up: " + safeMessage(error));
+    log("warn", "streak " + accountLogTag(account.label) + ": make-up: " + safeMessage(error));
   }
   // One-off collections that pay credits and then never appear again. A refusal
   // here is the normal "already collected" answer, so it is not a failure.
@@ -5418,7 +5429,7 @@ async function redeemAccountStreak(account) {
       const paid = await collect();
       if (paid > 0) {
         detail[label] += paid;
-        log("info", "streak " + account.label + ": " + label + " +" + paid + "c");
+        log("info", "streak " + accountLogTag(account.label) + ": " + label + " +" + paid + "c");
       }
     } catch {
       // Nothing waiting: the endpoints answer a business error for that.
@@ -5429,7 +5440,7 @@ async function redeemAccountStreak(account) {
     detail.activity += 1;
   } catch (error) {
     detail.failed += 1;
-    log("warn", "streak " + account.label + ": activity report failed: " + safeMessage(error));
+    log("warn", "streak " + accountLogTag(account.label) + ": activity report failed: " + safeMessage(error));
   }
   await checkinDelay(STREAK_REPORT_READ_GAP_MS);
   const status = await core.client.growthStreakFull(account.credential);
@@ -5447,10 +5458,10 @@ async function redeemAccountStreak(account) {
       credit += tier.credit;
       energy += tier.energy;
       detail.streak += 1;
-      log("info", "streak " + account.label + ": redeemed " + tier.tier + " (+" + tier.credit + "c +" + tier.energy + "e)");
+      log("info", "streak " + accountLogTag(account.label) + ": redeemed " + tier.tier + " (+" + tier.credit + "c +" + tier.energy + "e)");
     } catch (error) {
       detail.failed += 1;
-      log("warn", "streak " + account.label + ": redeem " + tier.tier + " failed: " + safeMessage(error));
+      log("warn", "streak " + accountLogTag(account.label) + ": redeem " + tier.tier + " failed: " + safeMessage(error));
     }
   }
   // Draws come only from the tiers just redeemed, so this runs after them and
@@ -5462,11 +5473,11 @@ async function redeemAccountStreak(account) {
     for (let draw = 0; draw < chances; draw += 1) {
       const prize = await core.client.drawLottery(account.credential);
       detail.lottery += 1;
-      log("info", "streak " + account.label + ": draw " + (draw + 1) + "/" + chances + " " + JSON.stringify(prize).slice(0, 160));
+      log("info", "streak " + accountLogTag(account.label) + ": draw " + (draw + 1) + "/" + chances + " " + JSON.stringify(prize).slice(0, 160));
     }
   } catch (error) {
     detail.failed += 1;
-    log("warn", "streak " + account.label + ": lottery: " + safeMessage(error));
+    log("warn", "streak " + accountLogTag(account.label) + ": lottery: " + safeMessage(error));
   }
   return { claimed, credit, energy, detail };
 }
@@ -5508,7 +5519,7 @@ async function claimAllGrowth() {
     } catch (error) {
       counts.failed += 1;
       counts.detail.failed += 1;
-      log("warn", "streak failed for " + account.label + ": " + safeMessage(error));
+      log("warn", "streak failed for " + accountLogTag(account.label) + ": " + safeMessage(error));
     }
     // A claim changed this account's balance, so its cached probe is stale.
     if (collected) probeCache.delete(account.id);
@@ -5562,7 +5573,7 @@ async function readGrowthState() {
       ]);
       return { account, streak, chances };
     } catch (error) {
-      log("warn", "growth state failed for " + account.label + ": " + safeMessage(error));
+      log("warn", "growth state failed for " + accountLogTag(account.label) + ": " + safeMessage(error));
       return { account, error };
     }
   }));
@@ -5641,7 +5652,7 @@ async function claimAllCheckins() {
         continue;
       }
       counts.failed += 1;
-      log("warn", "check-in failed for " + account.label + ": " + safeMessage(error));
+      log("warn", "check-in failed for " + accountLogTag(account.label) + ": " + safeMessage(error));
     }
   }
   return counts;
@@ -5670,7 +5681,7 @@ async function travelAdopt(account) {
   try {
     await core.client.reportChatActivity(account.credential, conversationId);
   } catch (error) {
-    log("warn", "travel " + account.label + ": adopt preflight report: " + safeMessage(error));
+    log("warn", "travel " + accountLogTag(account.label) + ": adopt preflight report: " + safeMessage(error));
   }
   // The abortable sleep, like every other pacing inside a pass: a service that
   // stops mid-adopt should not sit out the full gap first.
@@ -5678,7 +5689,7 @@ async function travelAdopt(account) {
   try {
     await core.client.agreeBuddy(account.credential);
   } catch (error) {
-    log("warn", "travel " + account.label + ": agreement: " + safeMessage(error));
+    log("warn", "travel " + accountLogTag(account.label) + ": agreement: " + safeMessage(error));
     return "failed";
   }
   try {
@@ -5686,13 +5697,13 @@ async function travelAdopt(account) {
   } catch (error) {
     if (isBuddyThresholdIncomplete(safeMessage(error))) {
       travelAdoptTried.set(account.id, day);
-      log("info", "travel " + account.label + ": adopt skipped (conversation threshold not reached, retry tomorrow)");
+      log("info", "travel " + accountLogTag(account.label) + ": adopt skipped (conversation threshold not reached, retry tomorrow)");
       return "skipped";
     }
-    log("warn", "travel " + account.label + ": adopt: " + safeMessage(error));
+    log("warn", "travel " + accountLogTag(account.label) + ": adopt: " + safeMessage(error));
     return "failed";
   }
-  log("info", "travel " + account.label + ": adopt ok");
+  log("info", "travel " + accountLogTag(account.label) + ": adopt ok");
   return "adopted";
 }
 
@@ -5707,7 +5718,7 @@ async function travelOne(account) {
   try {
     buddy = await core.client.fetchBuddyInfo(account.credential);
   } catch (error) {
-    log("warn", "travel " + account.label + ": buddy-info: " + safeMessage(error));
+    log("warn", "travel " + accountLogTag(account.label) + ": buddy-info: " + safeMessage(error));
     return "failed";
   }
   if (buddy === null) return await travelAdopt(account);
@@ -5715,42 +5726,42 @@ async function travelOne(account) {
   try {
     status = await core.client.fetchTravelStatus(account.credential);
   } catch (error) {
-    log("warn", "travel " + account.label + ": status: " + safeMessage(error));
+    log("warn", "travel " + accountLogTag(account.label) + ": status: " + safeMessage(error));
     return "failed";
   }
   if (status.state === "arrived") {
     if (status.recordId === 0) {
-      log("info", "travel " + account.label + ": claim skipped (arrived but no record_id)");
+      log("info", "travel " + accountLogTag(account.label) + ": claim skipped (arrived but no record_id)");
       return "skipped";
     }
     try {
       const reward = await core.client.claimTravelReward(account.credential, status.recordId);
-      log("info", "travel " + account.label + ": claim ok record=" + status.recordId + " reward=" + reward);
+      log("info", "travel " + accountLogTag(account.label) + ": claim ok record=" + status.recordId + " reward=" + reward);
       return "claimed";
     } catch (error) {
-      log("warn", "travel " + account.label + ": claim record=" + status.recordId + ": " + safeMessage(error));
+      log("warn", "travel " + accountLogTag(account.label) + ": claim record=" + status.recordId + ": " + safeMessage(error));
       return "failed";
     }
   }
   if (status.state === "idle") {
     if (status.dailyLimitReached) {
-      log("info", "travel " + account.label + ": skip (daily limit reached)");
+      log("info", "travel " + accountLogTag(account.label) + ": skip (daily limit reached)");
       return "skipped";
     }
     try {
       await core.client.departTravel(account.credential, 4);
-      log("info", "travel " + account.label + ": depart ok location=4");
+      log("info", "travel " + accountLogTag(account.label) + ": depart ok location=4");
       return "departed";
     } catch (error) {
-      log("warn", "travel " + account.label + ": depart: " + safeMessage(error));
+      log("warn", "travel " + accountLogTag(account.label) + ": depart: " + safeMessage(error));
       return "failed";
     }
   }
   if (status.state === "traveling") {
-    log("info", "travel " + account.label + ": skip (traveling record=" + status.recordId + ")");
+    log("info", "travel " + accountLogTag(account.label) + ": skip (traveling record=" + status.recordId + ")");
     return "skipped";
   }
-  log("info", "travel " + account.label + ": skip (unknown state " + JSON.stringify(status.state) + ")");
+  log("info", "travel " + accountLogTag(account.label) + ": skip (unknown state " + JSON.stringify(status.state) + ")");
   return "skipped";
 }
 
@@ -5791,7 +5802,7 @@ async function travelAllAccounts() {
       // failed travel round makes the summary say the pass found nothing to do
       // on an account it failed on.
       counts.failed += 1;
-      log("warn", "travel failed for " + account.label + ": " + safeMessage(error));
+      log("warn", "travel failed for " + accountLogTag(account.label) + ": " + safeMessage(error));
     }
   }
   return counts;
@@ -5835,6 +5846,10 @@ async function qoderCheckinAll() {
     seen += 1;
     const result = await qoderClaimFor(credential);
     counts[result.outcome] += 1;
+    // The panel reads the source rows this pass just changed, not a probe taken
+    // before it. Without this the card kept saying "claim" after a successful
+    // batch, which read as an inert button.
+    markSourceCheckinRow("qoder", qoderRowLabel(credential), credential.region, result);
     if (result.retry === true) counts.retry = true;
     if (result.opensAt !== undefined && (counts.opensAt === undefined || result.opensAt < counts.opensAt)) {
       counts.opensAt = result.opensAt;
@@ -5850,6 +5865,11 @@ async function qoderCheckinAll() {
  * that already collected) costs a single GET and no mutation.
  */
 async function qoderClaimFor(credential) {
+  if (sourceCredentialExpired(credential, Date.now())) {
+    const reason = "token expired (open Qoder to refresh it)";
+    log("warn", "[qoder:" + credential.region + "] check-in skipped for " + accountLogTag(qoderRowLabel(credential)) + ": " + reason);
+    return { outcome: "skipped", reason };
+  }
   const client = new QoderUpstreamClient({ region: credential.region, credential: async () => qoderClientCredential(credential) });
   try {
     const campaigns = await client.fetchCampaigns();
@@ -5857,22 +5877,33 @@ async function qoderClaimFor(credential) {
     if (id === undefined) {
       // Nothing to claim right now. When the next round opens (Qoder issues it
       // at 10:00 Beijing) say so: the automatic pass comes back at that moment
-      // instead of leaving the day unclaimed.
+      // instead of leaving the day unclaimed. A round already collected is the
+      // other way here, and carrying that mark lets the card stop offering a
+      // click the account cannot use.
       const state = qoderCheckinStateFrom(campaigns);
-      return { outcome: "skipped", ...state.opensAt === undefined ? {} : { opensAt: state.opensAt } };
+      return {
+        outcome: "skipped",
+        ...state.todayCheckedIn === true ? { todayCheckedIn: true } : {},
+        ...state.opensAt === undefined ? {} : { opensAt: state.opensAt },
+      };
     }
     const result = qoderNormalizeClaimResult(await client.claimCampaign(id));
     if (result.reason !== undefined) {
       // 200 with a business error: a refusal the user has to see, not a
       // "nothing to collect" the panel can report as already done. It is a
       // verdict for this round, not a transient transport failure.
-      log("warn", "[qoder:" + credential.region + "] check-in refused for " + qoderRowLabel(credential) + ": " + result.reason);
+      log("warn", "[qoder:" + credential.region + "] check-in refused for " + accountLogTag(qoderRowLabel(credential)) + ": " + result.reason);
       return { outcome: "failed", reason: result.reason, retry: false };
     }
-    return { outcome: result.claimed && !result.replayed ? "claimed" : "skipped" };
+    // A receipt is a claim. Qoder's `replayed` flag marks an idempotent
+    // answer, not a call that paid nothing: the campaign was CLAIMABLE in the
+    // read immediately before this POST, so the round is collected now.
+    // Returning "skipped" here made a first successful click read as "already
+    // collected" until the next refresh.
+    return { outcome: result.claimed ? "claimed" : "skipped" };
   } catch (error) {
     const reason = safeMessage(error);
-    log("warn", "[qoder:" + credential.region + "] check-in failed for " + qoderRowLabel(credential) + ": " + reason);
+    log("warn", "[qoder:" + credential.region + "] check-in failed for " + accountLogTag(qoderRowLabel(credential)) + ": " + reason);
     return { outcome: "failed", reason, retry: qoderFailureRetryable(error) };
   }
 }
@@ -5907,21 +5938,27 @@ async function traeCheckinAll() {
     return { ...counts, failed: 1, reason };
   }
   const cnCredentials = found.credentials.filter((credential) => traeRegionOfCredential(credential) === "cn");
+  // One check-in per device per day, keyed on the x-device-id of the install
+  // the sign-in came from. CN and SOLO are separate installs and can carry
+  // different ids, so a spent device only covers the edition that reported it.
+  const spentEditions = new Set();
   let index = 0;
   for (; index < cnCredentials.length; index += 1) {
     if (currentCheckinSignal().aborted) break;
-    if (index > 0) await checkinDelay(Math.max(1000, TRAE_ACCOUNT_DELAY_MS + Math.round((Math.random() * 2 - 1) * TRAE_ACCOUNT_JITTER_MS)));
-    const result = await traeClaimFor(cnCredentials[index], desktopCandidates);
-    counts[result.outcome] += 1;
-    // Upstream allows one check-in per device per day, keyed on the x-device-id
-    // that every account on this machine shares. Once one account holds it, each
-    // remaining account can only be refused 9095, so the batch stops instead of
-    // walking the rest into a refusal it already knows the answer to. They are
-    // skipped rather than failed: nothing went wrong, the day is simply spent.
-    if (result.deviceCheckedIn === true) {
-      counts.skipped += cnCredentials.length - index - 1;
-      break;
+    const credential = cnCredentials[index];
+    if (spentEditions.has(credential.edition)) {
+      markSourceCheckinRow("trae", traeRowLabel(credential), "cn", { outcome: "skipped", deviceCheckedIn: true });
+      counts.skipped += 1;
+      continue;
     }
+    if (index > 0) await checkinDelay(Math.max(1000, TRAE_ACCOUNT_DELAY_MS + Math.round((Math.random() * 2 - 1) * TRAE_ACCOUNT_JITTER_MS)));
+    const result = await traeClaimFor(credential, desktopCandidates);
+    counts[result.outcome] += 1;
+    markSourceCheckinRow("trae", traeRowLabel(credential), "cn", result);
+    // Once an account on this edition holds the device's daily claim, each
+    // remaining account on the same edition can only be refused 9095. They are
+    // skipped rather than failed: nothing went wrong, the day is simply spent.
+    if (result.deviceCheckedIn === true) spentEditions.add(credential.edition);
   }
   return counts;
 }
@@ -5988,7 +6025,7 @@ async function traeClaimFor(credential, desktopCandidates) {
   const label = traeRowLabel(credential);
   if (sourceCredentialExpired(credential, Date.now())) {
     const reason = "token expired (open Trae to refresh it)";
-    log("warn", "[trae:cn] check-in skipped for " + label + ": " + reason);
+    log("warn", "[trae:cn] check-in skipped for " + accountLogTag(label) + ": " + reason);
     return { outcome: "skipped", reason };
   }
   const client = new TraeSoloUpstreamClient({
@@ -6002,8 +6039,10 @@ async function traeClaimFor(credential, desktopCandidates) {
     // on `active` too; without this the batch would send a pointless mutation
     // and count a refusal against an account that is simply not enrolled.
     if (status.code === 0 && status.enable === false) return { outcome: "skipped" };
-    // The account's own reward for today already exists: nothing to do.
-    if (status.code === 0 && status.checkedIn) return { outcome: "skipped" };
+    // The account's own reward for today already exists: nothing to do. The
+    // panel is told so it can stop offering the click after a claim made in the
+    // desktop app, not only after one it sent itself.
+    if (status.code === 0 && status.checkedIn) return { outcome: "skipped", todayCheckedIn: true };
     // One check-in per device per day: when this machine already claimed for
     // another account, a claim for this one can only be refused (9095), so it
     // is not sent at all and the card says whose day is spent.
@@ -6014,7 +6053,7 @@ async function traeClaimFor(credential, desktopCandidates) {
     // itself) claimed between the read and the write. A benign refusal about
     // the device, not a broken account.
     if (claim.code === TRAE_CHECKIN_DEVICE_CLAIMED) {
-      log("info", "[trae:cn] check-in already used by this device for " + label + ": " + safeMessage(claim.message ?? ""));
+      log("info", "[trae:cn] check-in already used by this device for " + accountLogTag(label) + ": " + safeMessage(claim.message ?? ""));
       return { outcome: "skipped", deviceCheckedIn: true };
     }
     const reason = await traeCheckinReason(
@@ -6022,15 +6061,32 @@ async function traeClaimFor(credential, desktopCandidates) {
       credential,
       desktopCandidates,
     );
-    log("warn", "[trae:cn] check-in refused for " + label + ": " + reason);
+    log("warn", "[trae:cn] check-in refused for " + accountLogTag(label) + ": " + reason);
     return { outcome: "failed", reason };
   } catch (error) {
     // The blocker rides along on this path too: a throw is usually the identity
     // read itself failing, which is exactly what the hint explains.
     const reason = await traeCheckinReason(safeMessage(error), credential, desktopCandidates);
-    log("warn", "[trae:cn] check-in failed for " + label + ": " + reason);
+    log("warn", "[trae:cn] check-in failed for " + accountLogTag(label) + ": " + reason);
     return { outcome: "failed", reason };
   }
+}
+
+/** Record a single claim in the cached source row the panel reads back. */
+function markSourceCheckinRow(source, label, region, outcome) {
+  const checkedToday = outcome?.outcome === "claimed" || outcome?.todayCheckedIn === true;
+  if (!checkedToday && outcome?.deviceCheckedIn !== true) return;
+  const rows = source === "trae" ? traeAccountRows : qoderAccountRows;
+  const row = rows.find((entry) => entry.label === label && entry.region === region);
+  if (row === undefined) return;
+  // `statusDocument` serves this cache, not a fresh probe: without the write
+  // the card kept the pre-claim badge after a successful claim, and the next
+  // click was refused as already collected.
+  row.checkin = {
+    ...row.checkin ?? { active: true, todayCheckedIn: false },
+    ...checkedToday ? { active: true, todayCheckedIn: true } : {},
+    ...outcome.deviceCheckedIn === true ? { deviceCheckedIn: true } : {},
+  };
 }
 
 /** The one Trae account a panel row names, or a refusal that says why. */

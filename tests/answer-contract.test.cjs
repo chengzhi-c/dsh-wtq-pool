@@ -43,13 +43,26 @@ const { createTraeGateway } = require('../src/trae-gateway.ts')
 const QUIET = { info() {}, warn() {}, error() {} }
 
 /** A sign-in file the pool reads, far from expiry so no refresh is spent. */
-function signInDir(prefix) {
+function makeSignInDir(prefix, index) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `wtq-${prefix}-`))
   fs.writeFileSync(path.join(dir, 'workbuddy-desktop.info'), JSON.stringify({
-    auth: { accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3_600_000, domain: 'www.codebuddy.cn' },
-    account: { uin: 'u-1', nickname: 'one' },
+    auth: {
+      accessToken: `t-${prefix}-${index}`,
+      refreshToken: `r-${prefix}-${index}`,
+      expiresAt: Date.now() + 3_600_000,
+      domain: 'www.codebuddy.cn',
+    },
+    account: { uin: `u-${prefix}-${index}`, nickname: `${prefix}-${index}` },
   }))
   return dir
+}
+
+function signInDir(prefix) {
+  return makeSignInDir(prefix, 0)
+}
+
+function signInDirs(prefix, count) {
+  return Array.from({ length: count }, (_, index) => makeSignInDir(prefix, index))
 }
 
 /** A WorkBuddy gateway whose upstream is the given chat behaviour. */
@@ -77,6 +90,29 @@ async function workbuddyShim({ client, models, model = 'hy3' }) {
       await shim.close()
       fs.rmSync(dir, { recursive: true, force: true })
     },
+  }
+}
+
+/** A WorkBuddy gateway built from several sign-in files. */
+async function workbuddyShimFromDirs({ client, models, dirs, model = 'hy3' }) {
+  const pool = new WorkBuddyAccountPool({ authDirs: dirs, cooldownMs: 60_000, client })
+  await pool.scan()
+  const shim = createWorkBuddyShim({
+    pool, region: 'cn', client, logger: QUIET,
+    catalog: { visible: () => models.map((id) => ({ id })), current: () => models.map((id) => ({ id })) },
+  })
+  await shim.ready
+  return {
+    pool,
+    async turn(body = {}) {
+      const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], ...body }),
+      })
+      return { status: answer.status, type: answer.headers.get('content-type'), text: await answer.text() }
+    },
+    close: () => shim.close(),
   }
 }
 
@@ -246,10 +282,141 @@ test('a transport failure does not cool the account it failed on', async () => {
   try {
     const answer = await shim.turn()
     assert.equal(answer.status, 502)
-    assert.equal(calls.length, 1, 'every account reaches the same host, so one timeout ends the rotation')
+    assert.equal(calls.length, 1, 'with one account there is nowhere to rotate')
     const [account] = shim.pool.list()
     assert.equal(account.cooldownUntilMs, 0, 'the network path failed, not the account')
     assert.equal(account.rateLimitHits, 0, 'and it is not recorded as a rate limit')
+  } finally {
+    await shim.close()
+  }
+})
+
+test('a pool larger than eight accounts still reaches its healthy tail', async (t) => {
+  // `maxAttempts` was the fixed number eight. With nine sign-ins and the first
+  // eight rate-limited, the ninth was never tried and the request answered 429
+  // while a healthy account sat idle.
+  const dirs = signInDirs('tail', 9)
+  t.after(() => { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }) })
+  let calls = 0
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async () => {
+      calls += 1
+      if (calls < 9) return { ok: false, kind: 'soft_rate', status: 429, message: 'usage exceeds frequency limit' }
+      return {
+        ok: true,
+        response: new Response('data: {"choices":[{"delta":{"content":"tail"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        }),
+      }
+    },
+  }
+  const pool = new WorkBuddyAccountPool({ authDirs: dirs, cooldownMs: 60_000, client })
+  await pool.scan()
+  const shim = createWorkBuddyShim({
+    pool, region: 'cn', client, logger: QUIET,
+    catalog: { visible: () => [{ id: 'hy3' }], current: () => [{ id: 'hy3' }] },
+  })
+  try {
+    await shim.ready
+    const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'hy3', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(answer.status, 200, 'the ninth account has to get the turn')
+    assert.equal(calls, 9, 'and every earlier account is still tried in order')
+    await answer.text()
+  } finally {
+    await shim.close()
+  }
+})
+
+test('a host-wide transport failure stops after one failover', async (t) => {
+  const dirs = signInDirs('transport', 3)
+  t.after(() => { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }) })
+  let calls = 0
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async () => {
+      calls += 1
+      return { ok: false, kind: 'transport', status: 0, message: 'connect ECONNREFUSED' }
+    },
+  }
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 502)
+    assert.equal(calls, 2, 'one failover is worth trying; a third headers timeout is not')
+  } finally {
+    await shim.close()
+  }
+})
+
+test('an account whose first byte never arrives is skipped for the next one', async (t) => {
+  const dirs = signInDirs('head', 2)
+  t.after(() => { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }) })
+  let calls = 0
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async () => {
+      calls += 1
+      if (calls === 1) {
+        return {
+          ok: true,
+          response: new Response(new ReadableStream({
+            start(controller) { controller.error(new Error('socket reset before first byte')) },
+          }), { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+        }
+      }
+      return {
+        ok: true,
+        response: new Response('data: {"choices":[{"delta":{"content":"second"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        }),
+      }
+    },
+  }
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 200, 'the healthy account behind the broken stream serves the turn')
+    assert.match(answer.text, /second/)
+    assert.equal(calls, 2, 'the broken account is not retried in the same request')
+  } finally {
+    await shim.close()
+  }
+})
+
+test('an empty 200 stream is a failed attempt, not the end of the turn', async (t) => {
+  const dirs = signInDirs('empty', 2)
+  t.after(() => { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }) })
+  let calls = 0
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async () => {
+      calls += 1
+      if (calls === 1) {
+        return {
+          ok: true,
+          response: new Response(new ReadableStream({ start(controller) { controller.close() } }), {
+            status: 200, headers: { 'content-type': 'text/event-stream' },
+          }),
+        }
+      }
+      return {
+        ok: true,
+        response: new Response('data: {"choices":[{"delta":{"content":"second"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        }),
+      }
+    },
+  }
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 200, 'an empty 200 is still an attempt the next account can replace')
+    assert.match(answer.text, /second/)
+    assert.equal(calls, 2)
   } finally {
     await shim.close()
   }

@@ -16,7 +16,7 @@ import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { tokenExpiryMs, regionOf, upstreamErrorKind, type WorkBuddyRegion } from './upstream'
 import { encryptedFieldOpener, isEncryptedFieldWrapper } from './at-rest'
-import { LOG_PREFIX } from './log'
+import { LOG_PREFIX, accountLogTag } from './log'
 
 /** Minimal upstream surface the pool needs to refresh a token (no circular import). */
 export interface TokenRefresher {
@@ -1402,7 +1402,7 @@ export class WorkBuddyAccountPool {
     // Only the hold this record describes is released. A rate-limit cooldown
     // that outlasts it belongs to the upstream's window and stays.
     if (account.cooldownUntilMs > Date.now() && account.cooldownUntilMs <= hold.until) account.cooldownUntilMs = 0
-    this.logger?.info?.(`${LOG_PREFIX}: ${account.label} has credits again; releasing the hold`)
+    this.logger?.info?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} has credits again; releasing the hold`)
   }
 
   /** True when a known balance has reached the floor set for this account. */
@@ -1719,7 +1719,7 @@ export class WorkBuddyAccountPool {
       } catch (error: unknown) {
         // A snapshot the plugin could not copy is still a snapshot: it keeps
         // serving from where it lies, exactly as before.
-        this.logger?.warn?.(`${LOG_PREFIX}: could not take over ${accountLabel(credential)}: ${String(error)}`)
+        this.logger?.warn?.(`${LOG_PREFIX}: could not take over ${accountLogTag(accountLabel(credential))}: ${String(error)}`)
         continue
       }
       ownedIds.add(id)
@@ -1741,7 +1741,7 @@ export class WorkBuddyAccountPool {
         await renewOwnSignInFile(credential.sourcePath, credential)
       } catch (error: unknown) {
         this.logger?.warn?.(
-          `${LOG_PREFIX}: could not write the renewed token back for ${credential.nickname ?? credential.uid}: ${String(error)}`,
+          `${LOG_PREFIX}: could not write the renewed token back for ${accountLogTag(credential.nickname ?? credential.uid)}: ${String(error)}`,
         )
       }
       return
@@ -1758,7 +1758,7 @@ export class WorkBuddyAccountPool {
       credential.sourcePath = await writeOwnSignIn(directory, ownSignInOf(credential))
     } catch (error: unknown) {
       this.logger?.warn?.(
-        `${LOG_PREFIX}: could not keep the renewed token for ${credential.nickname ?? credential.uid}: ${String(error)}`,
+        `${LOG_PREFIX}: could not keep the renewed token for ${accountLogTag(credential.nickname ?? credential.uid)}: ${String(error)}`,
       )
     }
   }
@@ -2078,7 +2078,7 @@ export class WorkBuddyAccountPool {
       if (this.signInRefused(id, account.credential.accessToken)) continue
       this.heldIds.delete(id)
       if (account.cooldownUntilMs > 0 && account.cooldownUntilMs <= hold.until) account.cooldownUntilMs = 0
-      this.logger?.info?.(`${LOG_PREFIX}: ${account.label} has a sign-in the upstream did not refuse; releasing the hold`)
+      this.logger?.info?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} has a sign-in the upstream did not refuse; releasing the hold`)
     }
 
     const foundIds = new Set(found.map(credential => workbuddyAccountId(credential)))
@@ -2485,7 +2485,7 @@ export class WorkBuddyAccountPool {
         // warning buried everything else in the log.
         if (!this.noRefreshWarned.has(account.id)) {
           this.noRefreshWarned.add(account.id)
-          this.logger?.warn(`${LOG_PREFIX}: ${account.label} token expired with no refresh token; sign in again`)
+          this.logger?.warn(`${LOG_PREFIX}: ${accountLogTag(account.label)} token expired with no refresh token; sign in again`)
         }
         return 'noToken'
       }
@@ -2536,15 +2536,15 @@ export class WorkBuddyAccountPool {
           // Only the cooldown this hold wrote is cleared; one that outlasts it
           // belongs to the upstream's own window and stays.
           if (account.cooldownUntilMs > Date.now() && account.cooldownUntilMs <= sessionHold.until) account.cooldownUntilMs = 0
-          this.logger?.info?.(`${LOG_PREFIX}: ${account.label} refreshed again; releasing the refused sign-in hold`)
+          this.logger?.info?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} refreshed again; releasing the refused sign-in hold`)
         }
-        this.logger?.info?.(`${LOG_PREFIX}: refreshed token for ${account.label}`)
+        this.logger?.info?.(`${LOG_PREFIX}: refreshed token for ${accountLogTag(account.label)}`)
         return 'refreshed'
       } catch (error: unknown) {
         if (credential.expiresAtMs > Date.now() + 30_000) {
-          this.logger?.warn?.(`${LOG_PREFIX}: token refresh failed but token still valid for ${account.label}`, error)
+          this.logger?.warn?.(`${LOG_PREFIX}: token refresh failed but token still valid for ${accountLogTag(account.label)}`, error)
         } else {
-          this.logger?.error?.(`${LOG_PREFIX}: token refresh failed and token expired for ${account.label}`, error)
+          this.logger?.error?.(`${LOG_PREFIX}: token refresh failed and token expired for ${accountLogTag(account.label)}`, error)
         }
         const kind = upstreamErrorKind(error)
         return kind === 'session_dead' ? 'refused' : 'failed'
@@ -2612,7 +2612,7 @@ export class WorkBuddyAccountPool {
       pruneModelCooldowns(account, now)
       account.modelCooldowns[modelId] = Math.max(account.modelCooldowns[modelId] ?? 0, until)
       this.logger?.warn(
-        `${LOG_PREFIX}: ${account.label} rate-limited on model ${modelId}; ` +
+        `${LOG_PREFIX}: ${accountLogTag(account.label)} rate-limited on model ${modelId}; ` +
           `cooling that model until ${new Date(until).toISOString()}`,
       )
       return
@@ -2646,8 +2646,8 @@ export class WorkBuddyAccountPool {
     }
     this.logger?.warn(
       holdReason !== undefined
-        ? `${LOG_PREFIX}: account ${account.label} held (${holdReason}); held until ${new Date(until).toISOString()}`
-        : `${LOG_PREFIX}: account ${account.label} rate-limited; cooling until ${new Date(until).toISOString()}`,
+        ? `${LOG_PREFIX}: account ${accountLogTag(account.label)} held (${holdReason}); held until ${new Date(until).toISOString()}`
+        : `${LOG_PREFIX}: account ${accountLogTag(account.label)} rate-limited; cooling until ${new Date(until).toISOString()}`,
     )
   }
 

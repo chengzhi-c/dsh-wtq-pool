@@ -924,7 +924,7 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   // another account, so it must not read as a terminal client error. A 403
   // that carries `"code":` / `"msg":` is the upstream's own verdict and stays
   // with the classes above and below.
-  if (status === 403 && !body.includes('"code":') && !body.includes('"msg":')) return 'waf_block'
+  if (status === 403 && !/"code"\s*:|"msg"\s*:/.test(body)) return 'waf_block'
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
   return 'client'

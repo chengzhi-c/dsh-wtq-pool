@@ -7,7 +7,7 @@
 /** What one decoded frame means. */
 export type QoderFrame =
   | { type: 'chunk'; chunk: Record<string, unknown> }
-  | { type: 'failure'; code: string; detail: string; retryAfterSeconds: number }
+  | { type: 'failure'; code: string; detail: string; signals: string; retryAfterSeconds: number }
   | { type: 'unknown'; reason: 'unparseable' | 'unnamed'; data: unknown }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -41,9 +41,10 @@ function isAcknowledgementCode(value: unknown): boolean {
  * payload cannot spin. When it bottoms out on an object (the queue descriptor),
  * that object is far more useful than the string that carried it.
  */
-export function unwrapFailure(frame: unknown): { code: string; detail: string } {
+export function unwrapFailure(frame: unknown): { code: string; detail: string; signals: string } {
   let code = ''
   let detail = ''
+  const signals: string[] = []
   let node: unknown = frame
   let descended = false
   let codeFromPlainKey = false
@@ -84,8 +85,18 @@ export function unwrapFailure(frame: unknown): { code: string; detail: string } 
         codeFromErrorSpelling = errorSpelling !== undefined
       }
     }
+    // Outer text wins unless it is only a JSON wrapper. The envelope carries
+    // the vendor's own sentence ("Login expired"); a nested container usually
+    // adds request ids, and letting its `message` overwrite the outer one
+    // erased the only words the failure classifier can act on.
+    //
+    // The walked-away text is still collected in `signals`: when the outer
+    // sentence is generic and the nested one names the cause, the classifier
+    // needs the nested one even though the card should show the outer one.
     const message = node['message'] ?? node['errorMessage']
-    if (typeof message === 'string' && message.length > 0) detail = message
+    if (typeof message === 'string' && message.trim() !== '' && !signals.includes(message)) signals.push(message)
+    if ((detail === '' || tryJsonObject(detail) !== undefined)
+      && typeof message === 'string' && message.length > 0) detail = message
     // A container that arrived as a bare string is the message. Qoder spells a
     // refusal `{"choices":[],"error":"Login expired"}` as often as it spells one
     // with a code, and reading only the object form dropped those frames as
@@ -93,6 +104,7 @@ export function unwrapFailure(frame: unknown): { code: string; detail: string } 
     const flat = typeof node['error'] === 'string' ? node['error']
       : typeof node['details'] === 'string' ? node['details']
         : undefined
+    if (flat !== undefined && flat.trim() !== '' && !signals.includes(flat)) signals.push(flat)
     if (detail === '' && flat !== undefined && flat.length > 0) detail = flat
     const nested = isPlainObject(node['details']) ? node['details'] : isPlainObject(node['error']) ? node['error'] : undefined
     const next = nested ?? (typeof message === 'string' ? tryJsonObject(message) : undefined)
@@ -118,26 +130,32 @@ export function unwrapFailure(frame: unknown): { code: string; detail: string } 
   if (codeFromPlainKey && isAcknowledgementCode(code)) {
     code = ''
   }
-  return { code, detail }
+  return { code, detail, signals: signals.join('\n') }
 }
 
 /**
  * The gateway's retry hint, when the frame carries one.
  *
- * A carried `0` is the decoder's "no hint" placeholder, not a real wait, so it
- * falls through to the nested value the same way `queueSeconds` does. Treating it
- * as a real answer returned 0 and threw away the actual wait the queue frame
- * carried in its message text.
+ * A carried `0` is the decoder's "no hint" placeholder, not a real wait. The
+ * hint may sit on the envelope, in a nested container, or inside a message that
+ * is itself a JSON document; the walk reads all three so a queue descriptor is
+ * not lost when the outer sentence is the one worth showing.
  */
 export function retryAfterSecondsOf(frame: unknown): number {
-  if (!isPlainObject(frame)) return 0
-  const direct = frame['retryAfterSeconds']
-  if (typeof direct === 'number' && Number.isFinite(direct) && direct > 0) return direct
-  const { detail } = unwrapFailure(frame)
-  if (detail === '') return 0
-  const parsed = tryJsonObject(detail)
-  const nested = parsed?.['retryAfterSeconds']
-  return typeof nested === 'number' && Number.isFinite(nested) && nested > 0 ? nested : 0
+  const seen = new Set<object>()
+  let node: unknown = frame
+  for (let depth = 0; depth < 8; depth++) {
+    if (!isPlainObject(node) || seen.has(node)) break
+    seen.add(node)
+    const direct = node['retryAfterSeconds']
+    if (typeof direct === 'number' && Number.isFinite(direct) && direct > 0) return direct
+    const message = node['message'] ?? node['errorMessage']
+    const nested = isPlainObject(node['details']) ? node['details'] : isPlainObject(node['error']) ? node['error'] : undefined
+    const next = nested ?? (typeof message === 'string' ? tryJsonObject(message) : undefined)
+    if (next === undefined) break
+    node = next
+  }
+  return 0
 }
 
 /**
@@ -176,9 +194,9 @@ export function decodeQoderFrame(payload: string): QoderFrame {
   // alone: a frame whose only code sits under `error`/`details`, or inside a
   // JSON document in `message`, would otherwise read as an unnamed frame and
   // be dropped — presenting the user with an empty turn.
-  const { code, detail } = unwrapFailure(chunk)
+  const { code, detail, signals } = unwrapFailure(chunk)
   if (code === '' && detail === '') return { type: 'unknown', reason: 'unnamed', data: chunk }
-  return { type: 'failure', code, detail, retryAfterSeconds: retryAfterSecondsOf(chunk) }
+  return { type: 'failure', code, detail, signals, retryAfterSeconds: retryAfterSecondsOf(chunk) }
 }
 
 /**

@@ -731,7 +731,7 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
       ctx.effect(() => settingsService.configure?.({ auto: true }, ctx.fiber) ?? (() => {}))
     }
   } catch (error: unknown) {
-    ctx.logger.warn?.('dsh-wtq-pool: settings section unavailable', error)
+    ctx.logger.warn?.('dsh-wtq-pool: settings section unavailable', safeMessage(error))
   }
 
   // Registration is answered from the last declaration, so the discovery hook

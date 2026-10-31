@@ -125,6 +125,19 @@ function cleanIconPath(raw: string): string {
   return raw.replace(/^"/u, '').replace(/",-?\d+$/u, '').replace(/,-?\d+$/u, '').trim()
 }
 
+/**
+ * Whether a Windows path names a local file rather than a network share.
+ *
+ * The registry scan reads values any process running as the user can write. A
+ * `DisplayIcon` naming `\\host\share\x.exe` would make PowerShell's own path
+ * check authenticate to that host before any signature was read, leaking the
+ * user's NTLM response. Only absolute drive paths are considered, and every
+ * stat and spawn goes through the same filter.
+ */
+function localWindowsPath(candidate: string): boolean {
+  return /^[A-Za-z]:[\\/]/u.test(candidate)
+}
+
 function windowsRegistryAppPaths(): string[] {
   if (process.platform !== 'win32') return []
   // The scan is a blocking PowerShell call, and the installs it lists do not
@@ -207,21 +220,20 @@ export function scanInterpreter(env: NodeJS.ProcessEnv): string | undefined {
 }
 
 /**
- * Every path an uninstall key names for a WorkBuddy-family install, paired with
- * the signature PowerShell found on it.
+ * Every path an uninstall key names for a WorkBuddy-family install.
  *
  * The scan reads `DisplayName`, `DisplayIcon` and `InstallLocation` out of the
  * user's own uninstall keys, which means any process running as the user can add
- * one. Before the signature check, a key naming an arbitrary executable was
- * enough to have this plugin spawn it with the plugin's whole environment, inside
- * a process holding every WorkBuddy token - so the check is what makes the scan
- * safe to run at all, not an extra.
+ * one. It only enumerates here: a path is filtered to a local drive, stat'ed,
+ * and signature-checked in Node before anything is spawned. Doing the stat or
+ * signature read in PowerShell would touch a planted UNC path first and leak an
+ * NTLM response to the host it names.
  *
- * PowerShell does the part only it can do: enumerate, clean the resource index
- * and quotes off `DisplayIcon`, stat the file, and read its signature. The
- * decision is {@link signatureAccepts}'s, in Node, because that is where it can
- * be tested without a registry to plant a key in, and it is handed a module path
- * 5.1 can actually load, because the host's is not always one.
+ * PowerShell does the part only it can do: enumerate the keys and clean the
+ * resource index and quotes off `DisplayIcon`. The decision is
+ * {@link signatureAccepts}'s, in Node, because that is where it can be tested
+ * without a registry to plant a key in, and it is handed a module path 5.1 can
+ * actually load, because the host's is not always one.
  */
 function readRegistryAppPaths(): string[] {
   const script = [
@@ -236,23 +248,19 @@ function readRegistryAppPaths(): string[] {
     '  return $v',
     '}',
     "$roots=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*')",
-    'foreach($r in $roots){',
+    '$out = foreach($r in $roots){',
     '  Get-ItemProperty -Path $r | ForEach-Object {',
     '    $dn=[string]$_.DisplayName; $di=[string]$_.DisplayIcon; $il=[string]$_.InstallLocation',
     "    if($dn -match 'WorkBuddy|CodeBuddy' -or $di -match 'WorkBuddy|CodeBuddy'){",
     '      foreach($raw in @($di,$il)){',
     '        $p = Clean $raw',
     "        if($p -eq ''){ continue }",
-    "        if(-not (Test-Path -LiteralPath $p -PathType Leaf)){ continue }",
-    '        $s = $null',
-    '        try { $s = Get-AuthenticodeSignature -LiteralPath $p } catch { $s = $null }',
-    '        $st = if($s -ne $null){ [string]$s.Status } else { "" }',
-    '        $sj = if($s -ne $null -and $s.SignerCertificate -ne $null){ [string]$s.SignerCertificate.Subject } else { "" }',
-    '        Write-Output ($p + [char]9 + $st + [char]9 + $sj)',
+    '        Write-Output $p',
     '      }',
     '    }',
     '  }',
     '}',
+    'ConvertTo-Json -InputObject @($out) -Compress',
   ].join('\n')
   let stdout: string
   const interpreter = scanInterpreter(process.env)
@@ -264,14 +272,18 @@ function readRegistryAppPaths(): string[] {
   } catch {
     return []
   }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return []
+  }
+  const entries = Array.isArray(parsed) ? parsed : [parsed]
   const out: string[] = []
-  for (const line of stdout.split(/\r?\n/u)) {
-    // `path<TAB>status<TAB>signer`. A path the scan could not read a signature
-    // for arrives with an empty status and is dropped here rather than trusted.
-    const [rawPath, status, signer] = line.trim().split('\t')
-    const cleaned = rawPath === undefined ? '' : cleanIconPath(rawPath)
-    if (cleaned === '') continue
-    if (!signatureAccepts(status, signer)) continue
+  for (const entry of entries) {
+    if (typeof entry !== 'string') continue
+    const cleaned = cleanIconPath(entry)
+    if (cleaned === '' || !localWindowsPath(cleaned)) continue
     out.push(cleaned)
   }
   return out
@@ -284,11 +296,12 @@ function readRegistryAppPaths(): string[] {
  * PowerShell half is not unit-testable, and this half is where the decision
  * actually lives.
  *
- * `Valid` means the chain resolved to a trusted root, which a process running as
- * the user cannot produce for a file it wrote - it would need either a
- * certificate issued to it or administrative access to install a root. That is
- * the whole defence: an uninstall key is user-writable, so "the key names it" is
- * not evidence of anything, while a valid signature is.
+ * `Valid` means the chain resolved to a trusted root. A user process cannot
+ * forge the vendor's signature, but it can trust a certificate of its own in the
+ * current user's root store without elevation, so this check raises the bar
+ * rather than proving the file is the vendor's. It still rejects an unsigned
+ * planted executable, and every cached registry path is checked again before it
+ * is run.
  *
  * The publisher is deliberately not pinned. The plugin is a third-party build and
  * the vendor can change its signing certificate; a pinned name would turn that
@@ -303,10 +316,88 @@ export function signatureAccepts(status: string | undefined, signer: string | un
   return status === 'Valid' && signer !== undefined && signer.trim() !== ''
 }
 
+/** Why the last signature scan could not produce an answer, if it could not. */
+let signatureScanFailure = ''
+
+/**
+ * The candidates whose Authenticode signature is valid.
+ *
+ * The standard install roots and the environment override were trusted by path
+ * alone, while only the registry fallback checked a signature. A process running
+ * as the user can write `%LOCALAPPDATA%\\Programs\\WorkBuddy\\WorkBuddy.exe`; when
+ * the host runs elevated, spawning that file would hand it the plugin's whole
+ * environment and every WorkBuddy token. Every path is checked here, and the
+ * registry result is passed through the same check before it is spawned.
+ */
+async function signedExecutables(candidates: string[]): Promise<string[]> {
+  if (process.platform !== 'win32' || candidates.length === 0) return candidates
+  signatureScanFailure = ''
+  const interpreter = scanInterpreter(process.env)
+  if (interpreter === undefined) {
+    signatureScanFailure = 'the signature check could not run: Windows PowerShell was not found'
+    return []
+  }
+  const payload = Buffer.from(JSON.stringify(candidates), 'utf8').toString('base64')
+  const script = [
+    "$ErrorActionPreference='SilentlyContinue'",
+    'try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}',
+    `$paths = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json`,
+    '$out = foreach ($p in @($paths)) {',
+    '  if ([string]::IsNullOrWhiteSpace([string]$p)) { continue }',
+    '  $s = $null',
+    '  try { $s = Get-AuthenticodeSignature -LiteralPath ([string]$p) } catch { $s = $null }',
+    '  [pscustomobject]@{',
+    '    path = [string]$p',
+    '    status = if ($s -ne $null) { [string]$s.Status } else { "" }',
+    '    signer = if ($s -ne $null -and $s.SignerCertificate -ne $null) { [string]$s.SignerCertificate.Subject } else { "" }',
+    '  }',
+    '}',
+    'ConvertTo-Json -InputObject @($out) -Compress',
+  ].join('\n')
+  let stdout: string
+  try {
+    stdout = await new Promise<string>((resolve, reject) => {
+      execFile(interpreter, [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+      ], { encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 8_388_608, env: signatureScanEnv() }, (error, output) => {
+        if (error !== null) reject(error)
+        else resolve(output)
+      })
+    })
+  } catch {
+    signatureScanFailure = 'the signature check could not run'
+    return []
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    signatureScanFailure = 'the signature check returned no readable answer'
+    return []
+  }
+  const entries = Array.isArray(parsed) ? parsed : [parsed]
+  const accepted: string[] = []
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== 'object') continue
+    const record = entry as Record<string, unknown>
+    const file = record['path']
+    const status = record['status']
+    const signer = record['signer']
+    if (typeof file !== 'string' || file === '') continue
+    if (!signatureAccepts(typeof status === 'string' ? status : undefined,
+      typeof signer === 'string' ? signer : undefined)) continue
+    accepted.push(file)
+  }
+  return accepted
+}
+
 function statExecutables(candidates: string[]): string[] {
   const files: string[] = []
   for (const candidate of candidates) {
     if (candidate === '') continue
+    // A UNC path would make `statSync` open an SMB connection, which is the
+    // same leak the registry scan avoids. Only local drive paths are touched.
+    if (process.platform === 'win32' && !localWindowsPath(candidate)) continue
     try {
       // A file, not merely something that exists: the registry scan emits
       // InstallLocation, which is a directory, and spawning one spent a doomed
@@ -318,7 +409,7 @@ function statExecutables(candidates: string[]): string[] {
   return files
 }
 
-function executableCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
+async function executableCandidates(env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
   const override = env[WORKBUDDY_APP_EXECUTABLE_ENV]?.trim()
   const known = override === undefined ? [] : [override]
   if (process.platform === 'win32') {
@@ -341,13 +432,16 @@ function executableCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
       }
     }
   }
-  const standard = statExecutables(known)
+  const standard = await signedExecutables(statExecutables(known))
   // The registry scan is a blocking PowerShell call and the host waits for this
   // plugin to load, so it is only worth its cost for an install none of the
   // standard roots holds: a machine with the app in the usual place never runs
   // it, and one without it pays for the scan instead of guessing wrong roots.
   if (standard.length > 0 || process.platform !== 'win32') return standard
-  return statExecutables(windowsRegistryAppPaths())
+  // The registry answer is cached, but its paths are not trusted: a cached path
+  // the user has since replaced, or one a planted key named, still has to be a
+  // local file carrying a valid signature before it runs.
+  return signedExecutables(statExecutables(windowsRegistryAppPaths()))
 }
 
 function fetchAtRestKeyPayload(executable: string): Promise<string> {
@@ -408,13 +502,18 @@ function ensureAtRestKeys(): Promise<void> {
   if (atRestKeyById.size > 0) return Promise.resolve()
   if (Date.now() - lastKeyFailureAtMs < KEY_FAILURE_BACKOFF_MS) return Promise.resolve()
   inflightKeys ??= (async () => {
-    const candidates = executableCandidates()
+    const candidates = await executableCandidates()
     if (candidates.length === 0) {
       lastKeyFailureAtMs = Date.now()
       // Named, because the only other signal was a shim reporting "no WorkBuddy
       // credential found" for a sign-in whose sealed fields simply could not be
-      // opened.
-      lastKeyFailure = 'no WorkBuddy executable found in the standard install roots'
+      // opened. A scan that never ran is reported as its own condition rather
+      // than as a verdict that the installed file is unsigned.
+      lastKeyFailure = process.platform === 'win32'
+        ? signatureScanFailure !== ''
+          ? signatureScanFailure
+          : 'no WorkBuddy executable with a valid signature was found'
+        : 'no WorkBuddy executable found in the standard install roots'
       return
     }
     let anySuccess = false

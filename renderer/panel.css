@@ -578,7 +578,7 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
 .acct-delete:hover:not(:disabled) { color: var(--xd-danger); border-color: var(--xd-danger); background: color-mix(in srgb, var(--xd-danger) 10%, transparent); }
 
 /* Armed: the next press deletes, so the button stops looking like the idle one. */
-.acct-delete.confirming { color: #fff; background: var(--xd-danger); border-color: var(--xd-danger); font-weight: 600; }
+.acct-delete.confirming { color: var(--xd-on-danger); background: var(--xd-danger); border-color: var(--xd-danger); font-weight: 600; }
 .acct-delete.confirming:hover:not(:disabled) { background: color-mix(in srgb, var(--xd-danger) 85%, #000); border-color: color-mix(in srgb, var(--xd-danger) 85%, #000); }
 
 /* Switched off: visibly parked without being hidden. */

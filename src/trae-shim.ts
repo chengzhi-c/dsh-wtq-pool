@@ -363,7 +363,14 @@ export function bridgeTraeStream(
     // delta or a terminator, and answering it as content gave the client an
     // empty turn. The peek looks at all of them for the same reason.
     const failure = traeFailureOf(decoded)
-    if (failure !== undefined) throw new Error(describeTraeFailure(failure))
+    if (failure !== undefined) {
+      // The frame is attached to the thrown error: a failure after output has
+      // started can no longer change the status the client holds, but the
+      // gateway still has to cool the right account for the right reason.
+      const refusal = new Error(describeTraeFailure(failure)) as Error & { traeFailure?: TraeFailure }
+      refusal.traeFailure = failure
+      throw refusal
+    }
     if (decoded.type === 'unknown') {
       keepalive(controller)
       return

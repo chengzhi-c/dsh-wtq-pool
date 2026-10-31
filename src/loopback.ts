@@ -196,6 +196,9 @@ const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
    * secret).
    */
   [/((?:\\{0,2}["']?)(?:access_?token|refresh_?token|id_?token|auth_?token|oauth_?token|api_?key|secret|token)(?:\\{0,2}["']?\s*[:=]\s*\\{0,2}["']?))(?=[A-Za-z0-9_+/.=-]{6,})(?=[A-Za-z0-9_+/.=-]*[A-Za-z_-])[A-Za-z0-9_+/.=-]+/gi, '$1[redacted]'],
+  // An address names an account as surely as its label does, and this text
+  // reaches logs and client-facing errors. Mask it before the path rules below.
+  [/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[account]'],
   [/\b[A-Za-z]:[\\/][^\r\n"'<>|]*/g, '[redacted path]'],
   [/\\\\[^\r\n"'<>|]+/g, '[redacted path]'],
   [/(['"])(\/(?!\/)[^'"\r\n]+)\1/g, '$1[redacted path]$1'],
@@ -597,6 +600,16 @@ export async function pumpToResponse(source: ReadableStream<Uint8Array>, res: Se
   if (res.writable && !res.destroyed) res.end()
 }
 
+/** The part of a reader the replay needs, so a peek can queue its last read. */
+export type ReplayReadResult =
+  | { done: false; value: Uint8Array }
+  | { done: true; value: Uint8Array | undefined }
+
+export interface ReplayReader {
+  read(): Promise<ReplayReadResult>
+  cancel(reason?: unknown): Promise<void>
+}
+
 /**
  * Replay the bytes a peek consumed, then drain the rest of the upstream.
  *
@@ -608,7 +621,7 @@ export async function pumpToResponse(source: ReadableStream<Uint8Array>, res: Se
  */
 export function replaySource(
   buffered: readonly Uint8Array[],
-  reader: ReadableStreamDefaultReader<Uint8Array>,
+  reader: ReplayReader,
   ended: boolean,
 ): ReadableStream<Uint8Array> {
   let index = 0
@@ -723,7 +736,7 @@ export function createLoopbackServer(options: {
   // down. An unhandled 'error' on the server would take the plugin's process
   // with it.
   server.on('error', (error: unknown) => {
-    options.logger?.warn?.(LOG_PREFIX + ': ' + options.label + ' server error', error)
+    options.logger?.warn?.(LOG_PREFIX + ': ' + options.label + ' server error', safeMessage(error))
   })
   return {
     ready,

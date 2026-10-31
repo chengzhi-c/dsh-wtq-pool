@@ -37,7 +37,7 @@
 
 Use local WorkBuddy, Trae and Qoder desktop sign-ins in DeepSeek Harness. WorkBuddy fails over when an account is rate-limited or out of quota. Trae and Qoder select an account per request and move on to the next sign-in on an authentication failure, a rate limit or exhausted quota, while a problem with the request itself, such as an unknown model or a malformed body, is answered as the upstream answered it. Each source has its own switch, with domestic and international accounts grouped separately.
 
-A rate limit cools for the wait the upstream stated, or the configured window when it stated none. Exhausted quota and a dead sign-in do not recover on their own: that account leaves rotation. A balance read releases an exhausted-quota hold; a successful token refresh, a fresh sign-in or a manual cooldown reset releases a refused-sign-in hold, and both lapse after six hours (WorkBuddy). The non-stream reads of credits, check-in state, the model catalogue and check-ins force one token refresh and one retry when a sign-in is refused: an account whose refresh token still works recovers on the spot and never leaves rotation, and only one whose refresh token is spent too is held. Trae and Qoder holds are accounted separately, demoting the sign-in only by the cooldown window (60 seconds by default, configurable up to 24 hours) or by the wait the upstream stated, and it is still used when it is the only one left. When the upstream host cannot be reached at all, the turn ends with a network error. When the upstream says an account's plan does not include a model (11158), that model is disabled on that account for 24 hours while its other models keep serving; if no account includes it, the turn is answered with 400.
+A rate limit cools for the wait the upstream stated, or the configured window when it stated none. Exhausted quota and a dead sign-in do not recover on their own: that account leaves rotation. A balance read releases an exhausted-quota hold; a successful token refresh, a fresh sign-in or a manual cooldown reset releases a refused-sign-in hold, and both lapse after six hours (WorkBuddy). The non-stream reads of credits, check-in state, the model catalogue and check-ins force one token refresh and one retry when a sign-in is refused: an account whose refresh token still works recovers on the spot and never leaves rotation, and only one whose refresh token is spent too is held. Trae and Qoder holds are accounted separately, demoting the sign-in only by the cooldown window (60 seconds by default, configurable up to 24 hours) or by the wait the upstream stated, and it is still used when it is the only one left. When the upstream host cannot be reached, that account is skipped for the request and the next one is tried; after two accounts fail that way, the turn ends with a network error. When the upstream says an account's plan does not include a model (11158), that model is disabled on that account for 24 hours while its other models keep serving; if no account includes it, the turn is answered with 400.
 
 ## Preview
 
@@ -49,7 +49,7 @@ The panel reads the host's `app.getAppearance()` when it loads, which fixes its 
 
 ![Dark theme](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-dark.png)
 
-The model page edits each model's display and publishing settings. A Trae directory row states only its plan default, which differs per model (116k to 400k). A model that states no larger tier is published with the measured 1M ceiling. A Trae model whose directory states a rate carries a cost tag such as `x0.79`; models whose directory states none, and every Qoder model, stay unlabelled:
+The model page edits each model's display and publishing settings. A Trae directory row states only its plan default, which differs per model (116k to 400k). A model that states no larger tier is published with a 1M ceiling. A Trae model whose directory states a rate carries a cost tag such as `x0.79`; models whose directory states none, and every Qoder model, stay unlabelled:
 
 ![Model settings](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-models.png)
 
@@ -62,10 +62,6 @@ Live preview: <https://chengzhi-c.github.io/dsh-wtq-pool/>.
 `docs/index.html` drives the actual panel code with synthetic demo data. It supports source switching, model settings and theme previews.
 
 ![Preview page](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-page.png)
-
-With `showComposerPoints` enabled, the composer toolbar shows the credits of the account behind the current model; click it to inspect that group and switch accounts. The image below is an off-screen render of the actual composer extension:
-
-![Composer credits](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-composer.png)
 
 To run the preview locally, clone the repository, run `node docs/serve.cjs`, and open the address it prints. The page cannot be opened over `file://`, because a browser will not let it read the panel files beside it.
 
@@ -83,7 +79,16 @@ To run the preview locally, clone the repository, run `node docs/serve.cjs`, and
 
 ## Install
 
-For a local package, run `pnpm install && pnpm run build && npm pack --pack-destination dist` in the source directory, then install the generated `.tgz`:
+For a local package, run these in the source directory:
+
+```powershell
+pnpm install
+pnpm run build
+New-Item -ItemType Directory -Force dist | Out-Null
+npm pack --pack-destination dist
+```
+
+Then install the generated `.tgz`:
 
 ```powershell
 $package = (Get-ChildItem .\dist\*.tgz | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
@@ -117,7 +122,7 @@ To back them up, copy the `signins/` directory, which already has the format a b
 - **Connection check**: reports line by line whether each gateway is listening, how many models its catalogue returned, whether the registered address matches the one actually bound, and whether the host accepted each provider, and can copy the whole report.
 - **Growth centre**: applies to WorkBuddy only. It lists one row per account, and expanding a row shows that account's streak tiers. "Read state" reads the current tiers and what is due; "Run now" claims them and runs the growth stage, reporting every step: the make-up card, the gift and compensation, the activity report, and the streak tiers with their draws. An account whose sign-in the upstream refused is skipped in that round.
 
-Check-in runs per account, or for a whole source from the title bar. Automatic check-in is off by default; when on it claims at 09:00 (Beijing time), and a slot missed earlier the same day is still claimed at the next start, while one from a previous day is not. Trae's daily check-in is once per device; Qoder's new round opens at 10:00 (Beijing time). An account whose sign-in the upstream refused is skipped in that round.
+Check-in runs per account, or for a whole source from the title bar. Automatic check-in is off by default; when on it claims at 09:00 (Beijing time), and a slot missed earlier the same day is still claimed at the next start, while one from a previous day is not. Trae's daily check-in is once per device; Qoder CN's new round opens at 10:00 (Beijing time). The international WorkBuddy, Trae and Qoder services have no daily check-in, and the panel shows no check-in entry for them. An account whose sign-in the upstream refused is skipped in that round.
 
 The domestic WorkBuddy host refuses conversational requests whose client identifies itself as DeepSeek Harness (11128, channel check failed), whether the refusal arrives as HTTP 400 or as a JSON envelope with HTTP 200. When it lands, the plugin folds the system messages into the first user message and retries once; the client name is also removed from assistant history, because the channel check reads assistant turns too. An accepted prompt is remembered per region, so the same prompt does not pay that round trip again. Check-in, the growth centre and the keep-alive use their own endpoints.
 
@@ -169,9 +174,9 @@ The PI-Desktop edition uses a separate range starting at 41831, so both plugins 
 
 The plugin reads the vendors' local sign-in files. Providers are registered at runtime; the host persists plugin settings in the profile. Tokens are held by the plugin and go only to the relevant vendor endpoints. Gateways listen on `127.0.0.1`; the panel accepts loopback requests only.
 
-The plugin's own data directory, `~/.dsh/dsh-wtq-pool/` (or `$DSH_HOME` when set), holds four files (a `deleted-signins.json.lock` appears for a moment while the delete record is written). `checkin-slots.json` records the check-in slots already collected and the pending Qoder retry time; slots are kept for three days. `doctor.txt` is the most recent connection report, item by item, and names no account. `credentials-archive.json` keeps the sign-ins a later account switch overwrote, access tokens included, by token expiry, dropping each 30 days after it. `deleted-signins.json` records deleted sign-ins as a token digest, the sign-in's issue time and a delete time, so a scan cannot take the same superseded snapshot back over from the desktop app; the entry lapses once that account signs in again.
+The plugin's own data directory, `~/.dsh/dsh-wtq-pool/` (or `$DSH_HOME` when set), holds four files (a `deleted-signins.json.lock` appears for a moment while the delete record is written). `checkin-slots.json` records the check-in slots already collected and the pending Qoder retry time; slots are kept for three days. `doctor.txt` is the most recent connection report, item by item, and lists no account label. `credentials-archive.json` keeps the sign-ins a later account switch overwrote: access and refresh tokens, account identifiers (nickname, uin/uid, enterprise id) and the local sign-in path. Entries are kept by token expiry, dropping each 30 days after it; an entry with no stated expiry is kept until the account is deleted. `deleted-signins.json` records deleted sign-ins as a token digest, the sign-in's issue time and a delete time, so a scan cannot take the same superseded snapshot back over from the desktop app; the entry lapses once that account signs in again. These files carry no additional encryption; access is bounded by the operating system's file ACLs.
 
-Every sign-in the plugin writes lives in `signins/` beside it: ones added from the panel, snapshots adopted from the desktop app, and renewed copies. Each file is named after the account's billing identity and read on the same terms as a desktop sign-in. "Delete" in the panel removes that file together with its archive entry, and the snapshot the desktop app left behind stops being adopted; signing the account in again brings it back. "Remove" only disables the account, and "Removed accounts" restores it.
+Every sign-in the plugin writes lives in `signins/` beside it: ones added from the panel, snapshots adopted from the desktop app, and renewed copies. Each file is named after the account's billing identity and read on the same terms as a desktop sign-in. These files are not additionally encrypted either; access is bounded by the operating system's file ACLs. "Delete" in the panel removes that file together with its archive entry, and the snapshot the desktop app left behind stops being adopted; signing the account in again brings it back. "Remove" only disables the account, and "Removed accounts" restores it.
 
 The plugin sends requests only to the vendor endpoints; panel links open only when clicked.
 

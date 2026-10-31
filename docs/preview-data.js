@@ -42,6 +42,28 @@
       failed: 0,
       noToken: 0,
     },
+    // A completed growth read, so the centre shows its figures instead of
+    // asking the reader to press "read" in a still screenshot.
+    growth: {
+      read: {
+        readAt: Date.now(),
+        accounts: 5,
+        failed: 0,
+        rows: [
+          { id: 'wb-cn-1', label: 'lin.cn@example.com', region: 'cn', days: 12, tiers: 2, makeupCards: 2, lottery: 1, nextTier: 'Lv.4', nextTierRemaining: 3,
+            tierList: [
+              { tier: 'Lv.2', days: 30, credit: 100, energy: 20, status: 'unlocked' },
+              { tier: 'Lv.3', days: 60, credit: 200, energy: 40, status: 'locked' },
+            ] },
+          { id: 'wb-cn-2', label: 'du.cn@example.com', region: 'cn', days: 5, tiers: 1, makeupCards: 0, lottery: 1,
+            tierList: [{ tier: 'Lv.2', days: 30, credit: 100, energy: 20, status: 'locked' }] },
+          { id: 'wb-cn-3', label: 'wu.cn@example.com', region: 'cn', days: 3, tiers: 0, makeupCards: 1, lottery: 0, tierList: [] },
+          { id: 'wb-cn-4', label: 'qi.cn@example.com', region: 'cn', days: 1, tiers: 0, makeupCards: 0, lottery: 0, failed: true },
+          { id: 'wb-global-1', label: 'lin.ai@example.com', region: 'global', days: 8, tiers: 1, makeupCards: 1, lottery: 0,
+            tierList: [{ tier: 'Lv.3', days: 60, credit: 200, energy: 40, status: 'locked' }] },
+        ],
+      },
+    },
     preferredAccountIds: { cn: 'wb-cn-1', global: '' },
     removedAccounts: [],
     declaration: { ok: true, changed: false, providerCount: 6 },
@@ -157,7 +179,7 @@
           total: 6400,
           packages: [{ nameKey: 'credits.planQuota', remain: 6400, size: 10000, monthly: true, refreshAtMs: ms(17) }],
         },
-        checkin: { active: true, todayCheckedIn: false, streakDays: 2, dailyCredit: 20, todayCredit: 0 },
+        checkin: { active: false, todayCheckedIn: false, streakDays: 0, dailyCredit: 100, todayCredit: 0 },
       },
     ],
 
@@ -301,7 +323,7 @@
         {
           label: 'Qoder Global', region: 'global', expiresAt: ms(5), expired: false,
           usage: { plan: { name: 'Trial', inTrial: true } },
-          checkin: { active: true, todayCheckedIn: false, opensAtHour: 10, amount: 50, unit: 'credits' },
+          checkin: { active: false, todayCheckedIn: false },
         },
       ],
       gateways: [

@@ -67,7 +67,7 @@ export interface WorkBuddyShimOptions {
  * `./loopback` — one copy, shared with the Trae and Qoder gateways.
  */
 import { boundedRetryAfterSeconds, channelCheckRefusal, createLoopbackServer, guardsPass, isJsonContentType, listedModels, PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, readRequestBody, relayStreamOf, requestPathname, safeMessage, unapprovedChannelRefusal, writeChunk, writeJson, writeOpenAIError } from './loopback'
-import { LOG_PREFIX } from './log'
+import { LOG_PREFIX, accountLogTag } from './log'
 
 /** Whether one SSE data frame carries a non-null `finish_reason`. */
 function carriesFinishReason(data: string): boolean {
@@ -103,6 +103,17 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
  * without a restart.
  */
 const MODEL_TIER_HOLD_MS = 24 * 60 * 60 * 1000
+
+/**
+ * How many accounts one request may lose to a transport failure.
+ *
+ * Rotation is still worth one retry: a global pool can hold sign-ins served by
+ * different gateways, so one unreachable host says nothing about the next
+ * account. A host-wide outage, however, would otherwise cost one headers
+ * timeout per sign-in before the client saw an answer, so the second failure
+ * ends the turn.
+ */
+const MAX_TRANSPORT_ATTEMPTS = 2
 
 /**
  * The business code an account-level 200 envelope carries.
@@ -145,6 +156,8 @@ function conversationKeyOf(raw: string): string | undefined {
   }
   return undefined
 }
+
+const EMPTY_STREAM_REFUSAL = 'workbuddy returned an empty answer stream'
 
 /**
  * Read enough of a 200 body to tell an SSE stream from a refusal wearing a 200.
@@ -190,7 +203,7 @@ async function peekAnswerHead(
   }
   const trimmed = text.replace(/^\uFEFF/, '').trim()
   if (trimmed === '' && ended) {
-    return { head, ended, refusal: 'workbuddy returned an empty answer stream' }
+    return { head, ended, refusal: EMPTY_STREAM_REFUSAL }
   }
   if (!jsonLooking) return { head, ended }
   try {
@@ -392,7 +405,6 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
   const { pool, client, catalog } = options
   const region = options.region
   const logger = options.logger
-  const maxAttempts = 8
 
   const server = createLoopbackServer({ port: options.port, label: 'workbuddy shim', handle, logger })
   const ready = server.ready
@@ -474,19 +486,27 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       return
     }
 
-    const tried: string[] = []
+    let tried = 0
     // Accounts whose sign-in could not be refreshed during this request. They
     // stay available for later requests, but retrying one here only repeats the
     // same failed round trip and starves the healthy accounts behind it.
     const skipped = new Set<string>()
     let last: { kind: UpstreamErrorKind; status: number; message: string } | undefined
     let exhaustedByRateLimit = false
+    let transportAttempts = 0
     // Built on first use: the retry below is the only caller, and the answer does
     // not change inside one request. Every request would otherwise pay a full
     // parse+stringify of the whole conversation for a branch almost none take.
     let effortFallback: string | undefined
     let effortFallbackBuilt = false
 
+    // One attempt per account plus two retries, and never fewer than the old
+    // eight: a pool larger than the cap used to stop before trying its tail, so
+    // a healthy account could sit behind eight rate-limited ones forever.
+    // Transport failures have their own, much smaller cap: they say nothing
+    // about the account, and a host-wide outage must not cost one timeout per
+    // sign-in.
+    const maxAttempts = Math.max(8, pool.list(region).length + 2)
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (controller.signal.aborted) return
 
@@ -520,14 +540,26 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
               ? 'pick another model, or add an account whose plan includes it'
               : last.kind === 'account_restricted'
                 ? 'appeal the restriction in the WorkBuddy console, or add another account'
-                : last.kind === 'transport'
-                  ? 'check the connection to the upstream host'
-                  : 'sign in again in the desktop app'
+                : last.kind === 'waf_block'
+                  ? 'wait for the upstream gateway block to clear, or change network'
+                  : last.kind === 'transport'
+                    ? 'check the connection to the upstream host'
+                    : last.kind === 'hard_credit'
+                      ? 'top up the account, or add another account'
+                      : 'sign in again in the desktop app'
+          // A client that reads `Retry-After` should not have to guess the
+          // window from prose. Every account is cooling by now, so the pool can
+          // name the soonest one that comes back.
+          if (last.kind === 'soft_rate') {
+            const live = pool.list(region).filter(candidate => !pool.isDisabled(candidate.id))
+            const wait = unavailableAnswer(pool, live, Date.now(), modelId).retryAfterSeconds
+            if (wait !== undefined) res.setHeader('Retry-After', String(wait))
+          }
           writeOpenAIError(
             res,
             KIND_STATUS[last.kind],
             last.kind,
-            `${subject} (tried ${tried.length}: ${tried.join(', ')}); ` +
+            `${subject} (tried ${tried} account(s)); ` +
               `${advice} — ${last.message.slice(0, 200)}`,
           )
           return
@@ -542,7 +574,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
             res,
             403,
             'accounts_switched_off',
-            `every account for this gateway is switched off in the plugin panel (${switchedOff.map(account => account.label).join(', ')}); switch one back on`,
+            `every account for this gateway is switched off in the plugin panel; switch one back on`,
           )
           return
         }
@@ -566,7 +598,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         )
         return
       }
-      tried.push(account.label)
+      tried += 1
 
       let result = await client.chatStream(account.credential, prepared, controller.signal)
       let refreshOutcome: 'refreshed' | 'refused' | 'failed' | undefined
@@ -578,7 +610,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           // sign-in. Parking the account for six hours over one bad round trip
           // took a healthy account out of rotation, so the next account gets
           // the turn and this one stays available.
-          logger?.warn?.(`${LOG_PREFIX}: ${account.label} could not refresh its sign-in; trying the next account without holding it`)
+          logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} could not refresh its sign-in; trying the next account without holding it`)
           skipped.add(account.id)
           last = {
             kind: 'transport',
@@ -622,6 +654,10 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         let sawDone = false
         let sawFinish = false
         let envelopeFailure: UpstreamErrorKind | undefined
+        // A read that died before any byte was written. The relay cannot answer
+        // this in-band because no header has been sent yet; the outer loop is
+        // where the next account lives.
+        let headFailure: string | undefined
         const decoder = new TextDecoder()
         const sse = new SseDecoder()
         const startStream = (): void => {
@@ -703,7 +739,15 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
             ended = peeked.ended
             if (peeked.refusal !== undefined) {
               await reader.cancel().catch(() => {})
-              logger?.warn?.(`${LOG_PREFIX}: ${account.label} answered 200 with no stream: ${peeked.refusal}`)
+              // A 200 whose body ended before the first byte is the same
+              // pre-first-byte failure as a reset: no header was sent, so the
+              // next account can still take the turn.
+              if (peeked.ended && peeked.refusal === EMPTY_STREAM_REFUSAL) {
+                headFailure = peeked.refusal
+                logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} answered 200 with an empty stream; rotating`)
+                return
+              }
+              logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} answered 200 with no stream: ${peeked.refusal}`)
               // A prompt-screen refusal is the request's, not the account's:
               // rotating spends every sign-in and still answers the same way.
               if (peeked.code === '11128' || unapprovedChannelRefusal(peeked.refusal) !== undefined) {
@@ -762,14 +806,16 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
               return
             }
           } catch (error: unknown) {
-            // A stream that dies before its first byte is the same mid-flight
-            // failure one frame later, so it ends in the same place: the client
-            // gets headers, an error frame and a terminator it can finish on.
-            startStream()
-            failInBand(error)
+            // A stream that dies before its first byte has not committed a 200:
+            // no header has been written, so this is still an account attempt
+            // that can fail over. Answering it in-band ended the turn on the
+            // first sign-in even when a healthy one was queued behind it.
+            await reader.cancel().catch(() => {})
+            headFailure = safeMessage(error)
+            logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} failed before its first byte; rotating`)
             return
           }
-          logger?.info?.(`${LOG_PREFIX}: served by ${account.label}`)
+          logger?.info?.(`${LOG_PREFIX}: served by ${accountLogTag(account.label)}`)
           startStream()
           let headIndex = 0
           try {
@@ -836,6 +882,17 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           }
         })()
         await relayLoop
+        if (headFailure !== undefined) {
+          // Still before the first client byte: the account is skipped for this
+          // request and the next one gets the turn, unless this is already the
+          // second transport failure and the host itself is unreachable.
+          last = { kind: 'transport', status: 502, message: headFailure }
+          exhaustedByRateLimit = true
+          skipped.add(account.id)
+          transportAttempts += 1
+          if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
+          continue
+        }
         // The peek found an account-level refusal before any byte was sent, so
         // the hold above is already applied and the next account gets the turn.
         if (envelopeFailure === undefined) return
@@ -864,17 +921,24 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
        * configured window rather than a hold that would park a healthy account
        * for hours over a transient block.
        *
-       * A `transport` failure is the network path's, not the account's, so the
-       * rotation stops: every account here reaches the same host, and trying
-       * each one just spends another header timeout before answering. An
-       * `aborted` turn is the client's own doing and stops the loop too.
+       * A `transport` failure is the network path's. A global pool need not
+       * share a host: `codebuddy.ai` and `workbuddy.ai` logins can be served by
+       * different gateways, so one unreachable host says nothing about the next
+       * account. It is skipped for this request and rotation continues, up to
+       * `MAX_TRANSPORT_ATTEMPTS`: past that the host itself is down, and one
+       * headers timeout per sign-in is not a better answer.
+       * An `aborted` turn is the client's own doing and stops the loop.
        */
       if (result.kind === 'aborted') break
 
       if (result.kind === 'transport') {
         last = { kind: result.kind, status: result.status, message: result.message }
         exhaustedByRateLimit = true
-        break
+        skipped.add(account.id)
+        transportAttempts += 1
+        if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
+        logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} transport failure; rotating`)
+        continue
       }
 
       if (result.kind !== 'soft_rate' && result.kind !== 'waf_block'
@@ -936,7 +1000,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         pool.penalize(account.id)
       }
       logger?.warn(
-        `${LOG_PREFIX}: ${account.label} ${result.kind} on ${modelId} ` +
+        `${LOG_PREFIX}: ${accountLogTag(account.label)} ${result.kind} on ${modelId} ` +
           `(attempt ${attempt + 1}/${maxAttempts}); rotating`,
       )
     }
@@ -972,7 +1036,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       res,
       KIND_STATUS[last.kind],
       last.kind,
-      `workbuddy upstream ${last.kind} (http ${last.status}) after ${tried.length} account(s) [${tried.join(' → ')}]: ${last.message.slice(0, 400)}`,
+      `workbuddy upstream ${last.kind} (http ${last.status}) after ${tried} account(s): ${last.message.slice(0, 400)}`,
     )
   }
 

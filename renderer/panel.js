@@ -30,7 +30,7 @@ var EN = {
   "tab.check": "Connection check",
   "tab.growth": "Growth centre",
   "risk.note": "! A ban is possible. Use at your own discretion; no liability accepted !",
-  "host.missing": "The host has not registered {count} model group(s) from this plugin yet: reload the plugin so it re-reads the declaration.",
+  "host.missing": "The host has not registered {count} model group(s) from this plugin yet: reload the plugin.",
   "btn.rescan": "Detect accounts again",
   "btn.reset": "Clear all cooldowns",
   "btn.refresh": "Refresh",
@@ -57,6 +57,7 @@ var EN = {
   "pool.allRefused": "Every account's sign-in was refused by the upstream; add one with Add account and the pool starts working again.",
   "pool.restricted": "{count} restricted by the upstream",
   "pool.allRestricted": "Every account was restricted by the upstream; appeal the restriction in the WorkBuddy console, or add another account.",
+  "pool.allSwitchedOff": "Every account is switched off; switch one on to serve requests.",
   "pool.checkinAll": "Check in every account",
   "pool.checkinAllHint": "Collect every account's daily check-in. The streak bonus is collected with it.",
   "pool.checkinAllBusy": "Checking in…",
@@ -102,9 +103,8 @@ var EN = {
   "source.quotaUnknown": "usage unavailable",
   "source.checkedIn": "Checked in today",
   "source.claimable": "Can claim today",
-  "source.noCampaign": "no daily check-in",
   "source.campaignUnknown": "check-in state unavailable",
-  "source.claimableAt": "Can claim after {time}",
+  "source.claimableAt": "Can claim after {time} Beijing time",
   "source.deviceCheckedIn": "This device checked in today",
   "qoder.fallback": "preferred port {port} is taken; this session serves a spare port, which the provider row follows",
   "badge.next": "next up",
@@ -173,7 +173,6 @@ var EN = {
   "checkin.daily": "+{credit} credits/day",
   "checkin.bonus": "day {days} bonus +{credit}",
   "checkin.claimed": "claimed +{credit} credits",
-  "checkin.inactive": "check-in is not available for this account",
   "checkin.claiming": "Checking in…",
   "models.serviceModels": "Models for this service",
   "models.fetchModelList": "Fetch list",
@@ -318,7 +317,7 @@ var ZH = {
   "tab.check": "连接检查",
   "tab.growth": "成长中心",
   "risk.note": "！可能有封号风险，请斟酌使用，概不负责 ！",
-  "host.missing": "宿主还没有注册本插件的 {count} 个模型组：重新加载插件让它重读声明。",
+  "host.missing": "宿主还没有注册本插件的 {count} 个模型组：重新加载插件。",
   "btn.rescan": "重新检测账号",
   "btn.reset": "清除所有冷却",
   "btn.refresh": "刷新",
@@ -345,6 +344,7 @@ var ZH = {
   "pool.allRefused": "所有账号的登录都已被上游拒绝，用「添加账号」重新登录一个，号池就能继续用。",
   "pool.restricted": "{count} 个被上游限制",
   "pool.allRestricted": "所有账号都被上游限制了；请到 WorkBuddy 官方后台申诉，或换一个账号。",
+  "pool.allSwitchedOff": "所有账号都已停用，重新启用一个即可继续服务。",
   "pool.checkinAll": "全部签到",
   "pool.checkinAllHint": "一次领完所有账号今天的签到，连登奖励也随这一轮领取。",
   "pool.checkinAllBusy": "签到中…",
@@ -390,12 +390,11 @@ var ZH = {
   "source.checkedIn": "今日已签到",
   "source.claimable": "今日可签到",
   "source.noAccounts": "未找到本机登录",
-  "source.noCampaign": "该账号无签到活动",
   "source.campaignUnknown": "签到状态读取失败",
   "source.deviceCheckedIn": "本机今日已签到",
   "qoder.fallback": "首选端口 {port} 被占用，本次改听备用端口，供应商行跟随本次地址",
   "badge.next": "下一个",
-  "source.claimableAt": "{time} 后可签到",
+  "source.claimableAt": "北京时间 {time} 后可签到",
   "badge.cooling": "冷却中",
   "badge.revoked": "需重新登录",
   "badge.healthy": "可用",
@@ -461,7 +460,6 @@ var ZH = {
   "checkin.daily": "每天 +{credit} 积分",
   "checkin.bonus": "第 {days} 天额外 +{credit}",
   "checkin.claimed": "已领取 +{credit} 积分",
-  "checkin.inactive": "该账号没有签到活动",
   "checkin.claiming": "签到中…",
   "models.serviceModels": "该服务的模型",
   "models.fetchModelList": "获取列表",
@@ -824,6 +822,10 @@ var draft = null;
 var draftSlot = null;
 var busy = null;           // id of the control awaiting a response
 var checkinBusy = null;
+// Set when the host answers "still running" to a batch claim. The polling loop
+// clears the banner once the pass lands, so it does not say "checking in" for
+// the rest of the session.
+var checkinBusyNote = false;
 /** Set while a panel login is waiting on the browser, so its button reads as busy. */
 var loginBusy = false;
 /** The URL of the login in flight, so the button can offer it again. */
@@ -879,9 +881,12 @@ function renderHeader() {
   var cooling = accounts.filter(isCooling).length;
   var refused = accounts.filter(function (a) { return a.hold === "session"; }).length;
   var restricted = accounts.filter(function (a) { return a.hold === "restricted"; }).length;
-  // A pool whose every account is refused has nobody to serve a turn, so the
-  // dot must not read healthy just because a refused sign-in is not cooling.
-  var healthy = accounts.length > 0 && cooling + refused + restricted < accounts.length;
+  // A pool whose every account is refused, restricted or switched off has
+  // nobody to serve a turn, so the dot must not read healthy just because none
+  // of them is cooling.
+  var healthy = accounts.some(function (a) {
+    return a.disabled !== true && !isCooling(a) && a.hold !== "session" && a.hold !== "restricted";
+  });
   var refreshing = state !== null && state.refreshing === true;
   var dot = $("healthDot");
   dot.className = "dot " + (state === null ? "idle" : (healthy ? "ok" : "idle")) + (refreshing ? " busy" : "");
@@ -1167,18 +1172,24 @@ function renderWorkbuddyHead() {
   host.appendChild(el("span", "muted", t("pool.summary", { count: accounts.length, cooling: cooling })));
 
   // Collecting every reward is the reason a multi-account pool exists, so it is
-  // one button rather than a click per account card.
+  // one button rather than a click per account card. It acts on the whole pool,
+  // so it stays while any region still has a campaign and goes when none does.
+  var offerCheckin = accounts.some(function (account) {
+    return account.checkin && (account.checkin.active === true || account.checkin.todayCheckedIn === true);
+  });
   var claimable = accounts.filter(function (account) {
     return account.disabled !== true && account.checkin && account.checkin.active === true
       && account.checkin.todayCheckedIn !== true;
   }).length;
-  var allButton = el("button", "ghost small checkin-all ic-calendar" + (checkinBusy === "all" ? " is-busy" : ""),
-    checkinBusy === "all" ? t("pool.checkinAllBusy") : t("pool.checkinAll"));
-  allButton.type = "button";
-  allButton.title = t("pool.checkinAllHint");
-  allButton.disabled = busy !== null || checkinBusy !== null || claimable === 0;
-  allButton.addEventListener("click", claimAllCheckins);
-  host.appendChild(allButton);
+  if (offerCheckin) {
+    var allButton = el("button", "ghost small checkin-all ic-calendar" + (checkinBusy === "all" ? " is-busy" : ""),
+      checkinBusy === "all" ? t("pool.checkinAllBusy") : t("pool.checkinAll"));
+    allButton.type = "button";
+    allButton.title = t("pool.checkinAllHint");
+    allButton.disabled = busy !== null || checkinBusy !== null || claimable === 0;
+    allButton.addEventListener("click", claimAllCheckins);
+    host.appendChild(allButton);
+  }
 
   // Adding an account from here, rather than only from the desktop app: a user
   // with no WorkBuddy install on this machine had no way into the pool at all.
@@ -1215,9 +1226,11 @@ function renderPoolStrip() {
   var usable = accounts.filter(function (a) { return a.disabled !== true && !a.cooling; }).length;
   var noteText = accounts.length === 0
     ? ""
-    : usable <= 0
-      ? (restricted > 0 && refused === 0 ? t("pool.allRestricted") : refused > 0 ? t("pool.allRefused") : t("pool.allCooling"))
-      : t("pool.healthy");
+    : off === accounts.length
+      ? t("pool.allSwitchedOff")
+      : usable <= 0
+        ? (restricted > 0 && refused === 0 ? t("pool.allRestricted") : refused > 0 ? t("pool.allRefused") : t("pool.allCooling"))
+        : t("pool.healthy");
   if (noteText) strip.appendChild(el("span", "muted", noteText));
   if (refused > 0) strip.appendChild(el("span", "finding-fail", t("pool.refused", { count: refused })));
   if (restricted > 0) strip.appendChild(el("span", "finding-fail", t("pool.restricted", { count: restricted })));
@@ -1242,7 +1255,7 @@ function sourceToggle(source, on) {
 }
 
 /** Shared head row for one non-pool source: its name and its own check-in pool. */
-function sourceGroupHead(source, titleKey, count, claimable, busyHere) {
+function sourceGroupHead(source, titleKey, count, claimable, busyHere, offerCheckin) {
   var head = el("div", "source-head");
   head.appendChild(el("strong", null, t(titleKey)));
   head.appendChild(el("span", "muted", t("source.accountCount", { count: count })));
@@ -1253,8 +1266,22 @@ function sourceGroupHead(source, titleKey, count, claimable, busyHere) {
   allButton.disabled = busy !== null || checkinBusy !== null || claimable === 0
     || (state.sources || {})[source] !== true;
   allButton.addEventListener("click", function () { claimSourceCheckins(source); });
-  head.appendChild(allButton);
+  if (offerCheckin !== false) head.appendChild(allButton);
   return head;
+}
+
+/**
+ * Whether an account has a check-in surface worth drawing.
+ *
+ * Qoder's international service lists promotion campaigns but no daily
+ * CLAIM_BENEFIT round, so its accounts carry `active: false` and no opening
+ * hour. Drawing a disabled button and "no check-in" line for those accounts
+ * reads as a broken control; the card simply has no check-in.
+ */
+function checkinOffered(checkin) {
+  return checkin !== undefined && checkin !== null
+    && (checkin.active === true || checkin.todayCheckedIn === true
+      || typeof checkin.opensAtHour === "number" || checkin.campaignsUnavailable === true);
 }
 
 /** One non-pool account card: its own quota figure and today's check-in. */
@@ -1305,7 +1332,7 @@ function sourceAccountCard(account, kind) {
   }
 
   var checkin = account.checkin;
-  if (checkin) {
+  if (checkinOffered(checkin)) {
     var row = el("div", "checkin");
     row.appendChild(el("span", "card-title", t("checkin.title")));
     // Trae allows one check-in per device per day, so an account can be unclaimed
@@ -1324,7 +1351,7 @@ function sourceAccountCard(account, kind) {
       : deviceDone ? t("source.deviceCheckedIn")
         : opensLabel !== "" ? opensLabel
           : checkin.campaignsUnavailable === true ? t("source.campaignUnknown")
-            : checkin.active ? t("source.claimable") : t("source.noCampaign")));
+            : t("source.claimable")));
     if (!doneToday && checkin.active && checkin.amount > 0) {
   row.appendChild(el("span", "muted", checkin.amount + " "
     + (checkin.unit === undefined || checkin.unit === "credits" ? t("credits.keepUnit") : checkin.unit)));
@@ -1339,8 +1366,10 @@ function sourceAccountCard(account, kind) {
     var claim = el("button", "primary small" + (busyHere ? " is-busy" : ""),
       busyHere ? t("checkin.claiming") : idleLabel);
     claim.type = "button";
+    claim.setAttribute("aria-label", (busyHere ? t("checkin.claiming") : idleLabel) + ": " + account.label);
     claim.disabled = busyHere || checkinBusy !== null || busy !== null
-      || checkin.active !== true || doneToday || deviceDone || opensLabel !== "";
+      || checkin.active !== true || doneToday || deviceDone || opensLabel !== ""
+      || account.expired === true;
     claim.addEventListener("click", function () { claimSourceCheckin(kind, account); });
     row.appendChild(claim);
     card.appendChild(row);
@@ -1459,7 +1488,15 @@ function renderSourceStrip(source) {
       // account rows grey their button out for the same reason.
       && account.checkin.deviceCheckedIn !== true;
   }).length;
-  host.appendChild(sourceGroupHead(source, section.title, accounts.length, on ? claimable : 0, checkinBusy === source));
+  if (regions.indexOf(activeRegionOf(source)) < 0) setActiveRegion(source, regions[0]);
+  var region = activeRegionOf(source);
+  // An international region has no daily round. Hiding the source-wide button
+  // there keeps it from reading as an action on the accounts below.
+  var offerCheckin = accounts.some(function (account) {
+    return account.region === region && checkinOffered(account.checkin);
+  });
+  host.appendChild(sourceGroupHead(source, section.title, accounts.length, on ? claimable : 0,
+    checkinBusy === source, offerCheckin));
   if (!on) {
     host.appendChild(el("p", "hint", t(section.off)));
     // The switch stays here while the source is off, because that is the only
@@ -1467,12 +1504,14 @@ function renderSourceStrip(source) {
     host.appendChild(sourceFoot(source));
     return;
   }
-  if (regions.indexOf(activeRegionOf(source)) < 0) setActiveRegion(source, regions[0]);
-  var region = activeRegionOf(source);
   host.appendChild(sourceRegionNav(source, regions, accounts));
   // One short line about this source's own sign-in rules, where the accounts are.
   if (section.note) host.appendChild(el("p", "hint", t(section.note)));
-  if (section.checkinNote) host.appendChild(el("p", "hint", t(section.checkinNote)));
+  // The device rule is about the daily check-in; an international region has
+  // none, so the line would describe a button that is not on the page.
+  if (section.checkinNote && section.checkinRegions.indexOf(region) >= 0) {
+    host.appendChild(el("p", "hint", t(section.checkinNote)));
+  }
   if (regionParked(source, region)) {
     host.appendChild(parkedRegionBlock(source, region));
     host.appendChild(sourceFoot(source));
@@ -1519,9 +1558,13 @@ function claimSourceCheckins(source) {
     note(null);
     render();
     if (payload && payload.running === true) {
-      // The pass outlived the plugin's answer and is still collecting: the
-      // the panel reports it when it lands.
-      announce(t("pool.checkinAllBusy"));
+      // The pass outlived the plugin's answer and is still collecting. Say so
+      // on the visible page; the rows follow when it lands. If the pass never
+      // started (another pass owns the accounts), the poll below clears the
+      // banner immediately rather than leaving it up for the session.
+      checkinBusyNote = true;
+      note(t("pool.checkinAllBusy"));
+      pollCheckinLog(0);
       return;
     }
     var counts = payload ? payload[source] : null;
@@ -1531,10 +1574,10 @@ function claimSourceCheckins(source) {
     // today": the counts carry `failed` (and the reason), a source whose round
     // threw carries none of its own, and the panel read the missing number as
     // "nothing to collect". The user was told the day was done while nothing
-    // had been collected.
-    announce(failed > 0
-      ? checkinFailureText(claimed, failed, counts && counts.reason)
-      : claimed > 0 ? t("pool.checkinAllDone", { count: claimed }) : t("pool.checkinAllNone"));
+    // had been collected. The same answer has to be visible, not only announced.
+    if (failed > 0) note(checkinFailureText(claimed, failed, counts && counts.reason), "warn");
+    else if (claimed === 0) note(t("pool.checkinAllNone"));
+    else announce(t("pool.checkinAllDone", { count: claimed }));
   }).catch(function (error) {
     checkinBusy = null;
     note(String(error && error.message ? error.message : error));
@@ -1654,12 +1697,20 @@ function claimSourceCheckin(source, account) {
     .then(function (payload) {
       checkinBusy = null;
       if (payload && payload.state) adopt(payload.state);
+      note(null);
       var result = payload && payload.result ? payload.result : {};
       // A skipped claim can carry the upstream's own reason (Trae answers 9095
-      // "this device already checked in today"), which is worth reading.
-      if (result.outcome === "claimed") announce(t("source.checkinDone"));
-      else if (result.deviceCheckedIn === true) announce(t("source.deviceCheckedIn"));
-      else announce(result.reason || t("source.checkinSkipped"));
+      // "this device already checked in today"), which is worth reading. A
+      // skipped claim used to reach the screen reader only, so the button looked
+      // inert; the banner now says why on the visible page.
+      //
+      // A click can also land on a row the automatic pass has already collected:
+      // the host answers `skipped` with `todayCheckedIn`. The account is in the
+      // state the click asked for, so that is a success here, not the "already
+      // collected" wording that made the click look like it did nothing.
+      if (result.outcome === "claimed" || result.todayCheckedIn === true) note(t("source.checkinDone"));
+      else if (result.deviceCheckedIn === true) note(t("source.deviceCheckedIn"));
+      else note(result.reason || t("source.checkinSkipped"));
       render();
     }).catch(function (error) {
       checkinBusy = null;
@@ -1760,7 +1811,7 @@ function renderAutoCheckin() {
   var run = $("autoRunNow");
   run.textContent = busy === "checkin" ? t("auto.running") : t("auto.runNow");
   run.title = t("auto.runNowHint");
-  run.disabled = busy !== null;
+  run.disabled = busy !== null || checkinBusy !== null;
 
   // The keep-alive row: one button, run by hand. It is a static node, so the
   // handler lives in `bind`. Its own card, its own log: it renews tokens rather
@@ -1981,8 +2032,7 @@ function growthStateText() {
   // A run since the last read leaves the rows holding figures from before it, so
   // the stale wording names what to do rather than claiming nothing was read.
   if (growthState === null) {
-    var last = state && state.growth ? state.growth.last : null;
-    return t(last ? "growth.stateStale" : "growth.stateNone");
+    return t(growthLastRun() !== null ? "growth.stateStale" : "growth.stateNone");
   }
   // The scheduled pass records its growth half inside the pass it belongs to, so
   // the run time comes from the same place the log line does. Requiring
@@ -2129,14 +2179,17 @@ function paintGrowthAccounts(host) {
 /** The last growth run, whichever entry point started it. */
 function growthLastRun() {
   var growth = (state && state.growth) || {};
-  if (growth.last) return growth.last;
   var auto = (state && state.autoCheckin) || {};
-  if (auto.last && auto.last.growth) {
-    // The scheduled pass records its growth half inside the pass it belongs to,
-    // so the time to show is the pass's own.
-    return { at: auto.last.at, ...auto.last.growth };
-  }
-  return null;
+  var scheduled = auto.last && auto.last.growth ? { at: auto.last.at, ...auto.last.growth } : null;
+  if (!growth.last) return scheduled;
+  if (!scheduled) return growth.last;
+  // The scheduled pass and a manual run both leave a record. Taking
+  // `growth.last` unconditionally showed the older one after a pass.
+  var manualAt = Date.parse(growth.last.at);
+  var scheduledAt = Date.parse(scheduled.at);
+  if (!Number.isFinite(scheduledAt)) return growth.last;
+  if (!Number.isFinite(manualAt)) return scheduled;
+  return scheduledAt > manualAt ? scheduled : growth.last;
 }
 
 /** Paint the growth log as rows, the way the check-in log above it is painted. */
@@ -2386,7 +2439,7 @@ function accountCard(account) {
   toggle.setAttribute("aria-checked", off ? "false" : "true");
   // The name a switch carries is the property it controls and does not change
   // with its state; the visible label already says which state it is in.
-  toggle.setAttribute("aria-label", t("acct.inPool"));
+  toggle.setAttribute("aria-label", t("acct.inPool") + ": " + account.label);
   toggle.title = off ? t("acct.switchOn") : t("acct.switchOff");
   toggle.disabled = rowBusy;
   toggle.appendChild(el("span", "acct-toggle-dot"));
@@ -2397,6 +2450,7 @@ function accountCard(account) {
   var removeBtn = el("button", "acct-remove", t("acct.remove"));
   removeBtn.id = rowKey + "-remove";
   removeBtn.type = "button";
+  removeBtn.setAttribute("aria-label", t("acct.remove") + ": " + account.label);
   removeBtn.title = t("acct.removeHint");
   removeBtn.disabled = rowBusy;
   removeBtn.addEventListener("click", function () { setAccountState(account.id, "removed"); });
@@ -2418,6 +2472,7 @@ function accountCard(account) {
     var deleteBtn = el("button", armed ? "acct-delete confirming" : "acct-delete", t(armed ? "acct.deleteConfirmAgain" : "acct.delete"));
     deleteBtn.id = rowKey + "-delete";
     deleteBtn.type = "button";
+    deleteBtn.setAttribute("aria-label", t(armed ? "acct.deleteConfirmAgain" : "acct.delete") + ": " + account.label);
     deleteBtn.title = t("acct.deleteHint");
     deleteBtn.disabled = rowBusy;
     deleteBtn.setAttribute("aria-pressed", armed ? "true" : "false");
@@ -2496,7 +2551,8 @@ function accountCard(account) {
     card.appendChild(creditsBlock(account.credits, account.id, { floor: account }));
   }
 
-  card.appendChild(checkinBlock(account));
+  var checkinCard = checkinBlock(account);
+  if (checkinCard) card.appendChild(checkinCard);
   return card;
 }
 
@@ -2687,20 +2743,22 @@ function packWhen(pack) {
 }
 
 function checkinBlock(account) {
-  var wrap = el("div", "checkin");
-  wrap.appendChild(el("span", "card-title", t("checkin.title")));
-
   // A held sign-in is not read at all, so an error here would be the previous
   // read's; the account card already carries the hold and its remedy.
   if (account.checkinError && account.hold !== "session") {
-    wrap.appendChild(el("span", "hint finding-fail", account.checkinError));
-    return wrap;
+    var failed = el("div", "checkin");
+    failed.appendChild(el("span", "card-title", t("checkin.title")));
+    failed.appendChild(el("span", "hint finding-fail", account.checkinError));
+    return failed;
   }
   var checkin = account.checkin;
-  if (!checkin) {
-    wrap.appendChild(el("span", "muted", t("checkin.inactive")));
-    return wrap;
-  }
+  // A region without a daily campaign reports no active check-in. Drawing the
+  // title, a "no check-in" line and a disabled button for it only makes the
+  // card look broken, so the whole block stays away.
+  if (!checkin || (checkin.active !== true && checkin.todayCheckedIn !== true)) return null;
+
+  var wrap = el("div", "checkin");
+  wrap.appendChild(el("span", "card-title", t("checkin.title")));
 
   if (checkin.streakDays > 0) wrap.appendChild(el("span", "muted", t("checkin.streak", { days: checkin.streakDays })));
   if (checkin.dailyCredit > 0) wrap.appendChild(el("span", "muted", t("checkin.daily", { credit: checkin.dailyCredit })));
@@ -2711,16 +2769,12 @@ function checkinBlock(account) {
     wrap.appendChild(el("span", "badge free", t("checkin.bonus", { days: milestone, credit: checkin.streakBonusCredit })));
   }
 
-  if (!checkin.active) {
-    wrap.appendChild(el("span", "muted", t("checkin.inactive")));
-    return wrap;
-  }
-
   var busyHere = checkinBusy === account.id;
   // Upstream ships the button's own label when the campaign renames it.
   var idleLabel = checkin.todayCheckedIn ? t("btn.checkinDone") : t("btn.checkin");
   var button = el("button", "primary small" + (busyHere ? " is-busy" : ""), busyHere ? t("checkin.claiming") : idleLabel);
   button.type = "button";
+  button.setAttribute("aria-label", (busyHere ? t("checkin.claiming") : idleLabel) + ": " + account.label);
   // A whole-pool claim is in flight: this account is covered by it, so the
   // per-account button must not fire a second claim.
   button.disabled = checkin.todayCheckedIn || busyHere || busy !== null || checkinBusy !== null;
@@ -2820,6 +2874,20 @@ function restorePlace(host, keep) {
   // which is now inert anyway.
   if (again.disabled === true) return;
   again.focus({ preventScroll: true });
+}
+
+/**
+ * The button, input or select an event landed on.
+ *
+ * Both the pointer and the keyboard path need the same answer: most controls are
+ * rebuilt on every render, so the element itself cannot be the memory.
+ */
+function controlUnder(node) {
+  while (node && node !== document.body) {
+    if (node.tagName === "BUTTON" || node.tagName === "INPUT" || node.tagName === "SELECT") return node;
+    node = node.parentNode;
+  }
+  return null;
 }
 
 /**
@@ -3518,6 +3586,9 @@ function field(labelKey, helpKey, control) {
   var wrap = el("div", "field");
   var head = el("div", "field-head");
   head.appendChild(el("span", "field-label", t(labelKey)));
+  // The label is a span beside the control, not a <label>, so the accessible
+  // name has to be carried by the control itself.
+  control.setAttribute("aria-label", t(labelKey));
   if (helpKey) {
     var hint = el("span", "field-help", "?");
     hint.title = t(helpKey);
@@ -3958,9 +4029,13 @@ function render() {
   }
   // A pending pass whose poll was stopped (or never started) gets its watcher
   // back here: every state adoption ends in this render, and the log row is the
-  // only thing that reports the pass as running.
+  // only thing that reports the pass as running. Once the pass has landed there
+  // is nothing left to watch, so the banner it set is cleared here as well.
   if (state && state.autoCheckin && state.autoCheckin.last && state.autoCheckin.last.pending === true) {
     pollCheckinLog(checkinPollAttempts);
+  } else if (checkinBusyNote) {
+    checkinBusyNote = false;
+    if (bannerText === t("pool.checkinAllBusy")) note(null);
   }
 }
 
@@ -4138,7 +4213,14 @@ function pageIsVisible() {
 /** Keep reading the log while a check-in pass is still marked pending. */
 function pollCheckinLog(attempts) {
   var last = state && state.autoCheckin && state.autoCheckin.last;
-  if (!last || last.pending !== true || !pageIsVisible()) { stopCheckinPoll(); return; }
+  if (!last || last.pending !== true || !pageIsVisible()) {
+    if (checkinBusyNote) {
+      checkinBusyNote = false;
+      if (bannerText === t("pool.checkinAllBusy")) note(null);
+    }
+    stopCheckinPoll();
+    return;
+  }
   // Progress is counted per pass: a new `at` starts a fresh fast window, and a
   // failure count from the previous pass would otherwise cut the new one short.
   var stamp = typeof last.at === "string" ? last.at : "";
@@ -4325,7 +4407,7 @@ function claimCheckin(accountId) {
     note(null);
     render();
     if (payload && payload.result && payload.result.credit > 0) {
-      announce(t("checkin.claimed", { credit: payload.result.credit }));
+      note(t("checkin.claimed", { credit: payload.result.credit }));
     }
   }).catch(function (error) {
     checkinBusy = null;
@@ -4345,14 +4427,16 @@ function claimAllCheckins() {
     note(null);
     render();
     if (payload && payload.running === true) {
-      announce(t("pool.checkinAllBusy"));
+      checkinBusyNote = true;
+      note(t("pool.checkinAllBusy"));
+      pollCheckinLog(0);
       return;
     }
     var claimed = payload && typeof payload.claimed === "number" ? payload.claimed : 0;
     var failed = payload && typeof payload.failed === "number" ? payload.failed : 0;
-    announce(failed > 0
-      ? checkinFailureText(claimed, failed, payload && payload.reason)
-      : claimed > 0 ? t("pool.checkinAllDone", { count: claimed }) : t("pool.checkinAllNone"));
+    if (failed > 0) note(checkinFailureText(claimed, failed, payload && payload.reason), "warn");
+    else if (claimed === 0) note(t("pool.checkinAllNone"));
+    else announce(t("pool.checkinAllDone", { count: claimed }));
   }).catch(function (error) {
     checkinBusy = null;
     note(String(error && error.message ? error.message : error));
@@ -4669,14 +4753,13 @@ function bind() {
   // re-attached on every pass. Capture phase, so it runs before the button's own
   // handler and records the press even when that handler is about to disable it.
   document.addEventListener("pointerdown", function (event) {
-    var node = event.target;
-    while (node && node !== document.body) {
-      if (node.tagName === "BUTTON" || node.tagName === "INPUT" || node.tagName === "SELECT") {
-        notePress(node);
-        return;
-      }
-      node = node.parentNode;
-    }
+    notePress(controlUnder(event.target));
+  }, true);
+  // Keyboard activation fires click without a pointerdown, so the same memory
+  // has to be filled here or Enter/Space lost the focus on the next render.
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    notePress(controlUnder(event.target));
   }, true);
 
   var viewTabs = document.querySelectorAll("#viewTabs .subtab");

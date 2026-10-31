@@ -45,7 +45,7 @@ export interface QoderGatewayOptions {
    * per-request rotation cannot do — a daily limit otherwise costs one failed
    * round trip on every single request.
    */
-  onAttemptFailure?(credential: QoderClientCredential, outcome: { status: number; kind?: QoderUpstreamErrorKind; retryAfter?: string | null }): void
+  onAttemptFailure?(credential: QoderClientCredential, outcome: { retryAfter?: string | null }): void
 }
 
 export interface QoderGateway {
@@ -229,7 +229,14 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
             // sign-in's doing, so it is excluded on the same term the WorkBuddy
             // relay uses.
             if (!(error instanceof Error && error.name === 'AbortError') && !watcher.signal.aborted) {
-              options.onAttemptFailure?.(credential, { status: 0, kind: 'server' })
+              // A classified refusal that names a wait carries it on the error,
+              // including the daily-limit and queue classes. The host only needs
+              // the wait: the account is already out of this attempt list, and
+              // the hold is what keeps it from leading the next request.
+              const seconds = (error as { retryAfterSeconds?: number }).retryAfterSeconds
+              options.onAttemptFailure?.(credential, {
+                ...typeof seconds === 'number' && seconds > 0 ? { retryAfter: String(seconds) } : {},
+              })
             }
           },
         })
@@ -286,8 +293,6 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       // The sign-in's own failure, reported before the next attempt: the host
       // keeps it out of the lead on the requests after this one.
       options.onAttemptFailure?.(credential, {
-        status: attempt.status,
-        ...attempt.kind === undefined ? {} : { kind: attempt.kind },
         ...attempt.retryAfter === undefined ? {} : { retryAfter: attempt.retryAfter },
       })
       // Only worth a line while there is someone left to rotate to.

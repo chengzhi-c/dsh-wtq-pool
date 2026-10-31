@@ -284,14 +284,19 @@ function qoderClaimableCampaignOf(payload: unknown, nowMs: number): Record<strin
   const holder = payload as { campaigns?: unknown } | null | undefined
   const list = holder?.campaigns
   if (!Array.isArray(list)) return undefined
+  let collected: Record<string, unknown> | undefined
   for (const entry of list as unknown[]) {
     if (entry === null || typeof entry !== 'object') continue
     const campaign = entry as Record<string, unknown>
     if (campaign['actionType'] !== QODER_CLAIM_BENEFIT_ACTION) continue
     if (!qoderWindowOpenAt(campaign, nowMs)) continue
-    return campaign
+    // A list can carry more than one open round (a promotion beside the daily
+    // one). Returning the first round even when it was collected hid a later
+    // claimable one and made the card say the day was already done.
+    if (campaign['claimStatus'] !== QODER_CLAIMED_STATUS) return campaign
+    if (collected === undefined) collected = campaign
   }
-  return undefined
+  return collected
 }
 /**
  * Id of today's round when it can be claimed right now, else undefined. Kept

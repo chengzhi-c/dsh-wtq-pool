@@ -768,6 +768,22 @@ test('the panel page carries a strict policy and refuses a cross-site asker', as
     req.on('error', reject)
     req.end()
   })
+  const invoke = (headers) => new Promise((resolve, reject) => {
+    const body = JSON.stringify({ channel: 'xd.state', payload: {} })
+    const req = request({
+      host: '127.0.0.1', port, path: `${PANEL_BASE}/invoke`, method: 'POST',
+      headers: {
+        Host: `127.0.0.1:${port}`, 'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body), ...headers,
+      },
+    }, (res) => {
+      let raw = ''
+      res.on('data', (chunk) => { raw += chunk })
+      res.on('end', () => resolve({ status: res.statusCode, raw }))
+    })
+    req.on('error', reject)
+    req.end(body)
+  })
   try {
     const page = await ask({})
     assert.equal(page.status, 200, 'the panel page must be served')
@@ -787,6 +803,15 @@ test('the panel page carries a strict policy and refuses a cross-site asker', as
       'a non-browser client sends neither header and must pass')
     assert.equal((await ask({ Origin: 'https://evil.example.com' })).status, 403,
       'a foreign Origin must still be refused')
+    assert.equal((await invoke({ Origin: 'https://evil.example.com' })).status, 403,
+      'a foreign Origin is refused on the bridge too')
+    assert.equal((await invoke({ Origin: `http://127.0.0.1:${port}` })).status, 200,
+      'the panel and the composer both call the bridge from a same-origin page')
+    // The desktop shell forwards `dsh-app://app` requests to this server and
+    // drops the Origin header on the way, so a bare loopback POST is the shape
+    // the real composer has. Requiring Origin refused every real panel call.
+    assert.equal((await invoke({})).status, 200,
+      'the shell strips Origin before forwarding, and that call must still be served')
   } finally {
     await new Promise((resolve) => server.close(resolve))
   }
@@ -3149,9 +3174,17 @@ test('a WorkBuddy stream that fails mid-flight ends with a terminator', async ()
     account: { uin: 'u-1', nickname: 'Fixture' },
   }))
   const pool = new WorkBuddyAccountPool({ authDirs: [dir] })
+  let sent = false
   const failing = new ReadableStream({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
+    pull(controller) {
+      // First read serves the content; the next one is the mid-flight failure.
+      // Erroring in the same task as the enqueue discards the queued chunk,
+      // which is the pre-first-byte case that now rotates instead.
+      if (!sent) {
+        sent = true
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
+        return
+      }
       controller.error(new Error('Bearer eyJhbGciOi.real.token.value rejected'))
     },
   })
@@ -3736,14 +3769,25 @@ test('the panel keeps polling while every account is cooling', () => {
     return balanced(source, start)
   }
   const mod = { exports: {} }
-  const core = { pool: { list: () => accounts, isDisabled: () => false } }
+  const disabled = new Set()
+  const regionsOff = new Set()
+  const core = { pool: { list: () => accounts, isDisabled: (id) => disabled.has(id) } }
   new Function('module', 'exports', 'require', 'core', 'regionEnabled', 'regionOf', 'probeCache', 'PROBE_TTL_MS',
     grab('cooldownPending') + '\n' + grab('probesStale') + '\nmodule.exports = { cooldownPending, probesStale };',
-  )(mod, mod.exports, require, core, () => true, () => 'cn', new Map(), 60000)
-  const accounts = [{ id: 'a', cooldownUntilMs: Date.now() + 60000 }]
+  )(mod, mod.exports, require, core, (source, region) => !regionsOff.has(source + ':' + region),
+    () => 'cn', new Map(), 60000)
+  const accounts = [{ id: 'a', credential: { domain: 'www.codebuddy.cn' }, cooldownUntilMs: Date.now() + 60000 }]
   assert.equal(mod.exports.probesStale(accounts), false, 'a cooling account is never probed')
   assert.equal(mod.exports.cooldownPending(accounts), true,
     'but the cooldown is still something the panel is waiting for')
+  disabled.add('a')
+  assert.equal(mod.exports.cooldownPending(accounts), false,
+    'a switched-off account never probes, so its cooldown is not a deadline')
+  disabled.delete('a')
+  regionsOff.add('workbuddy:cn')
+  assert.equal(mod.exports.cooldownPending(accounts), false,
+    'nor is a cooling account in a switched-off region')
+  regionsOff.delete('workbuddy:cn')
   accounts[0].cooldownUntilMs = 0
   assert.equal(mod.exports.cooldownPending(accounts), false,
     'and nothing at all when nothing is cooling')
@@ -3805,6 +3849,45 @@ test('a check-in-only probe keeps the cached balance and cannot satisfy a full r
     assert.equal(creditReads, 1, 'and does not serve the check-in-only entry as a balance')
   } finally {
     probeCache.clear()
+  }
+})
+
+/**
+ * A gateway refusal is client-facing text, so it must not name the accounts.
+ *
+ * The panel can show an account label because the user is looking at their own
+ * list; an error body also reaches other local clients and gets pasted into
+ * reports. The count is enough there, and the label never leaves the pool.
+ */
+test('a gateway refusal names no account label', async () => {
+  const { createWorkBuddyShim } = require('../src/shim.ts')
+  const { WorkBuddyCatalog } = require('../src/catalog.ts')
+  const catalog = new WorkBuddyCatalog()
+  catalog.update([{ id: 'm', name: 'M', contextWindow: 1000, maxOutputTokens: 100 }])
+  const shim = createWorkBuddyShim({
+    pool: {
+      list: () => [{ id: 'a', label: 'Secret Nickname' }],
+      isDisabled: () => true,
+      acquire: async () => undefined,
+      penalize() {},
+      refreshAccount: async () => false,
+    },
+    client: { prepareChatBody: (raw) => raw, chatStream: async () => ({ ok: false, kind: 'transport', status: 503, message: 'not reached' }) },
+    catalog,
+  })
+  try {
+    await shim.ready
+    const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const body = await answer.text()
+    assert.equal(answer.status, 403)
+    assert.match(body, /switched off/)
+    assert.doesNotMatch(body, /Secret Nickname/, 'the client-facing refusal carries no account label')
+  } finally {
+    await shim.close()
   }
 })
 

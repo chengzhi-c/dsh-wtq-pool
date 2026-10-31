@@ -94,6 +94,21 @@ test('a run from before the read leaves it current', () => {
   assert.equal(context.growthStale(), false)
 })
 
+test('the later of a manual run and a scheduled pass is the one shown', () => {
+  const context = loadFreshness()
+  const manualAt = Date.parse('2026-10-30T18:33:00.000Z')
+  const scheduledAt = Date.parse('2026-10-30T19:00:00.000Z')
+  context.state = {
+    growth: { last: { at: new Date(manualAt).toISOString(), detail: { gift: 1 } } },
+    autoCheckin: { last: { at: new Date(scheduledAt).toISOString(), growth: { detail: { makeup: 2 } } } },
+  }
+  assert.equal(context.growthLastRun().detail.makeup, 2,
+    'a scheduled pass that finished later must not be hidden behind an older manual run')
+  context.state.autoCheckin.last.at = new Date(manualAt - 1000).toISOString()
+  assert.equal(context.growthLastRun().detail.gift, 1,
+    'and the manual run still wins when it is the later one')
+})
+
 /**
  * The scheduled check-in's growth half counts as a run.
  *

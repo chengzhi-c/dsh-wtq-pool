@@ -104,6 +104,147 @@ test('every channel the panel calls is admitted by the route and answered by the
   }
 })
 
+test('the Trae batch skips only the edition whose device is spent', async () => {
+  const source = sourceOf('src/host.ts')
+  const claims = []
+  const marked = []
+  const context = vm.createContext({
+    activeTraeRegions: () => ['cn'],
+    traeStorageCandidates: () => [],
+    discoverTraeCredentials: async () => ({
+      credentials: [
+        { label: 'cn-1', edition: 'cn' },
+        { label: 'cn-2', edition: 'cn' },
+        { label: 'solo-1', edition: 'solo' },
+      ],
+    }),
+    traeRegionOfCredential: () => 'cn',
+    checkinDelay: async () => {},
+    currentCheckinSignal: () => ({ aborted: false }),
+    traeClaimFor: async (credential) => {
+      claims.push(credential.label)
+      return credential.edition === 'cn'
+        ? { outcome: 'claimed', deviceCheckedIn: true }
+        : { outcome: 'claimed' }
+    },
+    traeRowLabel: (credential) => credential.label,
+    markSourceCheckinRow: (...args) => marked.push(args),
+    TRAE_ACCOUNT_DELAY_MS: 0,
+    TRAE_ACCOUNT_JITTER_MS: 0,
+    log: () => {},
+  })
+  vm.runInContext(liftFunction(source, 'traeCheckinAll'), context)
+  const counts = await vm.runInContext('traeCheckinAll()', context)
+  assert.deepEqual(claims, ['cn-1', 'solo-1'],
+    'the second CN account is skipped, the other edition is still claimable')
+  assert.equal(counts.claimed, 2)
+  assert.equal(counts.skipped, 1)
+  const skipped = marked.find((args) => args[1] === 'cn-2')
+  assert.equal(skipped[3].outcome, 'skipped')
+  assert.equal(skipped[3].deviceCheckedIn, true)
+})
+
+/**
+ * Qoder's claim answer carries `replayed: true` on the call that collects the
+ * round. The campaign read before the POST already proved it CLAIMABLE, so the
+ * receipt is a claim; treating the flag as "skipped" made the first successful
+ * click read as already collected until the panel was refreshed.
+ */
+test('a Qoder claim receipt is a claim even when marked replayed', async () => {
+  const source = sourceOf('src/host.ts')
+  class QoderClient {
+    async fetchCampaigns() { return {} }
+    async claimCampaign() { return {} }
+  }
+  const context = vm.createContext({
+    QoderUpstreamClient: QoderClient,
+    sourceCredentialExpired: () => false,
+    qoderClientCredential: (credential) => credential,
+    qoderClaimableCampaignIdOf: () => 'daily',
+    qoderCheckinStateFrom: () => ({}),
+    qoderNormalizeClaimResult: () => ({ claimed: true, replayed: true }),
+    qoderRowLabel: () => 'fixture',
+    accountLogTag: () => 'acct-fixture',
+    qoderFailureRetryable: () => false,
+    safeMessage: String,
+    log: () => {},
+    Object, Number, String,
+  })
+  vm.runInContext(liftFunction(source, 'qoderClaimFor'), context)
+  const result = await vm.runInContext('qoderClaimFor({ region: "cn" })', context)
+  assert.equal(result.outcome, 'claimed')
+  assert.equal(result.todayCheckedIn, undefined,
+    'the card is already marked collected by the claimed outcome')
+})
+
+/**
+ * A Qoder sign-in whose token has expired is skipped before the network.
+ *
+ * The panel already disables its button for an expired row, but the batch pass
+ * still read the campaign list with the dead token and counted the 401 as a
+ * failed account: a retry the account could not satisfy, and a failure the user
+ * could not act on. Trae's pass has always parked the same case.
+ */
+test('an expired Qoder sign-in is skipped before any upstream read', async () => {
+  const source = sourceOf('src/host.ts')
+  let reads = 0
+  class QoderClient {
+    async fetchCampaigns() { reads += 1; return {} }
+    async claimCampaign() { reads += 1; return {} }
+  }
+  const context = vm.createContext({
+    QoderUpstreamClient: QoderClient,
+    sourceCredentialExpired: (credential, now) => credential.expiresAtMs <= now,
+    qoderClientCredential: (credential) => credential,
+    qoderClaimableCampaignIdOf: () => 'daily',
+    qoderCheckinStateFrom: () => ({}),
+    qoderNormalizeClaimResult: () => ({ claimed: true }),
+    qoderRowLabel: () => 'fixture',
+    accountLogTag: () => 'acct-fixture',
+    qoderFailureRetryable: () => false,
+    safeMessage: String,
+    log: () => {},
+    Object, Number, String,
+  })
+  vm.runInContext(liftFunction(source, 'qoderClaimFor'), context)
+  const result = await vm.runInContext('qoderClaimFor({ region: "cn", expiresAtMs: 1 })', context)
+  assert.equal(result.outcome, 'skipped', 'an expired sign-in is not a failed account')
+  assert.match(result.reason, /expired/i)
+  assert.equal(reads, 0, 'and it costs no upstream read at all')
+})
+
+/**
+ * A log line is not a place for an account label or a credential.
+ *
+ * Logs are copied into bug reports; an email address or nickname there is
+ * personal data. The tag keeps lines about one account correlatable without
+ * carrying the label, and the logger strips the same credential and path shapes
+ * the gateway answers use.
+ */
+test('a log line carries no account label or credential', () => {
+  const source = sourceOf('src/host.ts')
+  const lines = []
+  const context = vm.createContext({
+    console: { log: (line) => lines.push(String(line)) },
+    redactSecrets: require('../src/loopback.ts').redactSecrets,
+    accountLogTag: require('../src/log.ts').accountLogTag,
+    String,
+  })
+  vm.runInContext(liftFunction(source, 'log'), context)
+  const tag = vm.runInContext('accountLogTag("lin.cn@example.com")', context)
+  assert.equal(tag, vm.runInContext('accountLogTag("lin.cn@example.com")', context), 'the tag is stable')
+  assert.notEqual(tag, vm.runInContext('accountLogTag("other@example.com")', context), 'different labels differ')
+  assert.doesNotMatch(tag, /lin\.cn|@/, 'the tag carries neither the local part nor the domain')
+  vm.runInContext(
+    'log("warn", "Bearer abcdefghij failed for lin.cn@example.com at C:\\\\Users\\\\fixture\\\\signins\\\\a.info")',
+    context,
+  )
+  const line = lines.join('\n')
+  assert.doesNotMatch(line, /lin\.cn@example\.com/, 'the address is redacted')
+  assert.doesNotMatch(line, /C:\\\\Users/, 'the path is redacted')
+  assert.doesNotMatch(line, /abcdefghij/, 'the credential is redacted')
+})
+
 test('a panel route that fails to mount releases the routes that already registered', () => {
   const { registerPanelRoutes } = loadSource('src/web-panel.ts')
   // The real server table: a duplicate (kind, path) throws, which is exactly
@@ -146,6 +287,32 @@ function loadSource(file, overrides = {}) {
     require: name => (Object.hasOwn(overrides, name) ? overrides[name] : ownRequire(name)) })
   vm.runInContext(transpile(sourceOf(file)), context, { filename: file })
   return module.exports
+}
+
+/** One function lifted out of a host module, for a path that needs no gateway. */
+function liftFunction(source, name) {
+  const from = source.indexOf(`function ${name}(`)
+  assert.notEqual(from, -1, `${name} must exist in the host module`)
+  const modifier = source.slice(Math.max(0, from - 6), from) === 'async ' ? 'async ' : ''
+  let depth = 0
+  let quote = ''
+  let index = source.indexOf('{', from)
+  for (; index < source.length; index += 1) {
+    const character = source[index]
+    if (quote !== '') {
+      if (character === '\\') index += 1
+      else if (character === quote) quote = ''
+      continue
+    }
+    if (character === "'" || character === '"' || character === '`') { quote = character; continue }
+    if (character === '/' && source[index + 1] === '/') {
+      while (index < source.length && source[index] !== '\n') index += 1
+      continue
+    }
+    if (character === '{') depth += 1
+    else if (character === '}') { depth -= 1; if (depth === 0) break }
+  }
+  return modifier + source.slice(from, index + 1)
 }
 
 /**
@@ -249,6 +416,39 @@ test('a Trae or Qoder composer row carries the identity the popup marks it by', 
     'each row must name itself, or the popup cannot clear the notice it put on it')
   assert.equal(trae.filter(row => row.active === true).length, 1, 'exactly one row is the served one')
   assert.equal(sourceComposerAccounts('qoder', 'cn')[0].id, 'Qoder A')
+})
+
+/**
+ * A single claim has to change the row the next document serves.
+ *
+ * `xd.sourceCheckin` answers with `statusDocument`, and that document reads
+ * the source row cache rather than probing again. A claim that only updated
+ * the upstream left the card on "check in" after a successful click.
+ */
+test('a single claim records today on the cached source row', () => {
+  const ownRequire = createRequire(path.join(root, 'src/host.ts'))
+  const context = vm.createContext({
+    module: { exports: {} }, exports: {}, console,
+    require: name => ownRequire(name),
+    AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval, URL, Buffer, process,
+  })
+  context.exports = context.module.exports
+  vm.runInContext(transpile(sourceOf('src/host.ts'))
+    + '\nmodule.exports.__rows = (trae, qoder) => { traeAccountRows = trae; qoderAccountRows = qoder }\n'
+    + '\nmodule.exports.__mark = markSourceCheckinRow\n', context)
+  const rows = context.module.exports.__rows
+  rows([{ label: 'B', region: 'cn', checkin: { active: true, todayCheckedIn: false } }],
+    [{ label: 'A', region: 'cn', checkin: { active: true, todayCheckedIn: false } }])
+  context.module.exports.__mark('qoder', 'A', 'cn', { outcome: 'claimed' })
+  assert.equal(vm.runInContext('qoderAccountRows[0].checkin.todayCheckedIn', context), true,
+    'the document the panel reads back has to say the claim happened')
+  context.module.exports.__mark('trae', 'B', 'cn', { outcome: 'skipped', deviceCheckedIn: true })
+  assert.equal(vm.runInContext('traeAccountRows[0].checkin.deviceCheckedIn', context), true,
+    'a device-level refusal has to reach the card too')
+  rows([], [{ label: 'C', region: 'cn', checkin: { active: true, todayCheckedIn: false } }])
+  context.module.exports.__mark('qoder', 'C', 'cn', { outcome: 'skipped', todayCheckedIn: true })
+  assert.equal(vm.runInContext('qoderAccountRows[0].checkin.todayCheckedIn', context), true,
+    'a round already collected in the app has to reach the card as collected')
 })
 
 /**
@@ -861,6 +1061,21 @@ test('the ban-risk note reaches the panel line', () => {
 })
 
 /**
+ * The panel starts in the host's locale, not a fixed one.
+ *
+ * `panel.js` reads `document.documentElement.lang` before the asynchronous
+ * appearance answer arrives, so a hardcoded `zh-CN` painted Chinese first on an
+ * English host and stayed Chinese if that answer never came. Leaving the
+ * attribute off falls through to `navigator.language`, which the host starts
+ * with; the appearance answer then replaces it with the authoritative locale.
+ */
+test('the panel page does not pin a locale', () => {
+  const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
+  assert.doesNotMatch(page, /<html[^>]*\blang\s*=/i,
+    'the panel document must not declare a language before the host appearance is known')
+})
+
+/**
  * The README screenshots show the panel the repository ships now.
  *
  * `docs/preview-panel.html` mounts `renderer/index.html`, `panel.js` and
@@ -871,17 +1086,21 @@ test('the ban-risk note reaches the panel line', () => {
  * "Newer than" is a content question, not a file-system one: git does not carry
  * modification times, so a stamp compared against them passes on the machine that
  * took the picture and fails on a fresh clone, in either direction. The capture
- * writes the hashes of the three files it mounted into `docs/preview-capture.json`,
+ * writes the hashes of the files it mounted into `docs/preview-capture.json`,
  * and this compares against those.
  */
 test('the README screenshots show the panel the repository ships', () => {
   const shots = ['preview-pool.png', 'preview-dark.png', 'preview-models.png', 'preview-growth.png', 'preview-page.png']
+  const rendered = ['renderer/index.html', 'renderer/panel.js', 'renderer/panel.css',
+    'docs/preview-panel.html', 'docs/preview-data.js']
   const stampAt = path.join(root, 'docs', 'preview-capture.json')
   assert.ok(fs.existsSync(stampAt), 'docs/preview-capture.json has to exist: the capture writes it')
   const stamp = JSON.parse(fs.readFileSync(stampAt, 'utf8'))
   const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')
 
-  for (const file of ['renderer/index.html', 'renderer/panel.js', 'renderer/panel.css']) {
+  assert.deepEqual(Object.keys(stamp.rendered).sort(), [...rendered].sort(),
+    'the capture has to name every source that decides what the screenshots show')
+  for (const file of rendered) {
     assert.equal(stamp.rendered[file], digest(file),
       `${file} changed since the screenshots were taken: re-capture, then run node docs/stamp.cjs`)
   }

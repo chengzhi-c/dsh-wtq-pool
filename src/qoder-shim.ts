@@ -9,7 +9,8 @@
 import { randomUUID } from 'node:crypto'
 import { QODER_EFFORT_ORDER, type QoderChatModel } from './qoder-client'
 import { QoderFrameDecoder, decodeQoderFrame, type QoderFrame } from './qoder-sse'
-import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, openAIFinishReason, redactSecrets, relayStreamOf, replaySource, retryAfterHeader, withRelayStream } from './loopback'
+import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, openAIFinishReason, redactSecrets, relayStreamOf, replaySource, retryAfterHeader, withRelayStream, type ReplayReadResult, type ReplayReader } from './loopback'
+import { readErrorBody } from './upstream'
 
 /**
  * How long a turn that has already emitted its finish chunk waits for anything
@@ -23,10 +24,23 @@ import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, openAIFinishReason, redactSecrets, rel
  */
 const TAIL_GRACE_MS = 1_000
 
+/**
+ * How long a peek that has seen a frame carrying no output waits for a refusal
+ * that may follow it.
+ *
+ * Qoder opens a turn with a role-only delta. Committing on that frame hid a
+ * refusal in the very next one; waiting for output instead kept the 200 from the
+ * client for the whole thinking phase. The grace is enough for a refusal that
+ * arrives promptly, and short enough that a slow model still gets its headers.
+ */
+const PEEK_OUTPUT_GRACE_MS = 1_000
+
 /** What the gateway must answer when Qoder refuses inside the stream. */
 export interface QoderFailure {
   code: string
   message: string
+  /** Every message the walk saw, for matching a cause the display sentence hides. */
+  signals?: string
   /** The frame decoder's own retry hint, preferred over digging in the text. */
   retryAfterSeconds?: number
 }
@@ -111,16 +125,21 @@ function queueSeconds(frame: QoderFrame & { type: 'failure' }): number {
  */
 export function classifyQoderFailure(failure: QoderFailure): { status: number; kind: 'soft_rate' | 'hard_credit' | 'authentication' | 'client'; error: Error } {
   const code = failure.code.trim()
-  const text = `${code} ${failure.message}`
+  const text = `${code} ${failure.message} ${failure.signals ?? ''}`
+  const frame: QoderFrame & { type: 'failure' } = {
+    type: 'failure',
+    code,
+    detail: failure.message,
+    signals: failure.signals ?? '',
+    retryAfterSeconds: failure.retryAfterSeconds ?? 0,
+  }
   if (code === '110' || /daily.*(limit|quota)|quota.*daily|allowance.*spent/i.test(text)) {
     // The same reader the queue branches use, so a hint carried as a field is
     // honoured as well as one embedded in the message text. Regexing the text
     // alone dropped the top-level `retryAfterSeconds`, so a spent allowance
     // answered with no `Retry-After` at all - the client then retried at once
     // against the same exhausted quota instead of failing over.
-    const retryAfter = queueSeconds({
-      type: 'failure', code, detail: failure.message, retryAfterSeconds: failure.retryAfterSeconds ?? 0,
-    })
+    const retryAfter = queueSeconds(frame)
     return {
       status: 429,
       kind: 'hard_credit',
@@ -131,7 +150,7 @@ export function classifyQoderFailure(failure: QoderFailure): { status: number; k
     return {
       status: 429,
       kind: 'soft_rate',
-      error: new QoderQueueRejection(queueSeconds({ type: 'failure', code, detail: failure.message, retryAfterSeconds: failure.retryAfterSeconds ?? 0 }), failure.message),
+      error: new QoderQueueRejection(queueSeconds(frame), failure.message),
     }
   }
   if (/Login expired|TOKEN_EXPIRE|token is not active/i.test(text) || code === '105') {
@@ -140,11 +159,11 @@ export function classifyQoderFailure(failure: QoderFailure): { status: number; k
   if (code === '1210') {
     return { status: 400, kind: 'client', error: new Error(failure.message) }
   }
-  if (queueMarkerCount(failure.message) >= 2) {
+  if (queueMarkerCount(text) >= 2) {
     return {
       status: 429,
       kind: 'soft_rate',
-      error: new QoderQueueRejection(queueSeconds({ type: 'failure', code, detail: failure.message, retryAfterSeconds: failure.retryAfterSeconds ?? 0 }), failure.message),
+      error: new QoderQueueRejection(queueSeconds(frame), failure.message),
     }
   }
   if (code === '429') return { status: 429, kind: 'soft_rate', error: new QoderQueueRejection(0, failure.message) }
@@ -322,7 +341,12 @@ export function bridgeQoderStream(
       return
     }
     if (decoded.type === 'failure') {
-      const { error } = classifyQoderFailure({ code: decoded.code, message: decoded.detail, retryAfterSeconds: decoded.retryAfterSeconds })
+      const { error } = classifyQoderFailure({
+        code: decoded.code,
+        message: decoded.detail,
+        signals: decoded.signals,
+        retryAfterSeconds: decoded.retryAfterSeconds,
+      })
       throw error
     }
     const inner = decoded.chunk as Record<string, unknown>
@@ -500,6 +524,49 @@ export function bridgeQoderStream(
 }
 
 /**
+ * Whether a Qoder chunk carries output a client would actually see.
+ *
+ * A role-only delta and a usage-only frame both have `choices`, but neither is
+ * output: a refusal that follows them can still become a real status code and
+ * let the next account try. Counting any non-empty `choices` as output committed
+ * the stream at 200 and skipped failover.
+ */
+function qoderChunkHasOutput(chunk: Record<string, unknown>): boolean {
+  const choices = chunk['choices']
+  if (!Array.isArray(choices)) return false
+  for (const raw of choices) {
+    if (raw === null || typeof raw !== 'object') continue
+    const delta = (raw as Record<string, unknown>)['delta']
+    if (delta === null || typeof delta !== 'object') continue
+    const fields = delta as Record<string, unknown>
+    if (typeof fields['content'] === 'string' && fields['content'] !== '') return true
+    if (typeof fields['reasoning_content'] === 'string' && fields['reasoning_content'] !== '') return true
+    const calls = fields['tool_calls']
+    if (Array.isArray(calls) && calls.length > 0) return true
+  }
+  return false
+}
+
+/**
+ * Whether a Qoder chunk closes the turn, even if the socket stays open.
+ *
+ * Qoder reports a completed turn with a `finish_reason` and often a trailing
+ * usage frame, then leaves the connection open. The peek must stop there or it
+ * waits for the upstream idle watchdog on a turn that has already finished.
+ */
+function qoderChunkIsTerminal(chunk: Record<string, unknown>): boolean {
+  const choices = chunk['choices']
+  if (Array.isArray(choices)) {
+    for (const raw of choices) {
+      if (raw === null || typeof raw !== 'object') continue
+      const finish = (raw as Record<string, unknown>)['finish_reason']
+      if (finish !== undefined && finish !== null) return true
+    }
+  }
+  return chunk['usage'] !== undefined && chunk['usage'] !== null
+}
+
+/**
  * Turn one gateway response into something an OpenAI client can consume.
  *
  * A non-2xx answer becomes a JSON error, and so does a 2xx with no body at all.
@@ -514,7 +581,10 @@ export async function openQoderResponse(
   options: QoderRelayOptions = {},
 ): Promise<Response> {
   if (!response.ok) {
-    const detail = (await response.text().catch(() => '')).slice(0, 1024)
+    // The refusal body is read to a fixed bound: an unbounded `text()` let a
+    // huge or never-ending error body hold the gateway open for the account's
+    // whole timeout before the 1024-byte preview was even cut.
+    const detail = await readErrorBody(response, 1024)
     return Response.json(
       {
         error: {
@@ -536,24 +606,65 @@ export async function openQoderResponse(
   const buffered: Uint8Array[] = []
   let bufferedBytes = 0
   let sawOutput = false
+  let sawTerminal = false
+  let sawQuiet = false
+  let graceDeadline = 0
+  let pendingRead: Promise<ReplayReadResult> | undefined
   let failure: QoderFailure | undefined
   let ended = false
   const inspect = (payloads: string[]): void => {
     for (const payload of payloads) {
       const decoded = decodeQoderFrame(payload)
       if (decoded.type === 'chunk') {
-        const choices = (decoded.chunk as Record<string, unknown>)['choices']
-        if (Array.isArray(choices) && choices.length > 0) sawOutput = true
-        else if ((decoded.chunk as Record<string, unknown>)['usage'] !== undefined) sawOutput = true
+        const chunk = decoded.chunk as Record<string, unknown>
+        if (qoderChunkHasOutput(chunk)) sawOutput = true
+        if (qoderChunkIsTerminal(chunk)) sawTerminal = true
+        // A role-only frame says the turn has started but carries no answer. It
+        // must not commit the stream before the refusal that may follow it, but
+        // it must not hold the headers for a slow first token either: the loop
+        // below gives the next frame a short grace, then commits.
+        if (!sawOutput && !sawTerminal && Array.isArray(chunk['choices']) && chunk['choices'].length > 0) sawQuiet = true
       } else if (decoded.type === 'failure') {
-        failure ??= { code: decoded.code, message: decoded.detail, retryAfterSeconds: decoded.retryAfterSeconds }
+        failure ??= {
+          code: decoded.code,
+          message: decoded.detail,
+          signals: decoded.signals,
+          retryAfterSeconds: decoded.retryAfterSeconds,
+        }
       }
-      if (sawOutput || failure !== undefined) break
+      if (sawOutput || sawTerminal || failure !== undefined) break
     }
   }
   try {
     while (buffered.length < PEEK_MAX_CHUNKS && bufferedBytes < PEEK_MAX_BYTES) {
-      const next = await reader.read()
+      let next: ReplayReadResult
+      if (graceDeadline === 0) {
+        next = await reader.read()
+      } else {
+        // The read is kept, not abandoned: a slow model that has only sent its
+        // role frame must still stream once its first token arrives. If the
+        // grace ends first, the queued read is handed to the relay below.
+        const read = reader.read()
+        pendingRead = read
+        // A caller that never reads the body (or cancels before the queued read
+        // settles) would otherwise leave this rejection unhandled. The relay
+        // still sees the rejection when it awaits the same promise.
+        read.catch(() => {})
+        const remaining = Math.max(0, graceDeadline - Date.now())
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const timedOut = new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), remaining)
+        })
+        let winner: { result: ReplayReadResult } | undefined
+        try {
+          winner = await Promise.race([read.then((result) => ({ result })), timedOut])
+        } finally {
+          if (timer !== undefined) clearTimeout(timer)
+        }
+        if (winner === undefined) break
+        next = winner.result
+        pendingRead = undefined
+      }
       if (next.done) {
         ended = true
         // The decoder is flushed before the frame decoder's tail: a stream cut
@@ -565,12 +676,14 @@ export async function openQoderResponse(
       buffered.push(next.value)
       bufferedBytes += next.value.byteLength
       inspect(frames.push(decoder.decode(next.value, { stream: true })))
-      if (sawOutput || failure !== undefined || frames.ended) break
+      if (sawOutput || sawTerminal || failure !== undefined || frames.ended) break
+      if (sawQuiet && graceDeadline === 0) graceDeadline = Date.now() + PEEK_OUTPUT_GRACE_MS
     }
   } catch (error: unknown) {
     // An upstream that resets mid-peek rejects the read, and the decoder throws
     // on an over-long line. Either way the reader has to be released, or the
     // upstream socket stays open after the caller has already been answered.
+    pendingRead = undefined
     await reader.cancel().catch(() => {})
     throw error
   }
@@ -600,7 +713,21 @@ export async function openQoderResponse(
       },
     )
   }
-  const replayed = replaySource(buffered, reader, ended)
+  // A grace that ran out leaves its read in flight. Handing the relay the same
+  // promise keeps the first token, and its byte order, instead of starting a
+  // second read against the locked reader.
+  const relayReader: ReplayReader = {
+    async read() {
+      const queued = pendingRead
+      if (queued !== undefined) {
+        pendingRead = undefined
+        return queued
+      }
+      return reader.read()
+    },
+    cancel(reason) { return reader.cancel(reason) },
+  }
+  const replayed = replaySource(buffered, relayReader, ended)
   const relay = bridgeQoderStream(replayed, model, options)
   return withRelayStream(new Response(relay, {
     status: 200,

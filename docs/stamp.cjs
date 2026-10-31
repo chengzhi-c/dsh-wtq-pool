@@ -15,7 +15,15 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const ROOT = path.resolve(__dirname, '..')
-const RENDERED = ['renderer/index.html', 'renderer/panel.js', 'renderer/panel.css']
+const RENDERED = [
+  'renderer/index.html',
+  'renderer/panel.js',
+  'renderer/panel.css',
+  // The preview's own stand-in host and demo data decide what the pictures
+  // show, so a change to either makes them stale just as the panel does.
+  'docs/preview-panel.html',
+  'docs/preview-data.js',
+]
 const SHOTS = [
   'preview-pool.png',
   'preview-dark.png',

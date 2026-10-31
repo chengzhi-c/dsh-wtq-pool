@@ -12,7 +12,7 @@ import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessag
 import type { TraeCredential } from './trae-discovery'
 import type { TraeIdentity, TraeReasoningCapability, TraeSoloModel, TraeSoloVariant, TraeUpstreamErrorKind } from './trae-upstream'
 import { TraeSoloUpstreamClient, mergeTraeDirectory, traeVariantFor } from './trae-upstream'
-import { openTraeResponse } from './trae-shim'
+import { openTraeResponse, classifyTraeFailure, type TraeFailure } from './trae-shim'
 import { LOG_PREFIX } from './log'
 
 export interface TraeGatewayLogger {
@@ -51,7 +51,7 @@ export interface TraeGatewayOptions {
    * per-request rotation cannot do — a spent allowance otherwise costs one
    * failed round trip on every single request.
    */
-  onAttemptFailure?(credential: TraeCredential, outcome: { status: number; kind?: TraeUpstreamErrorKind; retryAfter?: string | null }): void
+  onAttemptFailure?(credential: TraeCredential, outcome: { retryAfter?: string | null }): void
 }
 
 export interface TraeGateway {
@@ -323,7 +323,19 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
             // paying the same round trip on it. A caller hang-up is not the
             // sign-in's doing, so it is excluded.
             if (!(error instanceof Error && error.name === 'AbortError') && !watcher.signal.aborted) {
-              options.onAttemptFailure?.(credential, { status: 0, kind: 'server' })
+              // A refusal that arrived mid-stream still names an account-level
+              // condition; reporting every one as `server` lost its kind and the
+              // upstream's own wait, so a sign-in that had just expired or hit
+              // its daily limit was retried after the default cooldown.
+              const failure = (error as { traeFailure?: TraeFailure }).traeFailure
+              if (failure !== undefined) {
+                const classified = classifyTraeFailure(failure)
+                options.onAttemptFailure?.(credential, {
+                  ...classified.retryAfterSeconds === undefined ? {} : { retryAfter: String(classified.retryAfterSeconds) },
+                })
+              } else {
+                options.onAttemptFailure?.(credential, {})
+              }
             }
           },
         })
@@ -388,8 +400,6 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       // The sign-in's own failure, reported before the next attempt: the host
       // keeps it out of the lead on the requests after this one.
       options.onAttemptFailure?.(credential, {
-        status: attempt.status,
-        ...attempt.kind === undefined ? {} : { kind: attempt.kind },
         ...attempt.retryAfter === undefined ? {} : { retryAfter: attempt.retryAfter },
       })
       // Only worth a line while there is someone left to rotate to.

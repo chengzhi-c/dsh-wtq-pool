@@ -75,6 +75,26 @@ function originFor(realm: WorkBuddyRegion): string {
   return realm === 'global' ? GLOBAL_ORIGIN : CN_ORIGIN
 }
 
+/**
+ * The browser URL a login start hands the panel.
+ *
+ * The panel opens it without inspecting it, so the scheme is checked here: an
+ * upstream answer that named `javascript:` or `file:` would otherwise be handed
+ * straight to the desktop shell.
+ */
+function checkedAuthUrl(value: string): string {
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new Error('workbuddy login start returned an invalid url')
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error('workbuddy login start returned a non-https url')
+  }
+  return value
+}
+
 /** Browser-shaped headers; `Origin` is the one the endpoints check. */
 function loginHeaders(origin: string): Record<string, string> {
   return {
@@ -160,7 +180,7 @@ export async function startDeviceLogin(
   if (state === '' || authUrl === '') {
     throw new Error(`workbuddy login start gave no state or url: ${envelope.msg}`)
   }
-  return { state, authUrl }
+  return { state, authUrl: checkedAuthUrl(authUrl) }
 }
 
 /**

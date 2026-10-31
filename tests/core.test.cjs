@@ -247,6 +247,19 @@ test('a container acknowledgement does not blank an envelope business code', () 
     'a code inside a message string is still read')
 })
 
+test('a nested message does not overwrite the envelope\'s actionable sentence', () => {
+  const { unwrapFailure } = require('../src/qoder-sse.ts')
+  const failure = unwrapFailure({
+    code: 105,
+    message: 'Login expired',
+    details: { message: 'request rejected', reqId: 7 },
+  })
+  assert.equal(failure.detail, 'Login expired',
+    'the sentence the user can act on has to survive the walk into details')
+  assert.equal(unwrapFailure({ message: '{"code":10605,"message":"queue full"}' }).detail,
+    'queue full', 'a message that is only a JSON wrapper is still replaced by the inner sentence')
+})
+
 /**
  * A caller hang-up must release an error body too.
  *
@@ -372,6 +385,99 @@ test('a Qoder turn ends for the client when the upstream holds the socket open',
   assert.doesNotMatch(withoutUsage.text, /upstream_error/, 'and is not reported as a failure either')
 })
 
+test('a role-only Qoder frame does not commit a refusal that follows it', async () => {
+  // The peek used to treat any non-empty `choices` as output. Qoder sends the
+  // role delta first, so a refusal in the very next frame was relayed as a 200
+  // stream and the next account was never tried.
+  const { openQoderResponse } = require('../src/qoder-shim.ts')
+  const encoder = new TextEncoder()
+  const upstream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'))
+      controller.enqueue(encoder.encode('data: {"code":110,"message":"daily quota spent","retryAfterSeconds":3600}\n\n'))
+      controller.close()
+    },
+  })
+  const answer = await openQoderResponse(new Response(upstream, { status: 200 }), 'qfmodel')
+  assert.equal(answer.status, 429, 'the refusal must surface as a real status so failover can run')
+  assert.equal(answer.headers.get('retry-after'), '3600', 'and it must keep the upstream wait')
+})
+
+test('a role frame does not hide the stream while the first token is slow', async () => {
+  // Waiting for output fixed the role-then-refusal case but hid the 200 for the
+  // whole thinking phase. A short grace covers a refusal that follows at once;
+  // after that the turn commits and a late token still arrives in order.
+  const { openQoderResponse } = require('../src/qoder-shim.ts')
+  const encoder = new TextEncoder()
+  let control
+  const upstream = new ReadableStream({
+    start(controller) {
+      control = controller
+      controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'))
+    },
+  })
+  const first = await Promise.race([
+    openQoderResponse(new Response(upstream, { status: 200 }), 'qfmodel').then((answer) => ({ answer })),
+    new Promise((resolve) => { setTimeout(() => resolve({ timeout: true }), 2500) }),
+  ])
+  assert.notEqual(first.timeout, true, 'the role frame must not hold the headers for the thinking phase')
+  control.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"late token"}}]}\n\ndata: [DONE]\n\n'))
+  control.close()
+  const text = await first.answer.text()
+  assert.equal((text.match(/late token/g) ?? []).length, 1,
+    'the token that followed the grace reaches the client once, in order')
+})
+
+test('a nested queue wait survives the outer display sentence', () => {
+  const { unwrapFailure, retryAfterSecondsOf, decodeQoderFrame } = require('../src/qoder-sse.ts')
+  const frame = {
+    code: 10605,
+    message: 'queue full',
+    details: { message: '{"retryAfterSeconds":60,"queueType":"chat"}' },
+  }
+  const failure = unwrapFailure(frame)
+  assert.equal(failure.detail, 'queue full', 'the card keeps the sentence the vendor put on the envelope')
+  assert.match(failure.signals, /retryAfterSeconds/, 'the nested descriptor is still available to the classifier')
+  assert.equal(retryAfterSecondsOf(frame), 60, 'and its wait is read through the nesting')
+  assert.equal(decodeQoderFrame(JSON.stringify(frame)).retryAfterSeconds, 60,
+    'the decoder carries the same wait to the gateway')
+})
+
+test('a generic outer sentence does not hide a nested sign-in refusal from the classifier', () => {
+  const { unwrapFailure } = require('../src/qoder-sse.ts')
+  const { classifyQoderFailure } = require('../src/qoder-shim.ts')
+  const failure = unwrapFailure({ message: 'Request failed', details: { message: 'Login expired' } })
+  const classified = classifyQoderFailure({
+    code: failure.code,
+    message: failure.detail,
+    signals: failure.signals,
+  })
+  assert.equal(classified.status, 401, 'the nested sentence still says the sign-in is gone')
+  assert.equal(classified.kind, 'authentication')
+})
+
+test('a finished Qoder turn does not wait for the socket to close', async () => {
+  const { openQoderResponse } = require('../src/qoder-shim.ts')
+  const encoder = new TextEncoder()
+  let cancelled = false
+  const upstream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'))
+      controller.enqueue(encoder.encode('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'))
+      controller.enqueue(encoder.encode('data: {"choices":[],"usage":{"total_tokens":7}}\n\n'))
+    },
+    cancel() { cancelled = true },
+  })
+  const answer = await Promise.race([
+    openQoderResponse(new Response(upstream, { status: 200 }), 'qfmodel'),
+    new Promise((resolve) => { setTimeout(() => resolve({ timeout: true }), 1000) }),
+  ])
+  assert.notEqual(answer.timeout, true, 'a finish frame ends the peek even when the upstream holds the socket')
+  assert.equal(answer.status, 200)
+  await answer.body.cancel().catch(() => {})
+  assert.equal(cancelled, true, 'the upstream stream is released with the relay')
+})
+
 /**
  * A Qoder check-in answers with a JSON document, and the whole of it decides
  * whether the claim reads as granted or failed.
@@ -477,6 +583,38 @@ test('a Qoder claim answer is read from its receipt, and a refusal is one', () =
   const plain = qoderNormalizeClaimResult({ code: 0, status: 'CLAIMED', benefit: { amount: 50 } })
   assert.equal(plain.claimed, true, 'the status whitelist still works')
   assert.equal(plain.reason, undefined, 'a granted claim names no refusal')
+})
+
+/**
+ * A collected round must not hide a later claimable one.
+ *
+ * The campaign list can carry a promotion beside the daily round. Reading the
+ * first open CLAIM_BENEFIT entry regardless of its status picked the collected
+ * promotion, so the card said today was done and no claim id was returned: the
+ * click had nothing to send while a claimable round was right there.
+ */
+test('a collected Qoder round does not hide a later claimable one', () => {
+  const { qoderClaimableCampaignIdOf, qoderCheckinStateFrom } = require('../src/qoder-client.ts')
+  const now = 1_800_000_000_000
+  const at = Math.floor(now / 1000)
+  const round = (id, claimStatus) => ({
+    campaignId: id,
+    actionType: 'CLAIM_BENEFIT',
+    claimStatus,
+    startAt: at - 60,
+    endAt: at + 3600,
+    benefit: { kind: 'CREDITS', amount: 100, validity: { mode: 'RELATIVE_DAYS', days: 30 } },
+  })
+  const mixed = { campaigns: [round('collected', 'CLAIMED'), round('today', 'CLAIMABLE')] }
+  assert.equal(qoderClaimableCampaignIdOf(mixed, now), 'today',
+    'the claim id is the uncollected round, not the first open one')
+  const state = qoderCheckinStateFrom(mixed, now)
+  assert.equal(state.active, true, 'the card still offers the claim')
+  assert.equal(state.todayCheckedIn, false, 'and does not report the day as already collected')
+
+  const collectedOnly = qoderCheckinStateFrom({ campaigns: [round('collected', 'CLAIMED')] }, now)
+  assert.equal(collectedOnly.active, true, 'a day with only a collected round keeps its card')
+  assert.equal(collectedOnly.todayCheckedIn, true, 'and still reports it as collected')
 })
 
 /** A value that names no hour must not normalise to midnight. */

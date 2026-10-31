@@ -342,6 +342,7 @@ test('a live sign-in with a future expiry reaches the panel and the gateway', as
     credentials: [{ region: 'cn', userID: 'qoder-user', token: 'qoder-token', name: '', email: '', expiresAtMs: future, refreshTokenExpiresAtMs: future }],
     failures: [],
   }))
+  t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchModels', async () => ({ models: [], partial: false, failedFunctions: [] }))
   t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ code: 0, enable: true, checkedIn: false }))
   t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchUsageSummary', async () => ({ credits: [], packs: [] }))
   t.mock.method(QoderUpstreamClient.prototype, 'fetchUsage', async () => ({ userQuota: { remaining: 5, total: 10 }, dedicatedPackages: [] }))
@@ -361,8 +362,9 @@ test('a live sign-in with a future expiry reaches the panel and the gateway', as
     await startRegisteredService()
     // The listing is filled by the refresh pass behind the load, so poll for it
     // the way the panel does rather than assuming it is there on the first read.
+    // The pass may wait out a probe timeout before it publishes.
     let state
-    for (let attempt = 0; attempt < 50; attempt += 1) {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
       state = await plugin.onPanelInvoke('xd.state')
       if (state.trae.accounts.length > 0 && state.qoder.accounts.length > 0) break
       await new Promise((resolve) => setTimeout(resolve, 50))
@@ -1380,6 +1382,8 @@ test('a credential echoed by an upstream never survives into the client body', (
   // The business code is the actionable half of an error and must survive.
   assert.equal(redactSecrets('{"code":6004}').includes('6004'), true)
   assert.equal(redactSecrets('{"code":"soft_rate"}').includes('soft_rate'), true)
+  // An address is account-identifying too, and error bodies reach the user.
+  assert.equal(redactSecrets('mail lin.cn@example.com').includes('lin.cn'), false)
   // A filesystem path is redacted in either spelling, quoted or not.
   assert.equal(redactSecrets('open /home/bob/.config/qoder/auth.v1.dat failed').includes('/home/bob'), false)
   assert.equal(redactSecrets('open /Users/bob/Library/Application Support/WorkBuddy/login.info failed').includes('/Users/bob'), false)

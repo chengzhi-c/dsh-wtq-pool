@@ -320,7 +320,7 @@ export function registerPanelRoutes(ctx: { webServer: WebServerSeam }, deps: Pan
           try {
             dispose()
           } catch (error: unknown) {
-            deps.logger.warn('dsh-wtq-pool: a panel route did not release cleanly', error)
+            deps.logger.warn('dsh-wtq-pool: a panel route did not release cleanly', safeMessage(error))
           }
         }
       }
@@ -402,6 +402,6 @@ export function registerPanelRoutes(ctx: { webServer: WebServerSeam }, deps: Pan
       return release
     })
   } catch (error: unknown) {
-    deps.logger.warn('dsh-wtq-pool: the panel routes could not be mounted', error)
+    deps.logger.warn('dsh-wtq-pool: the panel routes could not be mounted', safeMessage(error))
   }
 }

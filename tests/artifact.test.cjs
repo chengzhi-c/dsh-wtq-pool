@@ -17,6 +17,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
+const { execSync } = require('node:child_process')
 
 const root = path.join(__dirname, '..')
 const built = path.join(root, 'lib', 'index.js')
@@ -26,6 +27,25 @@ test('the built entry loads and exports the contract the host calls', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
   assert.equal(pkg.main, 'lib/index.js', 'package.json main must name the file this case loads')
   assert.equal(pkg.exports['.'].default, './lib/index.js', 'and the default export entry with it')
+  // The client bundle is a second entry point, loaded by the host UI rather
+  // than by the entry. A build that drops it leaves the composer and the panel
+  // card dead while every other case stays green.
+  assert.equal(pkg.exports['./client'], './lib/client.js', 'the client subpath names the bundle the host loads')
+  assert.ok(fs.existsSync(path.join(root, 'lib', 'client.js')), 'and that bundle has to exist')
+  for (const file of ['lib', 'renderer', 'cordis.patch.yml']) {
+    assert.ok(pkg.files.includes(file), `the published package must carry ${file}`)
+  }
+  // The `files` list is a declaration, not the tarball. Packing with scripts
+  // off catches a `.npmignore` or a stale entry that would ship a different
+  // set, and pins the runtime files and the absence of docs in one check.
+  const packed = JSON.parse(execSync('npm pack --dry-run --ignore-scripts --json', {
+    cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+  }))[0].files.map((file) => file.path)
+  for (const file of ['lib/index.js', 'lib/client.js', 'renderer/panel.js', 'cordis.patch.yml']) {
+    assert.ok(packed.includes(file), `the tarball must carry ${file}`)
+  }
+  assert.equal(packed.some((file) => file.startsWith('docs/')), false,
+    'the published tarball must not carry the repository preview pages')
   const plugin = require(built)
   for (const name of ['apply', 'onLoad', 'onPanelInvoke', 'onUnload', 'name']) {
     assert.ok(plugin[name] !== undefined, `the built entry must export ${name}`)
