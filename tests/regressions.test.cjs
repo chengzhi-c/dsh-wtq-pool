@@ -345,6 +345,7 @@ test('a live sign-in with a future expiry reaches the panel and the gateway', as
   t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchModels', async () => ({ models: [], partial: false, failedFunctions: [] }))
   t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ code: 0, enable: true, checkedIn: false }))
   t.mock.method(TraeSoloUpstreamClient.prototype, 'fetchUsageSummary', async () => ({ credits: [], packs: [] }))
+  t.mock.method(QoderUpstreamClient.prototype, 'fetchModels', async () => [])
   t.mock.method(QoderUpstreamClient.prototype, 'fetchUsage', async () => ({ userQuota: { remaining: 5, total: 10 }, dedicatedPackages: [] }))
   t.mock.method(QoderUpstreamClient.prototype, 'fetchCampaigns', async () => ({}))
   const { installPi, startRegisteredService, stopRegisteredService } = require('../src/pi-compat.ts')
@@ -542,6 +543,7 @@ test('a Qoder round that is not open yet is collected when its window opens', as
       startAt: opened ? Date.now() - 1000 : opensAt }],
   }))
   t.mock.method(QoderUpstreamClient.prototype, 'claimCampaign', async () => ({ success: true, grantId: 'claim-1' }))
+  t.mock.method(QoderUpstreamClient.prototype, 'fetchModels', async () => [])
   t.mock.method(QoderUpstreamClient.prototype, 'fetchUsage', async () => ({ userQuota: { remaining: 5, total: 10 }, dedicatedPackages: [] }))
   const { installPi, startRegisteredService, stopRegisteredService } = require('../src/pi-compat.ts')
   installPi({ getSettings: () => ({ ...settings }), setSettings: patch => Object.assign(settings, patch), getDataPath: () => temporary,

@@ -56,6 +56,10 @@ const CN = {
  * the wiring under test real. `spent` records the calls that are not reads.
  */
 async function loadPlugin(t, temporary, growth) {
+  const unexpectedFetch = t.mock.method(globalThis, 'fetch', async () => {
+    throw new Error('growth fixtures must not reach an upstream')
+  })
+  t.after(() => assert.equal(unexpectedFetch.mock.callCount(), 0, 'the fixture must stay offline'))
   const auth = path.join(temporary, 'auth')
   fs.mkdirSync(auth, { recursive: true })
   const { installPi } = require('../src/pi-compat.ts')
@@ -366,11 +370,10 @@ test('a pass that starts during a single claim waits for it', async (t) => {
     return { credit: 100, streakDays: 1, isStreakDay: true }
   })
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: true, todayCheckedIn: false }))
-  const until = async (ready) => { for (let i = 0; i < 200 && !ready(); i += 1) await new Promise((r) => setImmediate(r)) }
   try {
     const id = (await plugin.onPanelInvoke('xd.state')).accounts[0].id
     const claim = plugin.onPanelInvoke('xd.checkin', { accountId: id })
-    await until(() => true)
+    await reached
     // The claim is inside its write now. A pass arriving here must not start.
     const pass = await plugin.onPanelInvoke('xd.checkinAll', { source: 'workbuddy' })
     assert.equal(pass.running, true, 'the pass waits rather than walking the same account')
@@ -380,11 +383,10 @@ test('a pass that starts during a single claim waits for it', async (t) => {
 
     // The control: once it is done the pass runs.
     openClaim()
-    t.mock.restoreAll()
-    t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [])
-    t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
     t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
     t.mock.method(WorkBuddyUpstreamClient.prototype, 'claimDailyCheckin', async () => ({ credit: 0, streakDays: 1, isStreakDay: false }))
+    t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchBuddyInfo', async () => ({}))
+    t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchTravelStatus', async () => ({ state: 'traveling' }))
     const after = await plugin.onPanelInvoke('xd.checkinAll', { source: 'workbuddy' })
     assert.notEqual(after.running, true, 'the guard is released when the claim finishes')
   } finally {
@@ -426,6 +428,40 @@ test('a check-in aimed at an unknown source is refused', async (t) => {
  * then started a second unpaced pass over the same accounts, which is what the
  * upstream reads as a burst.
  */
+test('stopping growth sends no further mutations after an in-flight request settles', async (t) => {
+  for (const boundary of ['makeupCards', 'claimGift', 'claimCompensation', 'growthStreakFull', 'lotteryChances', 'drawLottery']) {
+    await t.test(boundary, async (t) => {
+      const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-stop-'))
+      const { plugin, spent } = await loadPlugin(t, temporary, {
+        streak: STREAK, makeupCards: 1, missedYesterday: true, chances: 2,
+      })
+      let release, reached
+      const gate = new Promise((resolve) => { release = resolve })
+      const waiting = new Promise((resolve) => { reached = resolve })
+      const original = WorkBuddyUpstreamClient.prototype[boundary]
+      t.mock.method(WorkBuddyUpstreamClient.prototype, boundary, async (...args) => {
+        const answer = await original(...args)
+        reached()
+        await gate
+        return answer
+      })
+      try {
+        const run = plugin.onPanelInvoke('xd.growthRun')
+        await waiting
+        const before = spent.length
+        await plugin.onUnload()
+        release()
+        await run
+        assert.deepEqual(spent.slice(before).map(([name]) => name).filter((name) => MUTATING.includes(name)), [])
+      } finally {
+        release()
+        await plugin.onUnload()
+        fs.rmSync(temporary, { recursive: true, force: true })
+      }
+    })
+  }
+})
+
 test('a stale run does not clear the guard of the run that replaced it', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-'))
   const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 0, gift: 0, compensation: 0 })

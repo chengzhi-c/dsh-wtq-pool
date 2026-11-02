@@ -74,14 +74,14 @@ test('a system prompt refused in a 200 envelope is folded and retried', async ()
   const first = await client.chatStream(CN, prepared, undefined, { headersMs: 50 })
   assert.equal(first.ok, true)
   assert.equal(calls.length, 2, 'the 200 envelope is retried once, like the 400 shape')
-  assert.equal(calls[1].messages[0].content, '')
+  assert.ok(calls[1].messages[0].content.trim())
   assert.match(calls[1].messages[1].content, /envelope case/u)
 
   calls.length = 0
   const second = await client.chatStream(CN, prepared, undefined, { headersMs: 50 })
   assert.equal(second.ok, true)
   assert.equal(calls.length, 1, 'the accepted fold is remembered for the next turn')
-  assert.equal(calls[0].messages[0].content, '')
+  assert.ok(calls[0].messages[0].content.trim())
 })
 
 test('a prompt screen labeled text/plain is still folded and retried', async () => {
@@ -111,10 +111,10 @@ test('a prompt screen labeled text/plain is still folded and retried', async () 
   }), undefined, { headersMs: 50 })
   assert.equal(result.ok, true)
   assert.equal(calls.length, 2, 'a declared small body is inspected even when labeled text/plain')
-  assert.equal(calls[1].messages[0].content, '')
+  assert.ok(calls[1].messages[0].content.trim())
 })
 
-test('a refused system prompt is moved into the first user turn and retried', async () => {
+test('a refused system prompt is folded without introducing an empty Kimi message', async () => {
   const calls = []
   const client = new WorkBuddyUpstreamClient({
     fetchImpl: async (_url, init) => {
@@ -127,7 +127,7 @@ test('a refused system prompt is moved into the first user turn and retried', as
   })
   const system = 'You are an AI agent powered by DeepSeek Harness. (retry case)'
   const result = await client.chatStream(CN, JSON.stringify({
-    model: 'deepseek-v4.1-flash',
+    model: 'kimi-k3-1',
     stream: true,
     messages: [
       { role: 'system', content: system },
@@ -139,7 +139,7 @@ test('a refused system prompt is moved into the first user turn and retried', as
   assert.equal(calls.length, 2, 'the refusal is retried once')
   const sent = calls[1].messages
   assert.equal(sent[0].role, 'system', 'a system turn still opens the body')
-  assert.equal(sent[0].content, '', 'but carries no wording the screen reads')
+  assert.ok(sent[0].content.trim(), 'Kimi rejects an empty system placeholder with code 11151')
   assert.equal(sent[1].role, 'user')
   assert.match(sent[1].content, /You are an AI agent powered by DeepSeek Harness/u,
     'the instructions survive in the user turn')
@@ -172,7 +172,7 @@ test('an accepted fold is reused on the next turn', async () => {
   calls.length = 0
   assert.equal((await client.chatStream(CN, prepared, undefined, { headersMs: 50 })).ok, true)
   assert.equal(calls.length, 1, 'the accepted prompt no longer pays a refused call')
-  assert.equal(calls[0].messages[0].content, '')
+  assert.ok(calls[0].messages[0].content.trim())
   assert.match(calls[0].messages[1].content, /DeepSeek Harness/u)
 })
 
@@ -222,17 +222,33 @@ test('a 400 that is not the prompt screen is not retried', async () => {
 })
 
 test('folding keeps array content and inserts a user turn when there is none', () => {
-  const folded = JSON.parse(foldSystemIntoUser(JSON.stringify({
+  const raw = foldSystemIntoUser(JSON.stringify({
     messages: [
       { role: 'system', content: [{ type: 'text', text: 'Alpha' }] },
       { role: 'assistant', content: 'previous' },
     ],
-  })))
+  }))
+  const folded = JSON.parse(raw)
   assert.equal(folded.messages[0].role, 'system')
-  assert.equal(folded.messages[0].content, '')
+  assert.ok(folded.messages[0].content.trim())
   assert.equal(folded.messages[1].role, 'user')
   assert.equal(folded.messages[1].content, 'Alpha')
   assert.equal(folded.messages[2].role, 'assistant', 'the rest of the conversation keeps its order')
+  assert.equal(foldSystemIntoUser(raw), undefined, 'the neutral placeholder must not fold a second time')
+})
+
+test('renaming assistant history preserves the leading neutral system turn', () => {
+  const folded = JSON.parse(foldSystemIntoUser(JSON.stringify({
+    messages: [
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'assistant', content: 'DeepSeek Harness answered earlier.' },
+      { role: 'user', content: 'Continue.' },
+    ],
+  })))
+  assert.equal(folded.messages[0].role, 'system', 'the global gateway still requires the system turn')
+  assert.ok(folded.messages[0].content.trim())
+  assert.equal(folded.messages[1].content, 'DeepSeek answered earlier.')
+  assert.equal(foldSystemIntoUser(JSON.stringify(folded)), undefined)
 })
 
 test('an empty system turn is left alone', () => {

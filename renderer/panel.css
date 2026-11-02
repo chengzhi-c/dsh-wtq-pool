@@ -859,6 +859,7 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
   color: var(--xd-muted);
   font-variant-numeric: tabular-nums;
 }
+.credits-head:is(:hover, :active) .count-chip { color: var(--xd-fg); }
 
 /* ---------------------------------------------------- model columns */
 

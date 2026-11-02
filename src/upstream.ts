@@ -1095,17 +1095,9 @@ function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | undefined 
   }
 }
 
-/**
- * Put an empty system prompt in front of the conversation when the host opened
- * with a user turn.
- *
- * The international gateway refuses a request whose first message is not a
- * system prompt (code 11128, "first message is not system prompt"), and a host
- * that starts with the user's turn sends none. The content is empty on purpose:
- * it satisfies the check without adding an instruction the model would follow,
- * so the model still sees exactly what the host sent. The CN gateway asks for
- * neither, so this is the one part of the shape that is region-specific.
- */
+const NEUTRAL_SYSTEM_PROMPT = 'You are a helpful assistant.'
+
+/** Global requires a leading system turn; Kimi rejects an empty placeholder. */
 function withLeadingSystemPrompt(prepared: string): string {
   let body: unknown
   try {
@@ -1122,7 +1114,7 @@ function withLeadingSystemPrompt(prepared: string): string {
     && (first as Record<string, unknown>)['role'] === 'system') {
     return prepared
   }
-  obj['messages'] = [{ role: 'system', content: '' }, ...messages]
+  obj['messages'] = [{ role: 'system', content: NEUTRAL_SYSTEM_PROMPT }, ...messages]
   return JSON.stringify(obj)
 }
 
@@ -1184,7 +1176,7 @@ function contentText(content: unknown): string {
  * quoted the client name would fail the next request; that copy is renamed. A
  * neutral system message stays first so a gateway that insists on one still sees
  * it. Returns undefined when there is nothing to move or rename, which is also
- * what keeps an empty system message from looping.
+ * what keeps the neutral placeholder from folding into the user turn again.
  */
 export function foldSystemIntoUser(prepared: string): string | undefined {
   let body: unknown
@@ -1201,12 +1193,14 @@ export function foldSystemIntoUser(prepared: string): string | undefined {
   const prompts: string[] = []
   const rest: unknown[] = []
   let renamed = false
+  let hadSystem = false
   for (const value of messages) {
     if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
       const message = value as Record<string, unknown>
       if (message['role'] === 'system' || message['role'] === 'developer') {
+        hadSystem = true
         const text = contentText(message['content'])
-        if (text.trim() !== '') prompts.push(text)
+        if (text.trim() !== '' && text !== NEUTRAL_SYSTEM_PROMPT) prompts.push(text)
         continue
       }
       if (message['role'] === 'assistant' && 'content' in message) {
@@ -1222,7 +1216,7 @@ export function foldSystemIntoUser(prepared: string): string | undefined {
   }
   if (prompts.length === 0 && !renamed) return undefined
   if (prompts.length === 0) {
-    obj['messages'] = rest
+    obj['messages'] = hadSystem ? [{ role: 'system', content: NEUTRAL_SYSTEM_PROMPT }, ...rest] : rest
     return JSON.stringify(obj)
   }
 
@@ -1242,7 +1236,7 @@ export function foldSystemIntoUser(prepared: string): string | undefined {
         : [{ type: 'text', text: instructions }, ...(Array.isArray(content) ? content : [])],
     }
   }
-  obj['messages'] = [{ role: 'system', content: '' }, ...rest]
+  obj['messages'] = [{ role: 'system', content: NEUTRAL_SYSTEM_PROMPT }, ...rest]
   return JSON.stringify(obj)
 }
 

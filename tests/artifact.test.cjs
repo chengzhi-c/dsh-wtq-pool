@@ -16,6 +16,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const { execSync } = require('node:child_process')
 
@@ -57,6 +58,7 @@ test('the built entry loads and exports the contract the host calls', () => {
 function makeContext() {
   const logs = []
   const disposers = []
+  let published = false
   const noop = () => () => {}
   const ctx = {
     logger: {
@@ -78,16 +80,40 @@ function makeContext() {
     },
     inject: () => noop(),
     on: () => noop(),
-    emit: () => {},
+    emit: (event) => { if (event === 'llm/adapters-updated') published = true },
     get: () => undefined,
     fiber: { entry: { id: 'artifact-smoke' } },
   }
-  return { ctx, logs, disposers }
+  return { ctx, logs, disposers, isPublished: () => published }
 }
 
-test('the built entry activates, answers a panel document, and releases everything', async () => {
+test('the built entry activates, answers a panel document, and releases everything', async (t) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-artifact-'))
+  const dataDirectory = path.join(temporary, 'dsh-wtq-pool')
+  const environment = {
+    DSH_HOME: temporary,
+    HOME: temporary,
+    USERPROFILE: temporary,
+    APPDATA: path.join(temporary, 'roaming'),
+    LOCALAPPDATA: path.join(temporary, 'local'),
+    XDG_CONFIG_HOME: path.join(temporary, 'config'),
+    WORKBUDDY_AUTH_FILE: path.join(temporary, 'auth'),
+  }
+  const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]))
+  Object.assign(process.env, environment)
+  const unexpectedFetch = t.mock.method(globalThis, 'fetch', async () => {
+    throw new Error('artifact fixtures must not reach an upstream')
+  })
+  t.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    fs.rmSync(temporary, { recursive: true, force: true })
+    assert.equal(unexpectedFetch.mock.callCount(), 0, 'the fixture must stay offline')
+  })
   const plugin = require(built)
-  const { ctx, logs, disposers } = makeContext()
+  const { ctx, logs, disposers, isPublished } = makeContext()
   // Every source off: the document is still built, and no gateway or vendor call
   // is made, so the case is about the artifact rather than about the network.
   plugin.apply(ctx, {
@@ -97,22 +123,19 @@ test('the built entry activates, answers a panel document, and releases everythi
     sourceQoder: false,
     distribution: 'priority',
     cooldownSeconds: 60,
-    authFile: '',
+    authFile: path.join(temporary, 'auth', 'login.info'),
     showComposerPoints: false,
   })
   try {
-    // The entry activates asynchronously: `onLoad`, then its registered service.
-    // Waiting for a fixed interval made this case fail on a loaded machine, when
-    // the suite's other files are still transpiling: the document was read before
-    // the fixture's switches had been adopted. Read until they are, with a bound.
-    let document
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      document = await plugin.onPanelInvoke('xd.state', {})
-      if (document.sources.workbuddy === false) break
+    // Publication follows settings adoption and data-path initialization.
+    for (let attempt = 0; attempt < 100 && !isPublished(); attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 100))
     }
+    assert.equal(isPublished(), true, 'activation must publish before the panel is read')
+    const document = await plugin.onPanelInvoke('xd.state', { wait: true })
     assert.equal(typeof document, 'object', 'the panel document must be an object')
     assert.equal(document.sources.workbuddy, false, 'the switches the fixture set are the ones the document reports')
+    assert.equal(fs.existsSync(dataDirectory), true, 'the built entry must use the isolated fixture data directory')
     assert.ok(Array.isArray(document.accounts), 'the document carries the account list the panel paints')
     assert.ok(document.shims !== undefined, 'and the gateway rows')
     // A channel the entry does not implement is refused through `panelError`, not

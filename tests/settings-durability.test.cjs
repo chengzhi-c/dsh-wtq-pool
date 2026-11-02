@@ -87,7 +87,7 @@ function loadHost(options = {}) {
     'parseKnownModelIds', 'mergeSelectionForPartialRoster',
     'orderSourceCredentials', 'traeClaimFor', 'gatewaySelectionFor', 'sourceDistribution',
     'sourceRosterFor', 'traeNativeOf', 'traeDeclarationModels', 'traeGateways',
-    'creditReserves', 'isSelectableSourceModel', 'gatewayEnabledIds', 'sourceModelView']
+    'creditReserves', 'isSelectableSourceModel', 'gatewayEnabledIds', 'sourceModelView', 'refreshAll']
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8'))
     + `\nmodule.exports.__internals = { ${internals.join(', ')} }\n`
     + '\nmodule.exports.__settings = (next) => { settings = next }\n'
@@ -96,7 +96,7 @@ function loadHost(options = {}) {
     + '\nmodule.exports.__start = () => { serviceStopped = false }\n', context)
   const internalsApi = context.module.exports.__internals
   return {
-    logs,
+    logs, temporary,
     internals: internalsApi,
     setReadFails() { readFails = true },
     setDocument(value) { settingsDocument = value },
@@ -623,4 +623,40 @@ test('an empty model list disables every model, and a punctuation alias keeps it
     assert.equal(host.internals.isSelectableSourceModel('qoder', { id: 'm-1', name: '—', nativeName: '—' }), false,
       'a catalog name with nothing to show is still dropped')
   } finally { host.cleanup() }
+})
+
+test('refreshing disabled WorkBuddy regions does not discover or archive sign-ins', async (t) => {
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  for (const settings of [
+    { sourceWorkbuddy: false },
+    { sourceWorkbuddy: true, disabledRegions: ['workbuddy:cn', 'workbuddy:global'] },
+  ]) {
+    await t.test(settings.sourceWorkbuddy ? 'both regions parked' : 'source disabled', async () => {
+      const host = loadHost()
+      const auth = path.join(host.temporary, 'auth')
+      const data = path.join(host.temporary, 'data')
+      fs.mkdirSync(auth)
+      fs.writeFileSync(path.join(auth, 'fixture.info'), JSON.stringify({
+        auth: { accessToken: 'fixture-token', refreshToken: 'fixture-refresh', expiresAt: Date.now() + 3600000 },
+        account: { uin: 'fixture-off', nickname: 'Fixture' },
+      }))
+      host.setDocument({
+        enabled: true, sourceTrae: false, sourceQoder: false, autoCheckin: { enabled: false },
+        authFile: path.join(auth, 'fixture.info'), ...settings,
+      })
+      const pool = new WorkBuddyAccountPool({ authDirs: [auth], dataPath: () => data })
+      host.setCorePool(pool)
+      host.start()
+      try {
+        await host.internals.refreshAll('test', true)
+        assert.deepEqual({
+          accounts: pool.list().length,
+          archived: fs.existsSync(path.join(data, 'credentials-archive.json')),
+        }, { accounts: 0, archived: false })
+      } finally {
+        await host.stop()
+        host.cleanup()
+      }
+    })
+  }
 })

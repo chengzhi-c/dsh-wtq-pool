@@ -143,9 +143,28 @@ test('entering the growth tab re-reads a stale read, and waits out a running pas
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
   const at = source.indexOf('function selectTab(')
   assert.notEqual(at, -1, 'the tab switch must exist')
-  const body = source.slice(at, source.indexOf('\n}', at))
-  assert.match(body, /name === "growth"[\s\S]{0,240}?growthStale\(\)[\s\S]{0,120}?readGrowth\(\)/,
-    'selecting the growth tab must read a stale state instead of waiting to be asked')
-  assert.match(body, /state\.growth\.running/,
-    'and must not fire beside a pass that is already walking the same accounts')
+  const context = loadFreshness()
+  let reads = 0
+  Object.assign(context, {
+    $: (id) => id,
+    show() {},
+    document: { querySelectorAll: () => [] },
+    pageScrollTo() {},
+    readGrowth: () => { reads += 1 },
+  })
+  vm.runInContext(source.slice(at, source.indexOf('\n}', at) + 2), context)
+  const cases = [
+    { label: 'stale read', want: 1 },
+    { label: 'fresh read', growthState: { ...ROWS, readAt: Date.now() }, want: 0 },
+    { label: 'running pass', state: { growth: { running: true } }, want: 0 },
+    { label: 'busy action', busy: 'checkin', want: 0 },
+    { label: 'pending read', growthReading: true, want: 0 },
+    { label: 'another tab', tab: 'pool', want: 0 },
+  ]
+  for (const { label, tab = 'growth', want, ...state } of cases) {
+    reads = 0
+    Object.assign(context, { state: null, growthState: null, busy: null, growthReading: false }, state)
+    context.selectTab(tab)
+    assert.equal(reads, want, label)
+  }
 })

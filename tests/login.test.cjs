@@ -360,7 +360,7 @@ test('a path outside the plugin directory is refused however it is spelled', asy
  * unchanged list, which reads as a failed add, and the account had been written
  * and scanned all along.
  */
-test('a finished login answers with the document the panel adopts', async (t) => {
+test('only the current login writes credentials and returns the panel document', async (t) => {
   const vm = require('node:vm')
   const { createRequire } = require('node:module')
   const { createServer } = require('node:http')
@@ -386,16 +386,19 @@ test('a finished login answers with the document the panel adopts', async (t) =>
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
   // The device flow's three endpoints, in the envelope every one of them uses.
+  let starts = 0
+  let finishOld
   const loginStub = {
     startDeviceLogin: async (realm) => ({
-      state: 'st-doc', authUrl: `https://example.invalid/${realm}/login?state=st-doc`,
+      state: 'st-' + ++starts, authUrl: `https://example.invalid/${realm}/login`,
     }),
-    pollDeviceLogin: async () => ({
+    pollDeviceLogin: async (_realm, state) => ({
       status: 'ok',
       signIn: {
         region: 'cn', accessToken: 'at-added', refreshToken: 'rt-added',
         expiresAtMs: Date.now() + 3600000, domain: 'www.codebuddy.cn',
-        uid: 'u-added', uin: '90000000021', enterpriseId: '', nickname: 'Added From Panel',
+        uid: 'u-added', uin: state === 'st-1' ? await new Promise((resolve) => { finishOld = resolve }) : '90000000021',
+        enterpriseId: '', nickname: 'Added From Panel',
       },
     }),
   }
@@ -437,6 +440,13 @@ test('a finished login answers with the document the panel adopts', async (t) =>
   try {
     await plugin.onLoad()
     await plugin.onPanelInvoke('xd.startLogin', { realm: 'cn' })
+    const old = plugin.onPanelInvoke('xd.pollLogin', { realm: 'cn' })
+    assert.equal(typeof finishOld, 'function')
+    await plugin.onPanelInvoke('xd.startLogin', { realm: 'cn' })
+    const rejected = assert.rejects(old, (error) => error.code === 'NO_LOGIN')
+    finishOld('90000000022')
+    await rejected
+    assert.equal(fs.existsSync(path.join(own, 'workbuddy-panel-90000000022.info')), false)
     const replied = await plugin.onPanelInvoke('xd.pollLogin', { realm: 'cn' })
     assert.equal(replied.status, 'ok')
     assert.equal(replied.nickname, 'Added From Panel')
@@ -489,6 +499,7 @@ test('a deleted account is not remembered as switched off when it is added again
     // The region under test has to be live: a parked region is never scanned, so
     // its pool stays empty and there would be no account to delete.
     disabledRegions: ['workbuddy:global'],
+    authFile: path.join(own, 'fixture.info'),
     autoCheckin: { enabled: false },
   }
   const { installPi } = require('../src/pi-compat.ts')
@@ -514,7 +525,6 @@ test('a deleted account is not remembered as switched off when it is added again
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
   const plugin = context.module.exports
   try {
-    await plugin.onLoad()
     const { writeOwnSignIn, ownSignInDir, workbuddyAccountId } = require('../src/accounts.ts')
     const signIn = {
       region: 'cn', accessToken: 'at-again', refreshToken: 'rt-again',
@@ -523,8 +533,8 @@ test('a deleted account is not remembered as switched off when it is added again
     }
     await writeOwnSignIn(ownSignInDir(directory), signIn)
     const id = workbuddyAccountId({ uin: signIn.uin, uid: signIn.uid, domain: signIn.domain })
-    // The service scans on start; the file is written after it, so ask once for the
-    // re-read the panel's own refresh button performs.
+    // Seed before startup so a background scan cannot capture an empty fixture.
+    await plugin.onLoad()
     await plugin.onPanelInvoke('xd.rescan')
     const listed = await plugin.onPanelInvoke('xd.state')
     assert.ok(listed.accounts.some((account) => account.id === id),

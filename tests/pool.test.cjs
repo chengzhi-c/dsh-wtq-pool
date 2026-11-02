@@ -14,7 +14,7 @@
  * the same TypeScript transform the host builds with.
  */
 const assert = require('node:assert/strict')
-const { test } = require('node:test')
+const { test, after } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -46,7 +46,11 @@ registerHooks({
 const { WorkBuddyAccountPool } = require('../src/accounts.ts')
 const { createWorkBuddyShim } = require('../src/shim.ts')
 
-const scratch = (label) => fs.mkdtempSync(path.join(os.tmpdir(), `dsh-pool-${label}-`))
+const scratch = (label) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), `dsh-pool-${label}-`))
+  after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  return directory
+}
 
 /** One readable sign-in file, the shape the desktop app writes. */
 function writeSignIn(dir, name, uid) {

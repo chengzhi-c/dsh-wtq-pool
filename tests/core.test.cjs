@@ -184,6 +184,265 @@ test('a repointed auth directory is not repopulated by the scan already running'
   assert.equal(pool.list().length, 0, 'the new directory has no sign-in')
 })
 
+test('clearing the pool retires an in-flight scan before its next write', async (t) => {
+  for (const boundary of ['sign-in read', 'archive read', 'archive mkdir', 'archive temp write', 'adoption mkdir']) {
+    await t.test(boundary, async (t) => {
+      const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+      const io = require('node:fs/promises')
+      const directory = scratch('clear-scan')
+      const auth = writeSignIn(path.join(directory, 'auth'))
+      const data = path.join(directory, 'data')
+      const archive = path.join(data, 'credentials-archive.json')
+      const own = path.join(data, 'signins')
+      const signIn = path.join(auth, 'workbuddy-desktop.info')
+      if (boundary === 'adoption mkdir') fs.renameSync(signIn, path.join(auth, 'snapshot.info'))
+      const method = boundary.endsWith('mkdir') ? 'mkdir' : boundary === 'archive temp write' ? 'writeFile' : 'readFile'
+      const original = io[method]
+      let release, reached
+      const gate = new Promise((resolve) => { release = resolve })
+      const waiting = new Promise((resolve) => { reached = resolve })
+      t.mock.method(io, method, async (file, ...args) => {
+        const target = String(file)
+        const hit = boundary === 'sign-in read' ? target === signIn
+          : boundary === 'archive read' ? target === archive
+          : boundary === 'archive mkdir' ? target === data
+          : boundary === 'adoption mkdir' ? target === own
+          : target.startsWith(archive + '.') && target.endsWith('.tmp')
+        if (hit && boundary === 'archive read') { reached(); await gate }
+        const answer = await original(file, ...args)
+        if (hit && boundary !== 'archive read') { reached(); await gate }
+        return answer
+      })
+      const pool = new WorkBuddyAccountPool({ authDirs: [auth], dataPath: () => data })
+      const scan = pool.scan()
+      try {
+        await waiting
+        pool.clear()
+        release()
+        await scan
+        assert.equal(pool.list().length, 0, 'the retired scan must not put credentials back into the pool')
+        assert.equal(fs.existsSync(archive), boundary === 'adoption mkdir', 'no archive write may start after clear')
+        assert.deepEqual(fs.existsSync(own) ? fs.readdirSync(own) : [], [], 'no sign-in may be adopted after clear')
+        assert.equal(fs.existsSync(data) && fs.readdirSync(data).some((file) => file.endsWith('.tmp')), false,
+          'a retired archive write must not leave its temporary credentials behind')
+      } finally {
+        release()
+        await scan
+        fs.rmSync(directory, { recursive: true, force: true })
+      }
+    })
+  }
+})
+
+test('a new scan after clear is not joined to or released by the retired scan', async (t) => {
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const io = require('node:fs/promises')
+  const directory = scratch('clear-rescan')
+  const auth = writeSignIn(path.join(directory, 'auth'))
+  const signIn = path.join(auth, 'workbuddy-desktop.info')
+  const readFile = io.readFile
+  const releases = []
+  let reads = 0
+  t.mock.method(io, 'readFile', async (file, ...args) => {
+    if (String(file) === signIn) {
+      reads += 1
+      await new Promise((resolve) => { releases.push(resolve) })
+    }
+    return readFile(file, ...args)
+  })
+  const pool = new WorkBuddyAccountPool({ authDirs: [auth] })
+  const first = pool.scan()
+  let second, joined
+  try {
+    while (reads === 0) await tick()
+    pool.clear()
+    second = pool.scan()
+    for (let attempt = 0; attempt < 100 && reads < 2; attempt += 1) await tick()
+    assert.equal(reads, 2, 'the new lifecycle must start its own walk immediately')
+    releases[0]()
+    await first
+    joined = pool.scan()
+    await tick()
+    assert.equal(reads, 2, 'the old finally must not release the new scan slot')
+    releases[1]()
+    await Promise.all([second, joined])
+    assert.equal(pool.list().length, 1, 'the new scan may populate the pool normally')
+  } finally {
+    for (const release of releases) release()
+    await Promise.allSettled([first, second, joined])
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+for (const method of ['rescan', 'acquire']) test(`a waiting ${method} does not restart discovery after clear`, async (t) => {
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const io = require('node:fs/promises')
+  const directory = scratch('clear-waiter')
+  const auth = writeSignIn(path.join(directory, 'auth'))
+  const data = path.join(directory, 'data')
+  const readFile = io.readFile
+  let release, reached
+  const gate = new Promise((resolve) => { release = resolve })
+  const waiting = new Promise((resolve) => { reached = resolve })
+  t.mock.method(io, 'readFile', async (file, ...args) => {
+    if (String(file) === path.join(auth, 'workbuddy-desktop.info')) { reached(); await gate }
+    return readFile(file, ...args)
+  })
+  const pool = new WorkBuddyAccountPool({ authDirs: [auth], dataPath: () => data })
+  const scan = pool.scan()
+  const request = pool[method]()
+  try {
+    await waiting
+    pool.clear()
+    release()
+    await Promise.all([scan, request])
+    assert.equal(pool.list().length, 0, 'the caller belongs to the cleared lifecycle too')
+    assert.equal(fs.existsSync(path.join(data, 'credentials-archive.json')), false)
+  } finally {
+    release()
+    await Promise.allSettled([scan, request])
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+for (const existed of [true, false]) test(`a retired ${existed ? 'empty' : 'missing'} deletion read cannot replace a completed removal`, async (t) => {
+  const { WorkBuddyAccountPool, writeOwnSignIn } = require('../src/accounts.ts')
+  const io = require('node:fs/promises')
+  const directory = scratch('clear-delete')
+  const auth = path.join(directory, 'auth')
+  const data = path.join(directory, 'data')
+  const own = path.join(data, 'signins')
+  const deleted = path.join(data, 'deleted-signins.json')
+  fs.mkdirSync(auth)
+  const signIn = await writeOwnSignIn(own, {
+    accessToken: 'fixture-delete-token', refreshToken: '', expiresAtMs: Date.now() + 3600000,
+    domain: 'www.codebuddy.cn', uid: 'fixture-delete', uin: 'fixture-delete', nickname: 'Fixture',
+    enterpriseId: '', lastRefreshAtMs: Date.now() - 3600000,
+  })
+  fs.copyFileSync(signIn, path.join(auth, 'snapshot.info'))
+  if (existed) fs.writeFileSync(deleted, '{"version":1,"entries":{}}')
+  let releaseRead, readReached, releaseWrite, writeReached
+  const reading = new Promise((resolve) => { readReached = resolve })
+  const readGate = new Promise((resolve) => { releaseRead = resolve })
+  const writing = new Promise((resolve) => { writeReached = resolve })
+  const writeGate = new Promise((resolve) => { releaseWrite = resolve })
+  const readFile = io.readFile, rename = io.rename
+  let firstRead = true
+  t.mock.method(io, 'readFile', async (file, ...args) => {
+    if (String(file) !== deleted || !firstRead) return readFile(file, ...args)
+    firstRead = false
+    const answer = await readFile(file, ...args).then((value) => ({ value }), (error) => ({ error }))
+    readReached()
+    await readGate
+    if (answer.error) throw answer.error
+    return answer.value
+  })
+  t.mock.method(io, 'rename', async (from, to, ...args) => {
+    const answer = await rename(from, to, ...args)
+    if (String(to) === deleted) { writeReached(); await writeGate }
+    return answer
+  })
+  const pool = new WorkBuddyAccountPool({ authDirs: [auth], dataPath: () => data })
+  const scan = pool.scan()
+  let removing
+  try {
+    await reading
+    pool.clear()
+    await pool.scan()
+    removing = pool.removeOwnSignIn(pool.list()[0].id)
+    await writing
+    releaseRead()
+    await scan
+    releaseWrite()
+    assert.equal(await removing, true)
+    assert.equal(Object.keys(JSON.parse(fs.readFileSync(deleted, 'utf8')).entries).length, 1)
+    await pool.scan()
+    assert.equal(pool.list().length, 0, 'the retained snapshot must remain hidden by the persisted deletion')
+  } finally {
+    releaseRead()
+    releaseWrite()
+    await Promise.allSettled([scan, removing])
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+for (const mode of ['disabled', 'removed', 'model cooldown', 'all unavailable']) test(`acquire rechecks a fallback refresh after ${mode}`, async (t) => {
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const directory = scratch('acquire-refresh')
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const now = Date.now()
+  const authDirs = ['a', 'b', 'c'].map((name, index) => {
+    const dir = path.join(directory, name)
+    fs.mkdirSync(dir)
+    fs.writeFileSync(path.join(dir, 'workbuddy-desktop.info'), JSON.stringify({
+      auth: { accessToken: `token-${name}`, refreshToken: `refresh-${name}`, expiresAt: now + 60000, lastRefreshTime: now - index * 1000 },
+      account: { uin: name, nickname: name },
+    }))
+    return dir
+  })
+  const rejected = new Set()
+  const refreshed = []
+  const pool = new WorkBuddyAccountPool({ authDirs, client: {
+    async refreshToken(credential) {
+      refreshed.push(credential.uin)
+      await Promise.resolve()
+      if (credential.uin !== 'c' || mode === 'all unavailable') {
+        const id = pool.list().find(account => account.credential.uin === credential.uin).id
+        rejected.add(id)
+        if (mode === 'removed') pool.applyRemoved(rejected)
+        else if (mode === 'model cooldown') pool.penalize(id, now + 60000, 'hy3')
+        else pool.applyConfig({ disabledAccountIds: [...rejected] })
+      }
+      return { accessToken: `renewed-${credential.uin}`, refreshToken: `renewed-refresh-${credential.uin}`, expiresInSec: 3600 }
+    },
+  } })
+  await pool.scan()
+  const account = await pool.acquire('hy3', 'cn')
+  assert.equal(account?.credential.uin, mode === 'all unavailable' ? undefined : 'c',
+    'every refreshed candidate must still be eligible before it is handed out')
+  assert.deepEqual(refreshed, ['a', 'b', 'c'], 'each candidate is refreshed at most once and exhaustion terminates')
+})
+
+for (const fails of [false, true]) test(`a manual rescan reads after the ${fails ? 'failed' : 'successful'} scan already running`, async (t) => {
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const directory = scratch('manual-rescan')
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const pool = new WorkBuddyAccountPool({ authDirs: [directory] })
+  const readOnce = pool.scanOnce
+  let captured
+  let release
+  const snapshot = new Promise((resolve) => { captured = resolve })
+  const gate = new Promise((resolve) => { release = resolve })
+  let walks = 0
+  t.mock.method(pool, 'scanOnce', async function (dirs) {
+    walks += 1
+    const accounts = await readOnce.call(this, dirs)
+    if (walks === 1) {
+      captured(accounts)
+      await gate
+      if (fails) throw new Error('background scan failed')
+    }
+    return accounts
+  })
+  const background = Promise.allSettled([pool.scan(), pool.scan()])
+  try {
+    assert.deepEqual(await snapshot, [], 'the background scan read the empty directory')
+    writeAccountSignIn(directory, 'uin-added', 'Added')
+    const manual = Promise.all([pool.rescan(), pool.rescan()])
+    assert.equal(walks, 1, 'ordinary requests share the existing walk; manual reads must wait for it')
+    release()
+    const results = await manual
+    for (const accounts of results) assert.deepEqual(accounts.map(account => account.credential.uin), ['uin-added'],
+      'a manual rescan must find the sign-in written after the old snapshot')
+    assert.equal(walks, 2, 'simultaneous manual reads share one new walk')
+    assert.deepEqual((await background).map(result => result.status),
+      [fails ? 'rejected' : 'fulfilled', fails ? 'rejected' : 'fulfilled'])
+  } finally {
+    release()
+    await background
+  }
+})
+
 /**
  * A caller hang-up must tear the upstream body down.
  *

@@ -33,7 +33,7 @@
   <a href="https://github.com/chengzhi-c/dsh-wtq-pool/stargazers"><img src="https://img.shields.io/github/stars/chengzhi-c/dsh-wtq-pool?style=flat-square" alt="GitHub stars"></a>
 </p>
 
-> **! A ban is possible. Use at your own discretion; no liability accepted !**
+> Unofficial clients may trigger account restrictions. Review the risks and the relevant service terms before use.
 
 Use local WorkBuddy, Trae and Qoder desktop sign-ins in DeepSeek Harness. WorkBuddy fails over when an account is rate-limited or out of quota. Trae and Qoder select an account per request and move on to the next sign-in on an authentication failure, a rate limit or exhausted quota, while a problem with the request itself, such as an unknown model or a malformed body, is answered as the upstream answered it. Each source has its own switch, with domestic and international accounts grouped separately.
 
@@ -67,7 +67,7 @@ To run the preview locally, clone the repository, run `node docs/serve.cjs`, and
 
 ## Features
 
-- Reuse the local sign-ins: the sign-in files the three desktop apps saved are read as they are. The panel's Add account opens the vendor's own login page and writes the result into the plugin's own directory.
+- Reuse local sign-ins from the three desktop apps. WorkBuddy also supports Add account in the panel, which uses its official login page and saves the sign-in in the plugin's own directory.
 - Register model groups by region: each region of each vendor becomes its own provider, and several can be on at once; a region with no account is not registered. A domestic model runs only on domestic accounts, and an international model only on international ones.
 - Account distribution: WorkBuddy supports priority, round-robin, expiring credits first and conversation-sticky accounts, and fails over on a rate limit or exhausted quota. Trae and Qoder support priority, round-robin and expiring credits first, and move on to the next sign-in on an authentication failure, a rate limit or exhausted quota.
 - Gateway responses are SSE streams of `chat.completion.chunk`; the `stream` field in the request body does not change the format.
@@ -168,13 +168,13 @@ These are the preferred ports. When one is taken, the gateway binds an ephemeral
 
 When another process takes a port between the reservation and the listen, that gateway's start fails: its model group is dropped, the connection check reports the reason, and the panel surfaces address drift. Requests reach the new address only after the plugin is reloaded and the host re-reads its declaration.
 
-The PI-Desktop edition uses a separate range starting at 41831, so both plugins can be installed on one machine with each range intact. Each edition keeps its own copy of a sign-in and renews it on its own schedule, and the upstream rotates the refresh token whenever one does. A single account is therefore held by whichever edition renewed it last: the other one's refresh token stops working, its panel marks the account as needing a sign-in, and "Add account" puts it back. The token days differ for the same reason, since each row shows the expiry of that edition's own copy. To keep one account working in both editions, add it in only one of them, or re-add it in the one that was marked.
+The PI-Desktop edition uses a separate port range starting at 41831. Both editions can be installed together, but settings and credentials are stored separately and are not synchronized. If both use the same WorkBuddy sign-in, upstream refresh-token rotation may invalidate the other copy. When an edition asks for a new sign-in, add the account again there rather than overwriting it with old `signins/` files. The editions may show different token expiry times.
 
 ## Data and outbound requests
 
-The plugin reads the vendors' local sign-in files. Providers are registered at runtime; the host persists plugin settings in the profile. Tokens are held by the plugin and go only to the relevant vendor endpoints. Gateways listen on `127.0.0.1`; the panel accepts loopback requests only.
+The plugin reads the vendors' local sign-in files. Providers are registered at runtime; the host persists plugin settings in the profile. Tokens are held by the plugin and go only to the relevant vendor endpoints. Gateways listen on `127.0.0.1`, so other local processes can call them and spend account quota. The panel accepts loopback requests only.
 
-The plugin's own data directory, `~/.dsh/dsh-wtq-pool/` (or `$DSH_HOME` when set), holds four files (a `deleted-signins.json.lock` appears for a moment while the delete record is written). `checkin-slots.json` records the check-in slots already collected and the pending Qoder retry time; slots are kept for three days. `doctor.txt` is the most recent connection report, item by item, and lists no account label. `credentials-archive.json` keeps the sign-ins a later account switch overwrote: access and refresh tokens, account identifiers (nickname, uin/uid, enterprise id) and the local sign-in path. Entries are kept by token expiry, dropping each 30 days after it; an entry with no stated expiry is kept until the account is deleted. `deleted-signins.json` records deleted sign-ins as a token digest, the sign-in's issue time and a delete time, so a scan cannot take the same superseded snapshot back over from the desktop app; the entry lapses once that account signs in again. These files carry no additional encryption; access is bounded by the operating system's file ACLs.
+The plugin's own data directory, `~/.dsh/dsh-wtq-pool/` (or `$DSH_HOME/dsh-wtq-pool/` when set), holds four files (a `deleted-signins.json.lock` appears for a moment while the delete record is written). `checkin-slots.json` records the check-in slots already collected and the pending Qoder retry time; slots are kept for three days. `doctor.txt` is the most recent connection report, item by item, and lists no account label. `credentials-archive.json` keeps the sign-ins a later account switch overwrote: access and refresh tokens, account identifiers (nickname, uin/uid, enterprise id) and the local sign-in path. Entries are kept by token expiry, dropping each 30 days after it; an entry with no stated expiry is kept until the account is deleted. `deleted-signins.json` records deleted sign-ins as a token digest, the sign-in's issue time and a delete time, so a scan cannot take the same superseded snapshot back over from the desktop app; the entry lapses once that account signs in again. These files carry no additional encryption; access is bounded by the operating system's file ACLs.
 
 Every sign-in the plugin writes lives in `signins/` beside it: ones added from the panel, snapshots adopted from the desktop app, and renewed copies. Each file is named after the account's billing identity and read on the same terms as a desktop sign-in. These files are not additionally encrypted either; access is bounded by the operating system's file ACLs. "Delete" in the panel removes that file together with its archive entry, and the snapshot the desktop app left behind stops being adopted; signing the account in again brings it back. "Remove" only disables the account, and "Removed accounts" restores it.
 
@@ -203,7 +203,7 @@ The host-agnostic core:
 | Module | Responsibility |
 | --- | --- |
 | `loopback.ts` | The loopback security model (Host and Origin checks), response writing, stream relay and message redaction |
-| `accounts.ts` | WorkBuddy sign-in parsing, token encryption, the account pool and its cooldowns |
+| `accounts.ts` | WorkBuddy sign-in parsing, the account pool and its cooldowns |
 | `upstream.ts` | The WorkBuddy upstream client, error classification, rate-limit reset parsing |
 | `catalog.ts` | The model catalogue and its static fallback list |
 | `shim.ts` | The WorkBuddy gateway's OpenAI-compatible endpoint |

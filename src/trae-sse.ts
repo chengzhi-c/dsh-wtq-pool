@@ -40,6 +40,9 @@ export class SseDecoder {
   private retry: number | undefined
   private data: string[] = []
   private dataChars = 0
+  private rawFrame = ''
+
+  constructor(private readonly onFrame?: (raw: string, event: SseEvent | undefined) => void) {}
 
   push(chunk: string): SseEvent[] {
     this.buffer += chunk
@@ -51,9 +54,16 @@ export class SseDecoder {
       if (match === null || match.index === undefined) break
       if (match[0] === '\r' && match.index + 1 === this.buffer.length) break
       const line = this.buffer.slice(0, match.index)
+      if (this.onFrame !== undefined) {
+        this.appendRaw(this.buffer.slice(0, match.index + match[0].length))
+      }
       this.buffer = this.buffer.slice(match.index + match[0].length)
       const emitted = this.consumeLine(line)
       if (emitted !== undefined) events.push(emitted)
+      if (line === '' && this.onFrame !== undefined) {
+        this.onFrame(this.rawFrame, emitted)
+        this.rawFrame = ''
+      }
     }
     // What is left has no newline in it, so nothing will ever reduce it: a
     // stream that keeps sending bytes without ending a line is a stream this
@@ -74,6 +84,7 @@ export class SseDecoder {
   finish(): SseEvent[] {
     const events: SseEvent[] = []
     if (this.buffer !== '') {
+      if (this.onFrame !== undefined) this.appendRaw(this.buffer)
       // A stream that ended on a bare carriage return leaves it on the buffer,
       // and consuming it as part of the value kept `[DONE]` from matching.
       const tail = this.buffer.endsWith('\r') ? this.buffer.slice(0, -1) : this.buffer
@@ -83,7 +94,19 @@ export class SseDecoder {
     }
     const final = this.dispatch()
     if (final !== undefined) events.push(final)
+    if (this.rawFrame !== '' && this.onFrame !== undefined) {
+      this.onFrame(this.rawFrame, events[0])
+      this.rawFrame = ''
+    }
     return events
+  }
+
+  private appendRaw(value: string): void {
+    if (this.rawFrame.length + value.length > MAX_DATA_CHARS) {
+      this.rawFrame = ''
+      throw new Error('sse event exceeded ' + MAX_DATA_CHARS + ' characters of framing without a separator')
+    }
+    this.rawFrame += value
   }
 
   private consumeLine(line: string): SseEvent | undefined {

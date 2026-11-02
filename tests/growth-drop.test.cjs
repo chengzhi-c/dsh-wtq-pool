@@ -103,19 +103,22 @@ test('the host settings card, a rescan and a new login all drop the read', () =>
   // flight across one of them describes a pool that no longer exists. Asserted on
   // the entry point: a helper test cannot see whether the call is there.
   const entry = fs.readFileSync(path.join(root, 'src', 'host.ts'), 'utf8')
-  const bodyOf = (marker, length) => {
+  const bodyOf = (marker) => {
     const at = entry.indexOf(marker)
     assert.notEqual(at, -1, `${marker} must exist in the entry`)
-    return entry.slice(at, at + length)
+    const end = entry.indexOf(marker.startsWith('case ') ? '\n    }' : '\n}', at)
+    assert.notEqual(end, -1, `${marker} must have a closing block`)
+    return entry.slice(at, end)
   }
-  // Each window stops before the next call site, so deleting the call this case
-  // is about cannot be covered by a neighbouring one.
-  assert.match(bodyOf('async function onHostSettingsChanged(next)', 3000), /await applySettingsEverywhere\(toggled\)/,
+  // A neighbouring branch must not satisfy this block's assertion.
+  assert.match(bodyOf('async function onHostSettingsChanged(next)'), /await applySettingsEverywhere\(toggled\)/,
     'a host settings change must reach the shared reconciliation')
-  assert.match(bodyOf('async function applySettingsEverywhere(toggled)', 1400), /if \(toggled\)[\s\S]{0,160}?growthRead = null/,
+  assert.match(bodyOf('async function applySettingsEverywhere(toggled)'), /if \(toggled\)[\s\S]*?growthRead = null/,
     'a source or region switched in the host settings must drop the read')
-  assert.match(bodyOf('case "xd.rescan": {', 900), /growthRead = null/,
+  assert.match(bodyOf('case "xd.rescan": {'), /growthRead = null/,
     'a rescan can add or retire accounts, so it must drop the read')
-  assert.match(bodyOf('case "xd.pollLogin": {', 1000), /growthRead = null/,
+  assert.match(bodyOf('case "xd.rescan": {'), /core\.pool\.rescan\(\)/,
+    'a manual rescan must not reuse a snapshot started before the click')
+  assert.match(bodyOf('case "xd.pollLogin": {'), /growthRead = null/,
     'an account that just landed is not in a read taken before it')
 })

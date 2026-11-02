@@ -1,4 +1,4 @@
-// Serve this repository over http://127.0.0.1 so the preview page opens in a
+// Serve the public preview over http://127.0.0.1 so the page opens in a
 // browser. The preview fetches the panel markup it mounts (browsers block that
 // under file://) and the panel's own CSP admits scripts only from its own
 // origin; an http origin satisfies both.
@@ -13,18 +13,26 @@ const path = require('node:path')
 
 const ROOT = path.resolve(__dirname, '..')
 const PORT = Number(process.argv[2] || 8124)
+const PUBLIC_FILES = new Set([
+  'docs/index.html', 'docs/preview-panel.html', 'docs/preview-data.js',
+  'docs/logo.png', 'docs/logo-dark.png', 'docs/preview-pool.png',
+  'docs/preview-dark.png', 'docs/preview-models.png', 'docs/preview-growth.png',
+  'docs/preview-page.png', 'renderer/index.html', 'renderer/panel.js', 'renderer/panel.css',
+])
 
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
   '.png': 'image/png',
-  '.svg': 'image/svg+xml',
 }
 
 http.createServer((req, res) => {
+  // Loopback binding alone does not stop a browser using DNS rebinding.
+  if (!/^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(req.headers.host || '')) {
+    res.writeHead(403).end('forbidden')
+    return
+  }
   // A request-target the parser cannot resolve also throws, and it does so
   // before the guards below run: same rule as the decode failures, answered
   // rather than allowed to kill the server.
@@ -57,11 +65,11 @@ http.createServer((req, res) => {
     res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }).end('bad request: ' + url.pathname)
     return
   }
-  const file = path.resolve(ROOT, rel)
-  if (file !== ROOT && !file.startsWith(ROOT + path.sep)) {
+  if (!PUBLIC_FILES.has(rel)) {
     res.writeHead(403).end('forbidden')
     return
   }
+  const file = path.join(ROOT, rel)
   fs.readFile(file, (err, body) => {
     if (err) {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('not found: ' + rel)

@@ -20,7 +20,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { POOL_HOLD_MS, type WorkBuddyAccount, type WorkBuddyAccountPool } from './accounts'
 import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog'
 import { classifyUpstreamError, isHardCreditText, parseRateLimitReset, retryAfterSeconds, WorkBuddyUpstreamClient, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream'
-import { SseDecoder } from './trae-sse'
+import { SseDecoder, type SseEvent } from './trae-sse'
 
 export interface ShimLogger {
   info?(...args: unknown[]): void
@@ -66,17 +66,19 @@ export interface WorkBuddyShimOptions {
  * Loopback guards, the request body bound and the server shell live in
  * `./loopback` — one copy, shared with the Trae and Qoder gateways.
  */
-import { boundedRetryAfterSeconds, channelCheckRefusal, createLoopbackServer, guardsPass, isJsonContentType, listedModels, PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, readRequestBody, relayStreamOf, requestPathname, safeMessage, unapprovedChannelRefusal, writeChunk, writeJson, writeOpenAIError } from './loopback'
+import { boundedRetryAfterSeconds, channelCheckRefusal, createLoopbackServer, guardsPass, isJsonContentType, listedModels, openAIFinishReason, PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, readRequestBody, relayStreamOf, requestPathname, safeMessage, unapprovedChannelRefusal, writeChunk, writeJson, writeOpenAIError } from './loopback'
 import { LOG_PREFIX, accountLogTag } from './log'
 
-/** Whether one SSE data frame carries a non-null `finish_reason`. */
-function carriesFinishReason(data: string): boolean {
+function completionState(data: string): { finished: boolean; toolCalls: boolean } {
   try {
-    const parsed = JSON.parse(data) as { choices?: Array<{ finish_reason?: unknown }> }
-    return Array.isArray(parsed.choices)
-      && parsed.choices.some(choice => typeof choice?.finish_reason === 'string' && choice.finish_reason !== '')
+    const parsed = JSON.parse(data) as { choices?: Array<{ finish_reason?: unknown; delta?: { tool_calls?: unknown } }> }
+    const choices = Array.isArray(parsed.choices) ? parsed.choices : []
+    return {
+      finished: choices.some(choice => typeof choice?.finish_reason === 'string' && choice.finish_reason !== ''),
+      toolCalls: choices.some(choice => Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0),
+    }
   } catch {
-    return false
+    return { finished: false, toolCalls: false }
   }
 }
 /** HTTP status each upstream failure class surfaces as. */
@@ -653,13 +655,18 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         const reader = relayStreamOf(result.response).getReader()
         let sawDone = false
         let sawFinish = false
+        let sawToolCalls = false
         let envelopeFailure: UpstreamErrorKind | undefined
         // A read that died before any byte was written. The relay cannot answer
         // this in-band because no header has been sent yet; the outer loop is
         // where the next account lives.
         let headFailure: string | undefined
         const decoder = new TextDecoder()
-        const sse = new SseDecoder()
+        const frames: Array<{ raw: string; event: SseEvent | undefined }> = []
+        const sse = new SseDecoder((raw, event) => frames.push({ raw, event }))
+        const finishChunk = (): Buffer => Buffer.from(`data: ${JSON.stringify({
+          choices: [{ index: 0, delta: {}, finish_reason: openAIFinishReason(undefined, sawToolCalls) }],
+        })}\n\n`)
         const startStream = (): void => {
           res.writeHead(200, {
             'Content-Type': 'text/event-stream',
@@ -712,11 +719,33 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           // `finish_reason` null, which reads as a turn still in flight. The
           // sibling bridges already send this frame before their terminator.
           if (!sawFinish) {
-            res.write(`data: ${JSON.stringify({
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            })}\n\n`)
+            res.write(finishChunk())
           }
           res.end('data: [DONE]\n\n')
+        }
+
+        const relayFrames = async (finishTail = false): Promise<boolean> => {
+          for (const { raw, event } of frames.splice(0)) {
+            const chunk = Buffer.from(finishTail ? raw + '\n\n' : raw)
+            if (event?.data === '[DONE]') {
+              if (!sawFinish) {
+                await writeChunk(res, finishChunk())
+                sawFinish = true
+              }
+              await writeChunk(res, chunk)
+              sawDone = true
+              res.end()
+              await reader.cancel().catch(() => {})
+              return true
+            }
+            if (event !== undefined) {
+              const state = completionState(event.data)
+              sawFinish ||= state.finished
+              sawToolCalls ||= state.toolCalls
+            }
+            await writeChunk(res, chunk)
+          }
+          return false
         }
 
         /**
@@ -827,49 +856,16 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                 : ended ? { done: true, value: undefined } : await reader.read()
               if (done || value === undefined) break
               if (!res.writable) return
-              // Honours the client's socket: writing past a full buffer would
-              // park the whole answer in this process instead of slowing the read
-              // from the upstream, as the two sibling gateways already do.
-              await writeChunk(res, value)
-              try {
-                const decoded = decoder.decode(value, { stream: true })
-                const events = sse.push(decoded)
-                if (!sawFinish && events.some(event => carriesFinishReason(event.data))) sawFinish = true
-                if (events.some(event => event.data === '[DONE]')) {
-                  // The terminal frame is the last thing the client needs. A
-                  // stream that sent content but no finish frame gets one here,
-                  // before the terminator, or the last `finish_reason` stays
-                  // null and the turn reads as unfinished.
-                  if (!sawFinish && res.writable) {
-                    res.write(`data: ${JSON.stringify({
-                      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-                    })}\n\n`)
-                    sawFinish = true
-                  }
-                  // Ending the response here is what closes the turn:
-                  // `closeWithoutDone` deliberately does nothing once `[DONE]`
-                  // has been seen. The upstream is cancelled rather than
-                  // drained, so a stream that keeps talking after its
-                  // terminator is not read any further.
-                  sawDone = true
-                  if (res.writable) res.end()
-                  await reader.cancel().catch(() => {})
-                  return
-                }
-              } catch {
-                // Malformed frames are relayed as they arrived; the tail flush at
-                // the end is what decides whether `[DONE]` was really missing.
-              }
+              // Hold only the incomplete frame, so a split [DONE] can never
+              // overtake its finish chunk. Complete frames keep their raw bytes.
+              sse.push(decoder.decode(value, { stream: true }))
+              if (await relayFrames()) return
             }
             if (!sawDone) {
-              try {
-                const rest = decoder.decode()
-                const events = rest === '' ? sse.finish() : [...sse.push(rest), ...sse.finish()]
-                if (events.some(event => event.data === '[DONE]')) sawDone = true
-                if (events.some(event => carriesFinishReason(event.data))) sawFinish = true
-              } catch {
-                // Same as above: the frames already relayed stand.
-              }
+              const rest = decoder.decode()
+              if (rest !== '') sse.push(rest)
+              sse.finish()
+              if (await relayFrames(true)) return
             }
             closeWithoutDone()
           } catch (error: unknown) {

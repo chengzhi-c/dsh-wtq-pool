@@ -165,7 +165,7 @@ test('a stream that ends without [DONE] still carries a finish chunk', async () 
     prepareChatBody: (raw) => JSON.parse(raw),
     chatStream: async () => ({
       ok: true,
-      response: new Response('data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n', {
+      response: new Response('data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}', {
         status: 200, headers: { 'content-type': 'text/event-stream' },
       }),
     }),
@@ -176,6 +176,8 @@ test('a stream that ends without [DONE] still carries a finish chunk', async () 
     assert.equal(answer.status, 200)
     assert.match(answer.text, /"finish_reason":"stop"/, 'a truncated stream must end with a finish chunk')
     assert.ok(answer.text.includes('data: [DONE]'), 'and with the terminator')
+    assert.doesNotThrow(() => JSON.parse(answer.text.slice(6, answer.text.indexOf('\n\n'))),
+      'the unterminated upstream answer and the synthetic finish must remain separate SSE frames')
   } finally {
     await shim.close()
   }
@@ -422,12 +424,22 @@ test('an empty 200 stream is a failed attempt, not the end of the turn', async (
   }
 })
 
-test('a [DONE] with no finish frame still carries one', async () => {
+for (const [name, chunks, finish] of [
+  ['text and terminator together', ['data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'], 'stop'],
+  ['split terminator', ['data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\r\n\r\ndata: [DO', 'NE]\r\n\r\n'], 'stop'],
+  ['unterminated terminator', ['data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\ndata: [DONE]\r'], 'stop'],
+  ['tool call', ['data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"echo","arguments":"{}"}}]}}]}\n\ndata: [DONE]\n\n'], 'tool_calls'],
+]) test(`a [DONE] with no finish frame still carries one: ${name}`, async () => {
   const client = {
     prepareChatBody: (raw) => JSON.parse(raw),
     chatStream: async () => ({
       ok: true,
-      response: new Response('data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n', {
+      response: new Response(new ReadableStream({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk))
+          controller.close()
+        },
+      }), {
         status: 200, headers: { 'content-type': 'text/event-stream' },
       }),
     }),
@@ -435,7 +447,10 @@ test('a [DONE] with no finish frame still carries one', async () => {
   const shim = await workbuddyShim({ client, models: ['hy3'] })
   try {
     const answer = await shim.turn()
-    assert.match(answer.text, /"finish_reason":"stop"/, 'the terminator alone leaves the turn unfinished')
+    const finishAt = answer.text.indexOf(`"finish_reason":"${finish}"`)
+    assert.notEqual(finishAt, -1, 'the terminator alone leaves the turn unfinished')
+    assert.ok(finishAt < answer.text.indexOf('data: [DONE]'),
+      'clients stop at [DONE], so the finish frame must precede it')
   } finally {
     await shim.close()
   }
