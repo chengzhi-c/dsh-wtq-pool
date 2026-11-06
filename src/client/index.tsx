@@ -48,6 +48,7 @@ const zh: Record<string, string> = {
   'card.frameTitle': '账号池面板',
   'card.missing': '面板资源没有装好，重新安装这个插件即可。',
   'card.probeFailed': '面板没有打开：',
+  'card.networkError': '网络连接失败',
 }
 
 const en: Record<string, string> = {
@@ -59,6 +60,7 @@ const en: Record<string, string> = {
   'card.frameTitle': 'Account pool panel',
   'card.missing': 'The panel assets are missing; reinstalling this plugin restores them.',
   'card.probeFailed': 'The panel did not open:',
+  'card.networkError': 'Network error',
 }
 
 interface CardProps {
@@ -69,7 +71,7 @@ interface CardProps {
 /**
  * The embedded panel.
  *
- * of the Plugins page and the Plugins page's out of the panel: the panel was
+ * The frame keeps the panel's page and the Plugins page apart: the panel was
  * written as a whole page, and the frame is the boundary that lets it stay one.
  *
  * The frame is only mounted for the full page. The row's inline summary is asked
@@ -147,9 +149,13 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
           })
         })
         .catch(() => {
-          if (!live || remaining > 1) return
+          if (!live) return
+          if (remaining > 1) {
+            setTimeout(() => probe(remaining - 1), 500)
+            return
+          }
           setMissing(true)
-          setProbeFailure(null)
+          setProbeFailure(t('card.networkError'))
         })
     }
     probe(attempts)

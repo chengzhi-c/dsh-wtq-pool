@@ -16,29 +16,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
-const { createRequire, registerHooks } = require('node:module')
-const { fileURLToPath } = require('node:url')
-const ts = require('typescript')
-
-const root = path.resolve(__dirname, '..')
-const transpile = (source) => ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },
-}).outputText
-
-// The host imports its siblings without an extension, so the loader needs the
-// same `.ts` resolution the DSH entry builds against.
-registerHooks({
-  resolve(specifier, context, next) {
-    const ownSource = context.parentURL?.startsWith('file:') && fileURLToPath(context.parentURL).startsWith(path.join(root, 'src') + path.sep)
-    return next(ownSource && specifier.startsWith('.') && path.extname(specifier) === '' ? specifier + '.ts' : specifier, context)
-  },
-  load(url, context, next) {
-    if (url.startsWith('file:') && url.endsWith('.ts')) return {
-      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')),
-    }
-    return next(url, context)
-  },
-})
+const { createRequire } = require('node:module')
+const { root, transpile } = require('./ts-loader.cjs')
 
 const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
 
@@ -196,14 +175,14 @@ test('the keep-alive is run by the button and arms no timer of its own', async (
   const { plugin, timers, settings } = await loadPlugin(t, temporary, { expiresInMs: 60 * 1000 })
   try {
     assert.equal(timers.size, 0, 'no timer is armed while the plugin sits idle')
-    const state = await plugin.onPanelInvoke('xd.state')
-    assert.ok(!('tokenKeepAlive' in state),
-      'and the document carries no switch, because there is nothing to switch on or off')
     assert.ok(!('tokenKeepAlive' in settings), 'and the settings file holds no such key either')
 
     const answer = await plugin.onPanelInvoke('xd.keepAlive')
     assert.equal(answer.keepAlive.refreshed, 1, 'the pass runs when it is asked to')
     assert.equal(timers.size, 0, 'and it arms nothing on the way out')
+    const state = await plugin.onPanelInvoke('xd.state')
+    assert.ok(!('tokenKeepAlive' in state),
+      'and the document carries no switch, because there is nothing to switch on or off')
 
     // Nothing has come due, so a pass that left a timer behind would still be
     // waiting on this clock rather than having already spent it.

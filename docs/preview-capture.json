@@ -1,10 +1,10 @@
 {
   "rendered": {
-    "renderer/index.html": "981f9b4cd9ecb376869a80aab89d3d7b0d730d11448d3fb46050bb97e94fbb10",
-    "renderer/panel.js": "5ea661e6fbbf75bbda2b1fb7471123816a1807103fd3bb34f1a0f4038b4645bf",
-    "renderer/panel.css": "9044728a7c94f5aa57d0f8deda34d24ed2e76c389550f5095a33da3ed60cc9d7",
-    "docs/preview-panel.html": "25c99d8d9dabab1e0e4b2864d41eab16cc5b37da61bbc754e36d0f71cc6a83a2",
-    "docs/preview-data.js": "69193ddbc56a848b89e1f1c1f590b911f37032a62f538da3d3e2937e65e59614"
+    "renderer/index.html": "42ff7be54592a29f6082ece6f907ae7dd7fc331be4748573bba5f85d365aa0ac",
+    "renderer/panel.js": "563c66d112e5663dc3044a286ad6f5c66af01c65371788e67b1ab2c8bba0dc36",
+    "renderer/panel.css": "3ddbc3d928c8cdb2c4806f4e1c8da7f699f23afedd7dbfb1a70ec47eb69c8f07",
+    "docs/preview-panel.html": "062e78c75b552a5a127f15a9a9c972dc0a2213bf3b8f15716f2166422144d3de",
+    "docs/preview-data.js": "450c474495b8bca0fa64c88f860288f659dab71a0d2646571d25ea86814c4c64"
   },
   "shots": {
     "preview-pool.png": "d81b798891999457c9a35eb014e4ab969c9fb25a8a4d9b779fcc55c522fd9e78",

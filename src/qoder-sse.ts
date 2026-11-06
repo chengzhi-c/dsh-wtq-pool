@@ -26,8 +26,12 @@ function tryJsonObject(text: string): Record<string, unknown> | undefined {
 /**
  * Whether a code is the success-range acknowledgement Qoder sends for a
  * container it accepted. `{"code":0}` and `{"code":200}` are how it acks.
+ *
+ * Exported because the check-in parser asks the same question: it treated any
+ * non-zero code as a refusal, so a claim acknowledged with `{"code":200}`
+ * reached the panel as "the upstream refused it". One answer to one question.
  */
-function isAcknowledgementCode(value: unknown): boolean {
+export function isAcknowledgementCode(value: unknown): boolean {
   if (typeof value !== 'string' && typeof value !== 'number') return false
   if (typeof value === 'string' && value.length === 0) return false
   const code = Number(value)
@@ -127,8 +131,16 @@ export function unwrapFailure(frame: unknown): { code: string; detail: string; s
   // a refusal, whether or not it carries words: `{"code":0}` is how Qoder acks,
   // and reading it as a failure answered a healthy turn with a 502. The error
   // spellings carry business codes in that range, so they keep what they say.
+  //
+  // `detail` goes with the code. Clearing one and keeping the other was the
+  // same failure in a new shape: `{"code":0,"message":"success"}` lost its code
+  // here, still carried "success" as its detail, and the decoder's
+  // `code === '' && detail === ''` test then read the frame as a refusal - a
+  // healthy turn answered 502 with the word "success", or content truncated
+  // mid-stream when the ack arrived between two chunks.
   if (codeFromPlainKey && isAcknowledgementCode(code)) {
     code = ''
+    detail = ''
   }
   return { code, detail, signals: signals.join('\n') }
 }
@@ -159,17 +171,27 @@ export function retryAfterSecondsOf(frame: unknown): number {
 }
 
 /**
- * The inner chunk of one data payload: the envelope's `body` when it is a JSON
- * string, the object when it is inline, and the envelope itself when it carries
- * neither. Returns undefined when no layer parses.
+ * The layer holding the frame's content, and the envelope it came in.
+ *
+ * A `body` wrapper is Qoder's own envelope: the frame's content sits one level
+ * down, and so does its refusal. Reading only the inner object dropped an
+ * envelope's `errorCode`/`code` - `{"body":{"choices":[]},"code":401,"message":
+ * "Login expired"}` reached the decoder as a nameless inner object, so the turn
+ * answered 200 with an empty stream and never rotated to the next account,
+ * leaving the user without the re-login prompt that a 401 produces. Both are
+ * returned so a refusal found in either one is honoured.
+ *
+ * `envelope` is undefined when the payload has no wrapper, so the caller can
+ * tell "no outer layer" from "an outer layer with nothing to say".
  */
-export function unwrapQoderFrame(payload: string): Record<string, unknown> | undefined {
-  const envelope = tryJsonObject(payload)
-  if (envelope === undefined) return undefined
-  const body = envelope['body']
-  if (typeof body === 'string') return tryJsonObject(body)
-  if (isPlainObject(body)) return body
-  return envelope
+function qoderFrameParts(
+  payload: string,
+): { envelope: Record<string, unknown> | undefined; content: Record<string, unknown> } | undefined {
+  const outer = tryJsonObject(payload)
+  if (outer === undefined) return undefined
+  const body = outer['body']
+  const inner = typeof body === 'string' ? tryJsonObject(body) : isPlainObject(body) ? body : undefined
+  return inner === undefined ? { envelope: undefined, content: outer } : { envelope: outer, content: inner }
 }
 
 /**
@@ -182,21 +204,45 @@ export function unwrapQoderFrame(payload: string): Record<string, unknown> | und
  * way, and forwarding it as a chunk answered the client with an empty turn.
  */
 export function decodeQoderFrame(payload: string): QoderFrame {
-  const chunk = unwrapQoderFrame(payload)
-  if (chunk === undefined) return { type: 'unknown', reason: 'unparseable', data: payload }
-  const choices = chunk['choices']
+  const parts = qoderFrameParts(payload)
+  if (parts === undefined) return { type: 'unknown', reason: 'unparseable', data: payload }
+  const { envelope, content } = parts
+  const choices = content['choices']
   const hasOutput = Array.isArray(choices) && choices.length > 0
-  const hasUsage = chunk['usage'] !== undefined && chunk['usage'] !== null
+  const hasUsage = content['usage'] !== undefined && content['usage'] !== null
   if (hasOutput || hasUsage) {
-    return { type: 'chunk', chunk }
+    // A refusal wrapped around real output still counts: a final frame carrying
+    // both a finish reason and a daily-limit code was forwarded as a chunk, so
+    // the refusal vanished and the request never rotated to another account.
+    // Only the envelope is read here, because a refusal inside the content would
+    // be part of the answer itself.
+    if (envelope !== undefined) {
+      const outer = unwrapFailure(envelope)
+      if (outer.code !== '' || outer.detail !== '') {
+        return {
+          type: 'failure',
+          code: outer.code,
+          detail: outer.detail,
+          signals: outer.signals,
+          retryAfterSeconds: retryAfterSecondsOf(envelope),
+        }
+      }
+    }
+    return { type: 'chunk', chunk: content }
   }
   // Decide on what the walk actually found rather than on top-level fields
   // alone: a frame whose only code sits under `error`/`details`, or inside a
   // JSON document in `message`, would otherwise read as an unnamed frame and
   // be dropped — presenting the user with an empty turn.
-  const { code, detail, signals } = unwrapFailure(chunk)
-  if (code === '' && detail === '') return { type: 'unknown', reason: 'unnamed', data: chunk }
-  return { type: 'failure', code, detail, signals, retryAfterSeconds: retryAfterSecondsOf(chunk) }
+  //
+  // The envelope is read first: a `body` wrapper keeps its refusal there, and
+  // reading only the inner object turned a 401 into an empty 200 turn.
+  for (const layer of envelope === undefined ? [content] : [envelope, content]) {
+    const { code, detail, signals } = unwrapFailure(layer)
+    if (code === '' && detail === '') continue
+    return { type: 'failure', code, detail, signals, retryAfterSeconds: retryAfterSecondsOf(layer) }
+  }
+  return { type: 'unknown', reason: 'unnamed', data: content }
 }
 
 /**

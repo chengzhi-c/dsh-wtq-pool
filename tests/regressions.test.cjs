@@ -185,6 +185,220 @@ for (const source of ['qoder', 'trae']) {
   })
 }
 
+/**
+ * A 200 whose body ends before a single frame is a hiccup, not an answer.
+ *
+ * Passing it through told the client the turn succeeded with nothing in it, so
+ * the account that hiccuped stayed at the head of the queue and the healthy
+ * sign-ins were never tried. A body that did carry frames is an answer even
+ * when the model produced no prose - a tool call with no text, or a model that
+ * genuinely said nothing - so only the byte count decides.
+ */
+test('a Trae 200 with no frames at all is answered as an upstream failure', async () => {
+  const { openTraeResponse } = require('../src/trae-shim.ts')
+  const empty = await openTraeResponse(new Response('', { status: 200 }), 'model', {})
+  assert.equal(empty.status, 502, 'an empty body is not a successful turn')
+  assert.match(await empty.text(), /empty answer stream/)
+
+  const answered = await openTraeResponse(
+    new Response('event: output\ndata: {"tool_calls":[{"index":0,"function":{"name":"f","arguments":"{}"}}]}\n\nevent: done\ndata: {}\n\n', { status: 200 }),
+    'model',
+    {},
+  )
+  assert.equal(answered.status, 200, 'a tool call with no prose is still an answer')
+  assert.match(answered.headers.get('content-type'), /text\/event-stream/)
+})
+
+/**
+ * A usage frame that shares the terminal chunk still reaches the client.
+ *
+ * Trae sends `event: done` when the answer text ends, and a usage frame can ride
+ * in the same chunk. The bridge forward that frame once the finish chunk has
+ * gone out - but only while the loop is still reading, and it stops reading at
+ * `done` on purpose: a body the server leaves open would otherwise hold the turn
+ * open with it. So a usage frame in a later chunk is not collected, and this
+ * test pins that boundary rather than claiming more than the code does.
+ */
+test('a Trae usage frame sharing the terminal chunk is forwarded', async () => {
+  const { bridgeTraeStream } = require('../src/trae-shim.ts')
+  const encoder = new TextEncoder()
+  const upstream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('event: output\ndata: {"content":"hi"}\n\n'))
+      controller.enqueue(encoder.encode(
+        'event: done\ndata: {}\n\nevent: token_usage\ndata: {"input_tokens":10,"output_tokens":2,"total_tokens":12}\n\n',
+      ))
+      controller.close()
+    },
+  })
+  const body = await new Response(bridgeTraeStream(upstream, 'model')).text()
+  assert.match(body, /"total_tokens":12/)
+  assert.equal(body.match(/\[DONE\]/g).length, 1, 'and exactly one terminator still goes out')
+})
+
+/**
+ * A stream that stays open after its terminal marker is released without EOF.
+ *
+ * This is the reason the bridge stops reading at `done`: Trae may leave the
+ * body open, and a turn must end on the marker rather than on the socket.
+ */
+test('a Trae stream that stays open after done is released', async () => {
+  const { bridgeTraeStream } = require('../src/trae-shim.ts')
+  const encoder = new TextEncoder()
+  const upstream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('event: output\ndata: {"content":"hi"}\n\n'))
+      controller.enqueue(encoder.encode('event: done\ndata: {}\n\n'))
+      // Deliberately never closed.
+    },
+  })
+  let timer
+  try {
+    const outcome = await Promise.race([
+      new Response(bridgeTraeStream(upstream, 'model')).text().then((body) => ({ body })),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ timeout: true }), 5000) }),
+    ])
+    assert.equal(outcome.timeout, undefined, 'the turn must not wait for a body the server never ends')
+    assert.match(outcome.body, /\[DONE\]/)
+  } finally {
+    clearTimeout(timer)
+    await upstream.cancel().catch(() => {})
+  }
+})
+
+/**
+ * The rotation matrix: which refusals belong to the account and which do not.
+ *
+ * A 502 answers two very different things - "this sign-in gave me nothing" and
+ * "the service is down for everyone" - and only the first is worth spending
+ * another account on. The status alone cannot tell them apart, so the peek
+ * records the class on the response and the gateway rotates from that. This
+ * pins both halves of the split, because getting it backwards either leaves a
+ * dead sign-in at the head of the queue or cools every healthy one on an
+ * outage that had nothing to do with them.
+ */
+test('a Trae refusal rotates on account-level causes and not on an upstream outage', async () => {
+  const { createTraeGateway } = require('../src/trae-gateway.ts')
+  const QUIET = { info() {}, warn() {}, error() {}, debug() {} }
+  const credentials = [
+    { accessToken: 'first', refreshToken: '', expiresAtMs: 0, userId: 'first', edition: 'cn', source: 'desktop' },
+    { accessToken: 'second', refreshToken: '', expiresAtMs: 0, userId: 'second', edition: 'cn', source: 'desktop' },
+  ]
+  const cases = [
+    // [name, upstream answer, expected status, whether the second account must be tried]
+    ['a 401', { status: 401, body: 'nope', ct: 'text/plain' }, 401, true],
+    ['a 402', { status: 402, body: 'no credits', ct: 'text/plain' }, 402, true],
+    ['a 429', { status: 429, body: 'slow down', ct: 'text/plain', retryAfter: '30' }, 429, true],
+    ['a 500', { status: 500, body: 'boom', ct: 'text/plain' }, 500, false],
+    ['an empty 200', { status: 200, body: '', ct: 'text/event-stream' }, 502, true],
+    ['a code-less sign-in refusal', { status: 200, body: 'event: error\ndata: {"message":"Login expired"}\n\n', ct: 'text/event-stream' }, 401, true],
+    ['a spent balance', { status: 200, body: 'event: error\ndata: {"code":1005,"message":"insufficient credits"}\n\n', ct: 'text/event-stream' }, 402, true],
+    ['an upstream 5xxx', { status: 200, body: 'event: error\ndata: {"code":5001,"message":"upstream failed"}\n\n', ct: 'text/event-stream' }, 502, false],
+  ]
+  for (const [name, spec, expectedStatus, shouldRotate] of cases) {
+    const tried = []
+    const gateway = createTraeGateway({
+      port: 0, logger: QUIET,
+      credentials: async () => credentials,
+      identity: async () => ({ machineId: 'm', deviceId: 'd', platform: 'win32' }),
+      fetchImpl: async (url, init) => {
+        const target = String(url)
+        if (target.includes('get_detail_param')) {
+          return new Response(JSON.stringify({
+            config_info_list: [{
+              config_name: 'm1', function: 'solo_work_remote',
+              display_config: { display_name: 'M1' },
+              model_detail_map: { 'cn.solo_work_remote': { max_tokens: 8192, prompt_max_tokens: 4096 } },
+            }],
+          }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        if (target.includes('/model')) {
+          return new Response(JSON.stringify({ data: { list: [] } }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        tried.push(init?.headers?.['x-uid'])
+        const headers = { 'content-type': spec.ct }
+        if (spec.retryAfter) headers['retry-after'] = spec.retryAfter
+        return new Response(spec.body, { status: spec.status, headers })
+      },
+    })
+    try {
+      await gateway.ready
+      const answer = await fetch(gateway.baseUrl() + '/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', connection: 'close' },
+        body: JSON.stringify({ model: 'm1', messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      await answer.text()
+      assert.equal(answer.status, expectedStatus, `${name}: the client gets the class it can act on`)
+      assert.equal(tried.length, shouldRotate ? 2 : 1,
+        shouldRotate ? `${name} belongs to the account, so the next sign-in must be tried`
+          : `${name} is the service's own failure, so no healthy sign-in may be spent on it`)
+    } finally {
+      await gateway.close().catch(() => {})
+    }
+  }
+})
+
+/**
+ * The Qoder rotation matrix, held to the same split as the Trae one.
+ *
+ * A 502 answers two different things - "this sign-in gave me nothing" and "the
+ * service is down for everyone" - and only the first rotates.
+ * The status alone cannot tell them apart, so the peek records the class on the
+ * response. Before that, an empty 200 was forwarded as a successful empty turn:
+ * the sign-in stayed at the head of the queue and the healthy ones never ran.
+ */
+test('a Qoder refusal rotates on account-level causes and not on an upstream outage', async () => {
+  const { createQoderGateway } = require('../src/qoder-gateway.ts')
+  const QUIET = { info() {}, warn() {}, error() {}, debug() {} }
+  const credentials = [
+    { token: 'first', userID: 'first', name: 'first' },
+    { token: 'second', userID: 'second', name: 'second' },
+  ]
+  const cases = [
+    ['a 401', { status: 401, body: 'nope', ct: 'text/plain' }, 401, true],
+    ['a 402', { status: 402, body: 'no credits', ct: 'text/plain' }, 402, true],
+    ['a 429', { status: 429, body: 'slow', ct: 'text/plain', retryAfter: '30' }, 429, true],
+    ['a 500', { status: 500, body: 'boom', ct: 'text/plain' }, 500, false],
+    ['an empty 200', { status: 200, body: '', ct: 'text/event-stream' }, 502, true],
+    ['a sign-in refusal', { status: 200, body: 'data: {"code":105,"message":"Login expired"}\n\n', ct: 'text/event-stream' }, 401, true],
+  ]
+  for (const [name, spec, expectedStatus, shouldRotate] of cases) {
+    const tried = []
+    const gateway = createQoderGateway({
+      port: 0, region: 'cn', logger: QUIET,
+      credentials: async () => credentials,
+      fetchImpl: async (url, init) => {
+        const target = String(url)
+        if (target.includes('chat/completions') || target.includes('agent_chat') || target.includes('generate')) {
+          tried.push(init?.headers?.['authorization'] ?? init?.headers?.['Authorization'] ?? '?')
+          const headers = { 'content-type': spec.ct }
+          if (spec.retryAfter) headers['retry-after'] = spec.retryAfter
+          return new Response(spec.body, { status: spec.status, headers })
+        }
+        return new Response(JSON.stringify({ chat: [{ key: 'qm', display_name: 'QM', enable: true }] }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+    try {
+      await gateway.ready
+      const answer = await fetch(gateway.baseUrl() + '/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', connection: 'close' },
+        body: JSON.stringify({ model: 'qm', messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      await answer.text()
+      assert.equal(answer.status, expectedStatus, `${name}: the client gets the class it can act on`)
+      assert.equal(tried.length, shouldRotate ? 2 : 1,
+        shouldRotate ? `${name} belongs to the account, so the next sign-in must be tried`
+          : `${name} is the service's own failure, so no healthy sign-in may be spent on it`)
+    } finally {
+      await gateway.close().catch(() => {})
+    }
+  }
+})
+
 test('account scans drop deleted sign-ins but keep unreadable directories', async () => {
   const { WorkBuddyAccountPool } = require('../src/accounts.ts')
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-scan-test-'))
@@ -276,6 +490,9 @@ for (const source of ['qoder', 'trae']) {
 test('model defaults are per model and explicit reasoning remains authoritative', async (t) => {
   const { PiAiAdapter } = require('@deepseek-ai/dsh-llm-pi-ai')
   const { createProvider } = await import('@earendil-works/pi-ai')
+  // The real api object: `createProvider` refuses one without a callable
+  // `stream`, so an empty stand-in never reaches the code under test.
+  const { openAICompletionsApi } = await import('@earendil-works/pi-ai/api/openai-completions.lazy')
   const { resolveRetryPolicy } = require('@deepseek-ai/dsh-llm')
   const source = fs.readFileSync(path.join(root, 'src/index.ts'), 'utf8')
   const functions = ['toPiModel', 'buildAdapter'].map(name => {
@@ -285,7 +502,7 @@ test('model defaults are per model and explicit reasoning remains authoritative'
   }).join('\n')
   const context = vm.createContext({
     module: { exports: {} }, exports: {}, PiAiAdapter, createProvider, resolveRetryPolicy,
-    withDelegateShape: value => value, openAICompletionsApi: () => ({}),
+    withDelegateShape: value => value, openAICompletionsApi,
     resolveImageAttachmentAccess: () => { throw new Error('test must not access images') },
     THINKING_LEVELS: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     NO_COST: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, STREAM_IDLE_TIMEOUT_MS: 300000,
@@ -1405,20 +1622,32 @@ test('a credential echoed by an upstream never survives into the client body', (
  * spawn it with the plugin's whole environment, inside a process holding every
  * WorkBuddy token. A `Valid` status requires the chain to resolve to a trusted
  * root, which a same-user process cannot produce for a file it wrote.
+ *
+ * A trusted root is not enough on its own: any publisher's certificate reaches
+ * one. The signer's key hash is pinned to WorkBuddy's two releases, and an
+ * elevated host is refused outright, because such a process can rewrite the
+ * file between the check and the run.
  */
 test('a file the registry scan names is only run when its signature is valid', () => {
   const { signatureAccepts } = require('../src/at-rest.ts')
-  assert.equal(signatureAccepts('Valid', 'CN=Tencent Technology (Shenzhen) Company Limited'), true,
+  const domestic = '2F95C8391B09328BC42D131C50CC7B4E06F9E2A7B1E3624E14C9070A1BE9CC97'
+  const international = '307ECCDC80B73FF1662464E2591BF027124F11175039423BA2FEC1CDE64DB212'
+  assert.equal(signatureAccepts('Valid', domestic, false), true,
     'a signature that chains to a trusted root is the only thing accepted')
+  assert.equal(signatureAccepts('Valid', international, false), true)
   for (const status of ['NotSigned', 'HashMismatch', 'NotTrusted', 'UnknownError', '', undefined]) {
-    assert.equal(signatureAccepts(status, 'CN=someone'), false, `a ${String(status)} signature must be refused`)
+    assert.equal(signatureAccepts(status, domestic, false), false, `a ${String(status)} signature must be refused`)
   }
-  // A status PowerShell reported but a signer it could not name, and the blank
-  // and missing forms of the same.
-  assert.equal(signatureAccepts('Valid', ''), false, 'a valid status with no signer is not enough')
-  assert.equal(signatureAccepts('Valid', undefined), false)
-  assert.equal(signatureAccepts('Valid', '   '), false, 'a blank signer is not a signer')
-  assert.equal(signatureAccepts(undefined, undefined), false, 'an unreadable signature must be refused, not assumed')
+  // A trusted root is not a trusted publisher: another vendor's certificate
+  // chains just as far.
+  assert.equal(signatureAccepts('Valid', 'CN=Tencent Technology (Shenzhen) Company Limited', false), false,
+    'a signer that is not pinned is not accepted')
+  assert.equal(signatureAccepts('Valid', domestic, true), false, 'an elevated host can rewrite the file')
+  assert.equal(signatureAccepts('Valid', domestic, undefined), false, 'an unknowable elevation is refused')
+  assert.equal(signatureAccepts('Valid', '', false), false, 'a valid status with no key hash is not enough')
+  assert.equal(signatureAccepts('Valid', undefined, false), false)
+  assert.equal(signatureAccepts(undefined, undefined, undefined), false,
+    'an unreadable signature must be refused, not assumed')
 })
 
 /**
@@ -1790,5 +2019,195 @@ test('the connection report counts the accounts without naming them', async (t) 
     await stopRegisteredService()
     await plugin.onUnload()
     fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+
+/**
+ * Credential arrays, as the PI build already pins them.
+ *
+ * The redaction this exercises lives in the shared `loopback.ts`, so every
+ * shape below reaches DSH exactly as it reaches PI. The DSH suite covered only
+ * the header and JSON forms, which meant the array rule could be deleted
+ * outright - `{"authorization":[...]}` printed its token to the client - and the
+ * whole suite still passed.
+ */
+
+/**
+ * An array element is a whole credential, whatever characters it contains.
+ *
+ * The array rule used to be `\[[^\]]*\]`: it stopped at the first `]`, so an
+ * element that contained one - as a base64 or URL-safe token can - was cut
+ * short and the rest of the live credential was printed after the placeholder.
+ * The unclosed form leaked the entire value for the same reason, and it is the
+ * shape a body takes when the transport was cut off mid-token.
+ */
+test('an array element is redacted past a bracket or a missing close', () => {
+  const { redactSecrets } = require('../src/loopback.ts')
+  const secret = 'abcDEF123+/=ghiJKL456.mnoPQR789'
+  const windows = Array.from({ length: secret.length - 7 }, (_, i) => secret.slice(i, i + 8))
+  const shapes = [
+    `{"x-api-key":["a]${secret}"]}`,
+    `{"authorization":["${secret}]tail"]}`,
+    `{"authorization":[["${secret}"]]}`,
+    `{"authorization":[["a"],["b]${secret}"]]}`,
+    `{"x-api-key":[{"v":"${secret}"}],"code":6004}`,
+    `{"authorization":["${secret}}`,
+    `{"upstream":"{\\"x-api-key\\":[\\"${secret}\\"]}"}`,
+    `{"authorization":[123456789012]}`,
+  ]
+  for (const shape of shapes) {
+    const out = redactSecrets(shape)
+    for (const window of windows) {
+      assert.equal(out.includes(window), false, `a credential fragment leaked from: ${shape}`)
+    }
+    assert.equal(out.includes('123456789012'), false, `a numeric credential leaked from: ${shape}`)
+  }
+  // The fields behind an array are still the actionable half of the body.
+  assert.equal(redactSecrets(`{"x-api-key":["a]${secret}"],"code":6004}`).includes('"code":6004'), true)
+  assert.equal(redactSecrets('{"code":6004}'), '{"code":6004}')
+  assert.equal(redactSecrets('{"next":1}'), '{"next":1}')
+})
+
+/**
+ * A credential array longer than the scan budget still loses every element.
+ *
+ * The scan bounds how far past one opening bracket it will look, because an
+ * unterminated bracket must not be able to walk a whole body. What it finds in
+ * that span is a credential whatever its length is, so a long element cannot
+ * hide behind the bound.
+ */
+test('an over-long credential array is redacted whole', () => {
+  const { redactSecrets } = require('../src/loopback.ts')
+  const secret = 'abcDEF123+/=ghiJKL456.mnoPQR789'
+  for (const size of [1000, 5000, 20000, 70000]) {
+    const out = redactSecrets(`{"authorization":["${'a'.repeat(size)}","${secret}"],"code":6004}`)
+    assert.equal(out.includes(secret), false, `a credential leaked from a ${size}-byte array`)
+  }
+  // The fields after the array survive when its closer is inside the budget.
+  assert.equal(redactSecrets(`{"authorization":["${'a'.repeat(5000)}"],"code":6004}`).includes('"code":6004'), true)
+})
+
+/**
+ * A body of many unterminated brackets costs one pass, not one per bracket.
+ *
+ * What bounds the cost is not a line cut but the budget being spent: when the
+ * scan gives up, redaction swallows everything it looked at, so the next
+ * bracket starts past that span and no byte is scanned twice. Without that the
+ * cost grew with brackets times budget: 55 KB written as `{"token":[` lines
+ * took 49 ms, and doubling the count roughly doubled that again - a crafted
+ * body could make every other request in the plugin wait behind a redaction.
+ */
+test('many unterminated brackets are redacted in linear time', () => {
+  const { redactSecrets } = require('../src/loopback.ts')
+  const measure = (count) => {
+    const input = '{"token":[\n'.repeat(count)
+    const started = Date.now()
+    redactSecrets(input)
+    return Date.now() - started
+  }
+  const small = measure(1000)
+  const large = measure(8000)
+  // Eight times the input must not cost anything like sixty-four times the work.
+  assert.equal(large <= Math.max(small * 12, 40), true,
+    `8000 brackets took ${large}ms against ${small}ms for 1000`)
+})
+
+/**
+ * An array printed across lines loses its elements too.
+ *
+ * An upstream that quotes the request it was sent with `JSON.stringify(value,
+ * null, 2)` writes the bracket on one line and each element on the next. The
+ * scan used to stop at the first line break, which read this body as an array
+ * with nothing in it and left the token in place - the expanded echo is the
+ * most common shape a 400 takes, so that was the rule failing on its main case.
+ */
+test('a credential array split across lines is redacted whole', () => {
+  const { redactSecrets } = require('../src/loopback.ts')
+  const secret = 'LIVEACCESSTOKEN0123456789'
+  const shapes = [
+    JSON.stringify({ request: { 'x-api-key': [secret] }, code: 6004 }, null, 2),
+    JSON.stringify({ a: { b: { 'x-api-key': [secret, secret] } } }, null, 2),
+    `{"x-api-key": [${JSON.stringify(secret)}\n "${secret}"]}`,
+    `{"x-api-key":[\r\n  "${secret}"\r\n]}`,
+    JSON.stringify({ 'x-api-key': Array.from({ length: 200 }, () => secret) }, null, 2),
+  ]
+  for (const shape of shapes) {
+    const out = redactSecrets(shape)
+    assert.equal(out.includes(secret), false, `a token survived the array in: ${shape.slice(0, 120)}`)
+    assert.equal(out.includes('[redacted]'), true)
+  }
+  // The fields behind a closed array still reach the caller.
+  const expanded = redactSecrets(JSON.stringify({ 'x-api-key': [secret], code: 6004 }, null, 2))
+  assert.equal(expanded.includes('"code": 6004'), true)
+})
+
+/**
+ * A body that stops mid-token does not print the part it got through.
+ *
+ * An upstream that cuts the echo off leaves its partial line behind: the value
+ * before the cut is still the credential, and printing it would hand over
+ * however much of the token arrived. The scan spends its budget without finding
+ * a closer, so redaction consumes the whole span and the next line break.
+ */
+test('a truncated expanded array does not print its carried token', () => {
+  const { redactSecrets } = require('../src/loopback.ts')
+  const secret = 'LIVEACCESSTOKEN0123456789'
+  const out = redactSecrets(`{"request":{\n  "x-api-key": [\n    "${secret}"\n`)
+  assert.equal(out.includes(secret), false)
+  assert.equal(out.includes('LIVE'), false)
+})
+
+/**
+ * The credential directories are redacted even without a file extension.
+ *
+ * Trae keeps its token in `~/.trae-cn/trae-jwt-token`, which has no extension,
+ * so the rule that requires one matched nothing: an error naming that file
+ * printed the user's home layout. The names are listed rather than the rule
+ * widened, so an endpoint such as `/v1/chat/completions` still reads normally.
+ */
+test('a credential directory path is redacted but ordinary endpoints are not', () => {
+  const { redactSecrets } = require('../src/loopback.ts')
+  for (const path of [
+    '/root/.trae-cn/trae-jwt-token',
+    '/home/someone/.trae/credentials.json',
+    '/Users/someone/.workbuddy/auth',
+  ]) {
+    const out = redactSecrets(path)
+    assert.equal(out.includes('.trae') || out.includes('.workbuddy'), false, `a home layout leaked from ${path}`)
+  }
+  for (const text of [
+    'POST /v1/chat/completions returned 4001',
+    'the endpoint /v1/models answered 200',
+    '/api/v2/service/pro/sse/agent_chat_generation was rejected',
+  ]) {
+    assert.equal(redactSecrets(text), text, `an actionable endpoint was destroyed: ${text}`)
+  }
+})
+
+/**
+ * A body built to defeat the bracket scan is answered, not stalled.
+ *
+ * The scan has to find the closing bracket of an element that may contain one.
+ * A regular expression stating that (`(?:[^"]|"")*` around a quoted run) is
+ * ambiguous on a body that never closes, and Node's backtracking engine made
+ * the process hang: the gateway shares the host's event loop, so a crafted
+ * upstream body was enough to stop every other request in the plugin. The scan
+ * is linear; these inputs are the ones that measured it.
+ */
+test('a pathological bracket body is redacted in linear time', () => {
+  const { redactSecrets } = require('../src/loopback.ts')
+  const inputs = [
+    '{"authorization":' + '['.repeat(20000),
+    '{"token":' + '["'.repeat(10000),
+    '{"token":['.repeat(5000),
+    '{"authorization": ' + '"'.repeat(50000),
+    'y'.repeat(200000),
+  ]
+  for (const input of inputs) {
+    const started = Date.now()
+    redactSecrets(input)
+    const elapsed = Date.now() - started
+    assert.equal(elapsed < 2000, true, `redaction took ${elapsed}ms on ${input.length} bytes`)
   }
 })

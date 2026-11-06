@@ -140,6 +140,56 @@ export function writeOpenAIError(res: ServerResponse, status: number, kind: stri
 }
 
 /**
+ * The names whose value is a credential on its own, with nothing before it.
+ *
+ * `authorization` and the `x-…` header names are deliberately absent: their
+ * value starts with a scheme word (`Bearer`, `Cloud-IDE-JWT`), and a rule that
+ * treated the whole value as the credential would consume the scheme and print
+ * the token after it. The scheme rule in `REDACTIONS` covers those, and it runs
+ * on text the array scan has already cleared.
+ */
+const BARE_CREDENTIAL_KEYS =
+  'access_?token|refresh_?token|id_?token|auth_?token|oauth_?token|api_?key|secret|token'
+
+/**
+ * Every name whose value is a credential, in any of the shapes it takes.
+ *
+ * One list for the array scan and the bare rule, so a name cannot fall out of
+ * one and leak what the other still covers. The array form has no scheme word
+ * and no value that is not a credential, so it takes the whole set.
+ */
+const CREDENTIAL_KEYS =
+  `${BARE_CREDENTIAL_KEYS}|authorization|x-ide-token|x-refresh-token|x-api-key|` +
+  'x-cloudide-token|cloud-ide-jwt|cosy-key|cosy-machinetoken|cosy-machineid|cosy-user|' +
+  'x-user-id|x-device-id|x-machine-id|x-uid'
+
+/** The key, its separator and the optional JSON escaping a quoted echo adds. */
+const CREDENTIAL_KEY_PREFIX = `(?:\\\\{0,2}["']?)(?:${CREDENTIAL_KEYS})(?:\\\\{0,2}["']?\\s*[:=]\\s*)`
+
+/** Where a credential value begins, when that value is an array. */
+const CREDENTIAL_ARRAY_OPEN = new RegExp(`(${CREDENTIAL_KEY_PREFIX})\\\\?\\[`, 'gi')
+
+/**
+ * A field whose name says it is a credential, and its value.
+ *
+ * The key and both quotes may carry JSON escaping, because an upstream that
+ * quotes the request it was sent nests the credential one escape layer down
+ * (`{\"accessToken\":\"…\"}`) — the shape Trae's and Qoder's 401 bodies
+ * actually take. The value class carries the base64 punctuation (`+ / =`)
+ * and the dot, or a real token would be redacted only up to its first such
+ * character and the tail would still reach the client.
+ *
+ * The value must be at least six characters. A credential can be numeric, so
+ * this rule does not require a letter; the field name is the signal. Business
+ * codes such as `"code":6004` and `code=11115` stay readable because `code` is
+ * deliberately absent from the key list.
+ */
+const BARE_CREDENTIAL = new RegExp(
+  `((?:\\\\{0,2}["']?)(?:${BARE_CREDENTIAL_KEYS})(?:\\\\{0,2}["']?\\s*[:=]\\s*\\\\{0,2}["']?))[A-Za-z0-9_+/.=-]{6,}`,
+  'gi',
+)
+
+/**
  * Credential shapes in any text that leaves this process.
  *
  * The log path redacts these in the host entry; this is the client path, which runs
@@ -165,6 +215,10 @@ export function writeOpenAIError(res: ServerResponse, status: number, kind: stri
  * carries) plus `x-machine-id`, `x-device-id` and `x-uid`, the Trae machine,
  * device and account ids. Qoder's identity headers were listed and Trae's were
  * not, which is the drift the sentence above is meant to prevent.
+ *
+ * Arrays are not regex work: `redactCredentialArrays` handles them before this
+ * list runs, because a bracket cannot be matched by pattern without either
+ * stopping inside an element or backtracking on a body that never closes.
  */
 const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
   // A scheme that carries the credential itself, in either the `Bearer <value>`
@@ -175,27 +229,24 @@ const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
   // the line, destroying the fields after it and truncating the body mid-JSON -
   // and the eight-character floor is what keeps a prose word (`invalid Bearer
   // format`) from being taken for a credential.
-  [/\b(Bearer|Cosy-Key|Cosy-Machineid|Cosy-Machinetoken|Cosy-User|Cloud-IDE-JWT|X-Cloudide-Token|X-Ide-Token|X-Refresh-Token|X-Api-Key|X-User-Id|x-device-id|x-machine-id|x-uid)\b([\s:="'\\]{1,6})[A-Za-z0-9_+/.=~-]{8,}/gi, '$1$2[redacted]'],
+  [/\b(Bearer|Basic|Digest|Negotiate|NTLM|Cosy-Key|Cosy-Machineid|Cosy-Machinetoken|Cosy-User|Cloud-IDE-JWT|X-Cloudide-Token|X-Ide-Token|X-Refresh-Token|X-Api-Key|X-User-Id|x-device-id|x-machine-id|x-uid)\b([\s:="'\\]{1,6})[A-Za-z0-9_+/.=~-]{8,}/gi, '$1$2[redacted]'],
+  // `authorization` alone is not in BARE_CREDENTIAL_KEYS because that rule would
+  // eat the scheme word and leave the value behind (`authorization: Bearer …`
+  // became `authorization: [redacted] …`). The scheme rule above covers the
+  // forms that carry one; this covers the rest - an opaque value sent without a
+  // scheme, which is a real shape (`{"authorization":"<opaque>"}` or a raw
+  // `Authorization: <opaque>` echo) and had no rule at all.
+  //
+  // The value must carry a digit: a bare 8+ letter run after this key is far
+  // more often prose (`Authorization: required`) than a credential, and the
+  // real ones - opaque base64 payloads - carry digits. The scheme rule keeps
+  // its digit-free form, because there the scheme word already says it is a
+  // credential.
+  [/\b(authorization|proxy-authorization)\b([\s:="'\\]{1,6})(?!(?:Bearer|Basic|Digest|Negotiate|NTLM)\b)(?=[A-Za-z0-9_+/.=~-]{8,})(?=[A-Za-z0-9_+/.=~-]*[0-9])[A-Za-z0-9_+/.=~-]+/gi, '$1$2[redacted]'],
   [/\beyJ[A-Za-z0-9_+/.=-]+(?:\.[A-Za-z0-9_+/.=-]+){0,2}/g, '[redacted token]'],
   [/\b(qoder-oauth-token-)[A-Za-z0-9_+/.=-]+/g, '$1[redacted]'],
   [/\b(rt_)[A-Za-z0-9_+/.=-]+/g, '$1[redacted]'],
-  /**
-   * A field whose name says it is a credential, and its value.
-   *
-   * The key and both quotes may carry JSON escaping, because an upstream that
-   * quotes the request it was sent nests the credential one escape layer down
-   * (`{\"accessToken\":\"…\"}`) — the shape Trae's and Qoder's 401 bodies
-   * actually take. The value class carries the base64 punctuation (`+ / =`)
-   * and the dot, or a real token would be redacted only up to its first such
-   * character and the tail would still reach the client.
-   *
-   * The value must be at least six characters and carry a letter, which is what
-   * keeps this off an upstream business code: `"code":6004` and `code=11115` are
-   * the actionable half of an error, and a bare `code` is deliberately not a key
-   * here for the same reason (`"code":"soft_rate"` is the classification, not a
-   * secret).
-   */
-  [/((?:\\{0,2}["']?)(?:access_?token|refresh_?token|id_?token|auth_?token|oauth_?token|api_?key|secret|token)(?:\\{0,2}["']?\s*[:=]\s*\\{0,2}["']?))(?=[A-Za-z0-9_+/.=-]{6,})(?=[A-Za-z0-9_+/.=-]*[A-Za-z_-])[A-Za-z0-9_+/.=-]+/gi, '$1[redacted]'],
+  [BARE_CREDENTIAL, '$1[redacted]'],
   // An address names an account as surely as its label does, and this text
   // reaches logs and client-facing errors. Mask it before the path rules below.
   [/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[account]'],
@@ -207,11 +258,146 @@ const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
   // it": the extension is required, and a segment may carry spaces but not start
   // with one, so `POST /v1/chat/completions returned 4001` and `and/or` survive
   // intact - that is the actionable half of an error and destroying it would
-  // trade a path disclosure for an undiagnosable one. A dot-directory with no
-  // extension anywhere (`/root/.trae-cn/trae-jwt-token`) is not matched; the
-  // identity readers never print those paths in the first place.
+  // trade a path disclosure for an undiagnosable one.
   [/(?<![\w./])\/(?:[\w.@-]+(?: [\w.@-]+)*\/)+[\w.@-]+(?: [\w.@-]+)*\.[A-Za-z][\w]*/g, '[redacted path]'],
+  // The exception the rule above leaves open, named rather than generalised:
+  // Trae keeps its credential in `~/.trae-cn/trae-jwt-token`, which has no
+  // extension and so matched nothing. The home directory it sits in is the
+  // disclosure. Listing the directory is what keeps this narrow enough that
+  // ordinary prose stays readable.
+  [/(?<![\w./])(?:\/[\w.@-]+)*\/(?:\.trae|\.trae-cn|\.workbuddy|\.qoder)(?:\/[\w.@-]+)*\/?[^\s"'<>|]*/g, '[redacted path]'],
 ]
+
+/**
+ * How far past an opening bracket the scan may look for its closer.
+ *
+ * A credential array is a handful of elements, but an echo can carry a full JWT
+ * (about 1-4 KB) as one element, so the budget has to be generous. It is spent
+ * per opening bracket, not per byte of input, so the pass stays linear in the
+ * text: what it bounds is how much work one unterminated bracket can cost.
+ */
+const ARRAY_SCAN_LIMIT = 65_536
+
+/**
+ * The index just past the bracket that closes the array starting at `start`.
+ *
+ * A hand-written scan, not a regular expression, because the bracket cannot be
+ * matched by pattern alone: an element may contain `]`, the element may itself
+ * be an array, and the quoted form of either may contain a bracket, a quote or
+ * an escaped quote. Every expression that tried to state this - `[^\]]*` for
+ * the array, a quoted alternative with an optional closing quote - either
+ * stopped at a `]` inside an element (`{"x-api-key":["a]b"]}` printed
+ * `[redacted]b"]`, the tail of a live credential) or backtracked exponentially
+ * on a body that never closes (`{"authorization":` followed by a run of `["`
+ * hung the process). The scan walks once, tracks one quote at a time, counts
+ * the nested openers, and skips the character after a backslash, so it stays
+ * linear and cannot be made to spin.
+ *
+ * The scan crosses line breaks, because an upstream that prints the request it
+ * was sent with `JSON.stringify(body, null, 2)` writes one element per line and
+ * cutting at the first break skipped the whole array: a token echoed that way
+ * reached the client untouched.
+ *
+ * What keeps its cost linear is not a line cut but the budget being *consumed*:
+ * when the scan gives up, redaction replaces the whole span it examined, so the
+ * next bracket starts after that span and no byte is scanned twice.
+ *
+ * A backslash escapes outside a quoted run too, because the echo this has to
+ * survive is a request nested inside another JSON document one escape layer
+ * down: there a quote is spelled `\"`, and reading it as an opener ran the scan
+ * past the array's real end to the end of the line, deleting the fields after
+ * it. One escaping level is what that echo adds; the plugin never produces two.
+ */
+function arrayEnd(text: string, start: number): number {
+  const limit = Math.min(text.length, start + ARRAY_SCAN_LIMIT)
+  let quote = ''
+  let depth = 1
+  for (let i = start; i < limit; i += 1) {
+    const ch = text[i]
+    if (ch === '\\') {
+      i += 1
+      continue
+    }
+    if (quote !== '') {
+      if (ch === quote) quote = ''
+      continue
+    }
+    if (ch === '"' || ch === "'") quote = ch
+    else if (ch === '[') depth += 1
+    else if (ch === ']') {
+      depth -= 1
+      if (depth === 0) return i + 1
+    }
+  }
+  return -1
+}
+
+/**
+ * Where a span the scan gave up on ends.
+ *
+ * An array whose closer was not found inside the budget is still a credential,
+ * so redaction swallows exactly what the scan looked at - no more, which would
+ * delete the diagnostic half of the body, and no less, which would print the
+ * tail of a truncated token.
+ *
+ * The span ends at the first line break past the budget, so a body that stops
+ * mid-token loses its partial line too rather than printing what is left of it.
+ * A single line longer than the whole budget has no break to find inside it and
+ * is consumed to its end.
+ */
+function scanGiveUpEnd(text: string, start: number): number {
+  const limit = Math.min(text.length, start + ARRAY_SCAN_LIMIT)
+  for (let i = limit; i < text.length; i += 1) {
+    if (text[i] === '\n' || text[i] === '\r') return i + 1
+  }
+  return text.length
+}
+
+/**
+ * Replace every credential array with a placeholder, keeping its key.
+ *
+ * A whole array, because each element is a credential and a rule that replaced
+ * only the ones it recognised as token-shaped would leave the numeric ones and
+ * the account ids readable.
+ *
+ * An array whose closer is never found loses everything the scan looked at,
+ * plus the partial line it stopped in: that text is still credential material -
+ * a truncated echo is the case where the body was cut off mid-token - so
+ * leaving it in place would publish it.
+ *
+ * A bracket with nothing after it at all is a bracket, not a value, and is left
+ * alone.
+ */
+function redactCredentialArrays(text: string): string {
+  let out = ''
+  let cursor = 0
+  CREDENTIAL_ARRAY_OPEN.lastIndex = 0
+  for (let match = CREDENTIAL_ARRAY_OPEN.exec(text); match !== null; match = CREDENTIAL_ARRAY_OPEN.exec(text)) {
+    const key = match[1]
+    const bodyStart = match.index + match[0].length
+    const closed = arrayEnd(text, bodyStart)
+    if (closed === -1) {
+      // The scan found no closer inside its budget, so the credential runs to
+      // wherever the scan would have stopped: an unclosed array and an array
+      // whose closer sits past the budget look alike from here, and both hold
+      // credential material. Consuming that whole span is what keeps the tail
+      // of a truncated echo from being printed.
+      const stop = scanGiveUpEnd(text, bodyStart)
+      if (stop === bodyStart) {
+        CREDENTIAL_ARRAY_OPEN.lastIndex = bodyStart
+        continue
+      }
+      out += text.slice(cursor, match.index) + key + '[redacted]'
+      cursor = stop
+      CREDENTIAL_ARRAY_OPEN.lastIndex = stop
+      continue
+    }
+    out += text.slice(cursor, match.index) + key + '[redacted]'
+    cursor = closed
+    CREDENTIAL_ARRAY_OPEN.lastIndex = closed
+  }
+  return cursor === 0 ? text : out + text.slice(cursor)
+}
 
 /**
  * Strip credential shapes out of text bound for a client.
@@ -221,6 +407,7 @@ const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
  */
 export function redactSecrets(text: string): string {
   let out = typeof text === 'string' ? text : String(text)
+  out = redactCredentialArrays(out)
   for (const [pattern, replacement] of REDACTIONS) out = out.replace(pattern, replacement)
   return out
 }

@@ -16,29 +16,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
-const { createRequire, registerHooks } = require('node:module')
-const { fileURLToPath } = require('node:url')
-const ts = require('typescript')
-
-const root = path.resolve(__dirname, '..')
-const transpile = (source) => ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },
-}).outputText
-
-// The host imports its siblings without an extension, so the loader needs the
-// same `.ts` resolution the DSH entry builds against.
-registerHooks({
-  resolve(specifier, context, next) {
-    const ownSource = context.parentURL?.startsWith('file:') && fileURLToPath(context.parentURL).startsWith(path.join(root, 'src') + path.sep)
-    return next(ownSource && specifier.startsWith('.') && path.extname(specifier) === '' ? specifier + '.ts' : specifier, context)
-  },
-  load(url, context, next) {
-    if (url.startsWith('file:') && url.endsWith('.ts')) return {
-      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')),
-    }
-    return next(url, context)
-  },
-})
+const { createRequire } = require('node:module')
+const { root, transpile } = require('./ts-loader.cjs')
 
 const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
 

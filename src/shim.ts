@@ -69,17 +69,59 @@ export interface WorkBuddyShimOptions {
 import { boundedRetryAfterSeconds, channelCheckRefusal, createLoopbackServer, guardsPass, isJsonContentType, listedModels, openAIFinishReason, PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, readRequestBody, relayStreamOf, requestPathname, safeMessage, unapprovedChannelRefusal, writeChunk, writeJson, writeOpenAIError } from './loopback'
 import { LOG_PREFIX, accountLogTag } from './log'
 
-function completionState(data: string): { finished: boolean; toolCalls: boolean } {
+function completionState(data: string): { finished: boolean; toolCalls: boolean; toolCallIndices: number[] } {
   try {
-    const parsed = JSON.parse(data) as { choices?: Array<{ finish_reason?: unknown; delta?: { tool_calls?: unknown } }> }
+    const parsed = JSON.parse(data) as { choices?: Array<{ index?: unknown; finish_reason?: unknown; delta?: { tool_calls?: unknown } }> }
     const choices = Array.isArray(parsed.choices) ? parsed.choices : []
+    const toolCallIndices = choices.flatMap((choice, index) =>
+      Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0
+        ? [typeof choice.index === 'number' && Number.isInteger(choice.index) ? choice.index : index]
+        : [])
     return {
       finished: choices.some(choice => typeof choice?.finish_reason === 'string' && choice.finish_reason !== ''),
-      toolCalls: choices.some(choice => Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0),
+      toolCalls: toolCallIndices.length > 0,
+      toolCallIndices,
     }
   } catch {
-    return { finished: false, toolCalls: false }
+    return { finished: false, toolCalls: false, toolCallIndices: [] }
   }
+}
+
+function completedToolCallData(data: string, toolCallIndices: Set<number>): string | undefined {
+  if (toolCallIndices.size === 0) return undefined
+  try {
+    const parsed = JSON.parse(data) as { choices?: Array<{ index?: unknown; finish_reason?: unknown }> }
+    if (!Array.isArray(parsed.choices)) return undefined
+    let changed = false
+    for (const [index, choice] of parsed.choices.entries()) {
+      const choiceIndex = typeof choice?.index === 'number' && Number.isInteger(choice.index) ? choice.index : index
+      if (choice?.finish_reason === 'stop' && toolCallIndices.has(choiceIndex)) {
+        choice.finish_reason = 'tool_calls'
+        changed = true
+      }
+    }
+    return changed ? JSON.stringify(parsed) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function eventWithData(raw: string, data: string, finishTail: boolean): Buffer {
+  const separator = /\r\n|\r|\n/.exec(raw)?.[0] ?? '\n'
+  const lines = raw.split(/\r\n|\r|\n/)
+  const output: string[] = []
+  let replaced = false
+  for (const line of lines) {
+    if (line === 'data' || line.startsWith('data:')) {
+      if (!replaced) output.push('data: ' + data)
+      replaced = true
+    } else {
+      output.push(line)
+    }
+  }
+  let frame = replaced ? output.join(separator) : 'data: ' + data
+  if (finishTail && !/(?:\r\n|\r|\n){2}$/u.test(frame)) frame += separator + separator
+  return Buffer.from(frame)
 }
 /** HTTP status each upstream failure class surfaces as. */
 const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
@@ -116,6 +158,18 @@ const MODEL_TIER_HOLD_MS = 24 * 60 * 60 * 1000
  * ends the turn.
  */
 const MAX_TRANSPORT_ATTEMPTS = 2
+
+/**
+ * How many accounts one request may lose to a 200 that ended before its first
+ * byte.
+ *
+ * Not a small fixed number: an empty stream is an *answer*, so the host is
+ * reachable and the account behind the next one is worth trying. Two dead
+ * streams in a row used to end the turn through the transport cap and left a
+ * healthy third account untried. The bound is the pool's own size, so every
+ * account gets its turn once and the loop still cannot walk forever.
+ */
+const emptyStreamAttemptsFor = (poolSize: number): number => Math.max(3, poolSize)
 
 /**
  * The business code an account-level 200 envelope carries.
@@ -473,11 +527,24 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     // 其他模型继续使用"), so cooldowns are keyed by (account, model): a 429 on
     // `hy4-preview` only cools that model on the account, never the whole one.
     let modelId: string | undefined
+    let bodyIsJson = true
     try {
-      const parsed = JSON.parse(raw) as { model?: unknown }
-      modelId = typeof parsed.model === 'string' && parsed.model !== '' ? parsed.model : undefined
+      const parsed = JSON.parse(raw) as unknown
+      if (typeof parsed === 'object' && parsed !== null) {
+        const model = (parsed as { model?: unknown }).model
+        modelId = typeof model === 'string' && model !== '' ? model : undefined
+      }
     } catch {
-      modelId = undefined
+      bodyIsJson = false
+    }
+
+    // A body that is not JSON at all is the caller's bug, and answering "model
+    // is required" sent them looking for a field in a request that has none to
+    // read. The two problems get different messages so a client can tell them
+    // apart.
+    if (!bodyIsJson) {
+      writeOpenAIError(res, 400, 'invalid_request_error', 'body is not valid JSON')
+      return
     }
 
     // An empty or model-less body is answered here rather than spent upstream:
@@ -494,8 +561,15 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     // same failed round trip and starves the healthy accounts behind it.
     const skipped = new Set<string>()
     let last: { kind: UpstreamErrorKind; status: number; message: string } | undefined
-    let exhaustedByRateLimit = false
+    let accountSkipped = false
     let transportAttempts = 0
+    // A 200 whose body ended before its first byte says the upstream answered
+    // and then cut the answer off, which is not the host being unreachable. It
+    // gets its own count for two reasons: the two failures need opposite
+    // remedies, and sharing the transport cap let two dead streams in a row end
+    // the turn without ever trying the healthy account behind them (three
+    // accounts, two empties: answered 502, never served).
+    let emptyStreams = 0
     // Built on first use: the retry below is the only caller, and the answer does
     // not change inside one request. Every request would otherwise pay a full
     // parse+stringify of the whole conversation for a branch almost none take.
@@ -509,14 +583,16 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     // about the account, and a host-wide outage must not cost one timeout per
     // sign-in.
     const maxAttempts = Math.max(8, pool.list(region).length + 2)
+    const maxEmptyStreams = emptyStreamAttemptsFor(pool.list(region).length)
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (controller.signal.aborted) return
 
       const account = await pool.acquire(modelId, region, conversationKey, skipped)
       if (account === undefined) {
-        // Distinguish "never signed in" from "every account is rate-limited":
-        // they need opposite remedies, so they must not share a status code.
-        if (exhaustedByRateLimit && last !== undefined) {
+        // Distinguish "never signed in" from "every account was tried and
+        // refused": they need opposite remedies, so they must not share a
+        // status code.
+        if (accountSkipped && last !== undefined) {
           // The wording follows the cause, because the remedy does: a spent
           // billing account is topped up, a dead session re-authenticated, a
           // WAF block waited out, and only a 429 clears on its own. Calling
@@ -534,7 +610,9 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                   : last.kind === 'account_restricted'
                     ? 'every WorkBuddy account was restricted by the upstream'
                     : last.kind === 'transport'
-                      ? `the upstream host could not be reached on any account${model}`
+                      ? (emptyStreams > 0 && transportAttempts === 0
+                        ? `every WorkBuddy account answered${model} with an empty stream`
+                        : `the upstream host could not be reached on any account${model}`)
                       : `every account is rate-limited${model}`
           const advice = last.kind === 'soft_rate'
             ? 'resets at the upstream window'
@@ -545,7 +623,9 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                 : last.kind === 'waf_block'
                   ? 'wait for the upstream gateway block to clear, or change network'
                   : last.kind === 'transport'
-                    ? 'check the connection to the upstream host'
+                    ? (emptyStreams > 0 && transportAttempts === 0
+                      ? 'the upstream answered and then produced no content; retry the request'
+                      : 'check the connection to the upstream host')
                     : last.kind === 'hard_credit'
                       ? 'top up the account, or add another account'
                       : 'sign in again in the desktop app'
@@ -619,7 +699,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
             status: 502,
             message: `could not refresh the sign-in: ${failure.message}`,
           }
-          exhaustedByRateLimit = true
+          accountSkipped = true
           continue
         }
       }
@@ -656,11 +736,13 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         let sawDone = false
         let sawFinish = false
         let sawToolCalls = false
+        const sawToolCallChoices = new Set<number>()
         let envelopeFailure: UpstreamErrorKind | undefined
         // A read that died before any byte was written. The relay cannot answer
         // this in-band because no header has been sent yet; the outer loop is
         // where the next account lives.
         let headFailure: string | undefined
+        let headIsEmptyStream = false
         const decoder = new TextDecoder()
         const frames: Array<{ raw: string; event: SseEvent | undefined }> = []
         const sse = new SseDecoder((raw, event) => frames.push({ raw, event }))
@@ -726,7 +808,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
 
         const relayFrames = async (finishTail = false): Promise<boolean> => {
           for (const { raw, event } of frames.splice(0)) {
-            const chunk = Buffer.from(finishTail ? raw + '\n\n' : raw)
+            let chunk: Uint8Array = Buffer.from(finishTail ? raw + '\n\n' : raw)
             if (event?.data === '[DONE]') {
               if (!sawFinish) {
                 await writeChunk(res, finishChunk())
@@ -742,6 +824,11 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
               const state = completionState(event.data)
               sawFinish ||= state.finished
               sawToolCalls ||= state.toolCalls
+              for (const index of state.toolCallIndices) sawToolCallChoices.add(index)
+              if (state.finished) {
+                const data = completedToolCallData(event.data, sawToolCallChoices)
+                if (data !== undefined) chunk = eventWithData(raw, data, finishTail)
+              }
             }
             await writeChunk(res, chunk)
           }
@@ -773,6 +860,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
               // next account can still take the turn.
               if (peeked.ended && peeked.refusal === EMPTY_STREAM_REFUSAL) {
                 headFailure = peeked.refusal
+                headIsEmptyStream = true
                 logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} answered 200 with an empty stream; rotating`)
                 return
               }
@@ -793,7 +881,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                 || envelopeKind === 'session_dead' || envelopeKind === 'account_restricted'
                 || envelopeKind === 'model_tier') {
                 last = { kind: envelopeKind, status: 200, message: peeked.refusal }
-                exhaustedByRateLimit = true
+                accountSkipped = true
                 envelopeFailure = envelopeKind
                 if (envelopeKind === 'soft_rate') {
                   // The 200 envelope is the same rate-limit answer the 429 path
@@ -880,13 +968,23 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         await relayLoop
         if (headFailure !== undefined) {
           // Still before the first client byte: the account is skipped for this
-          // request and the next one gets the turn, unless this is already the
-          // second transport failure and the host itself is unreachable.
+          // request and the next one gets the turn. The two causes are counted
+          // apart: a transport failure means the host never answered twice, and
+          // stopping there saves one timeout per sign-in; an empty stream means
+          // the host answered and cut the answer off, which says nothing about
+          // the accounts behind it, so it must not end the turn early.
           last = { kind: 'transport', status: 502, message: headFailure }
-          exhaustedByRateLimit = true
+          accountSkipped = true
           skipped.add(account.id)
-          transportAttempts += 1
-          if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
+          let spent: boolean
+          if (headIsEmptyStream) {
+            emptyStreams += 1
+            spent = emptyStreams >= maxEmptyStreams
+          } else {
+            transportAttempts += 1
+            spent = transportAttempts >= MAX_TRANSPORT_ATTEMPTS
+          }
+          if (spent) break
           continue
         }
         // The peek found an account-level refusal before any byte was sent, so
@@ -929,7 +1027,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
 
       if (result.kind === 'transport') {
         last = { kind: result.kind, status: result.status, message: result.message }
-        exhaustedByRateLimit = true
+        accountSkipped = true
         skipped.add(account.id)
         transportAttempts += 1
         if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
@@ -942,7 +1040,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         && result.kind !== 'model_tier'
         && result.kind !== 'account_restricted') break
 
-      exhaustedByRateLimit = true
+      accountSkipped = true
       if (result.kind === 'soft_rate') {
         // Cool only this model on this account; the account's other models stay
         // usable (the upstream explicitly allows switching to another model).

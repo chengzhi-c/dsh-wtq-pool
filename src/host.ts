@@ -275,13 +275,6 @@ const SERVICE_BOOTSTRAP_BUDGET_MS = 1500;
  */
 const REFRESH_PASS_BUDGET_MS = 18000;
 /**
- * How often the token keep-alive walks the pool.
- *
- * Half of the lifetime the pool assumes for a token that reports none, so a
- * sign-in nobody has used is renewed while it still works rather than at the
- * moment a request needs it.
- */
-/**
  * How long a started panel login stays pollable.
  *
  * The browser half is the user's to finish, so it is measured in minutes
@@ -311,6 +304,8 @@ let settings = {};
  * a switch the user just flipped.
  */
 let settingsRevision = 0;
+/** Orders overlapping reads, so a slower older response cannot replace a newer one. */
+let settingsReadSequence = 0;
 /**
  * Bumped only by writes this process made, never by a document the host pushed.
  *
@@ -333,7 +328,7 @@ const runtimes = new Map();
  */
 const runtimeStarts = new Map();
 /**
- * Gateway closes `reconcileRuntimes` started but could not wait for.
+ * Retired gateway starts and closes that may still hold a port.
  *
  * That function runs synchronously inside settings application, yet a source
  * toggled off and straight back on starts a new gateway while the old one's
@@ -366,6 +361,8 @@ const gatewayStartFailures = new Map();
 const sourceStartFailures = new Map();
 /** One in-flight source-gateway start per region, shared by overlapping passes. */
 const sourceGatewayStarts = new Map();
+/** Retired source starts and closes that may hold a port, keyed `source:region`. */
+const pendingSourceStops = new Map();
 /** Provider ids the host has confirmed it is serving, this process's lifetime. */
 let publishedIds = new Set();
 /**
@@ -594,13 +591,16 @@ async function loadSettings() {
  * the switch the user had just flipped.
  */
 async function adoptHostSettings() {
+  const readSequence = ++settingsReadSequence;
   const revision = settingsRevision;
+  const generation = loadGeneration;
   const next = await loadSettings();
+  if (readSequence !== settingsReadSequence) return false;
   if (next === undefined) {
     log("warn", "could not read settings; keeping the last known document");
     return false;
   }
-  if (settingsRevision !== revision) return false;
+  if (settingsRevision !== revision || loadGeneration !== generation) return false;
   settings = next;
   return true;
 }
@@ -617,9 +617,12 @@ async function adoptHostSettings() {
  * it read, and the panel answered success for a change that was gone.
  */
 async function saveSettings(patch) {
+  const generation = loadGeneration;
   return enqueueWrite(async () => {
+    if (generation !== loadGeneration) return false;
     try {
       await pi.plugin.setSettings(patch);
+      if (generation !== loadGeneration) return false;
       settings = { ...settings, ...patch };
       settingsRevision += 1;
       localSettingsRevision += 1;
@@ -663,16 +666,25 @@ function enqueueWrite(work) {
  * `undefined` means "no change", which skips the write entirely.
  */
 async function mutateSettings(key, mutate) {
+  const generation = loadGeneration;
   return enqueueWrite(async () => {
-    // A failed read is not fatal: the last known document is still the best
-    // answer available, and refusing the edit would drop a change the user can
-    // see they made.
-    await adoptHostSettings();
+    if (generation !== loadGeneration) return false;
+    // A read can lose to a newer concurrent read and answer false even though
+    // the host is healthy. Retry once so the mutation does not write from the
+    // stale local copy; a second failure refuses the edit.
+    let adopted = false;
+    for (let attempt = 0; attempt < 2 && !adopted; attempt += 1) {
+      adopted = await adoptHostSettings();
+      if (generation !== loadGeneration) return false;
+    }
+    if (!adopted) return false;
     const current = settings[key];
     const next = await mutate(current);
+    if (generation !== loadGeneration) return false;
     if (next === undefined) return true;
     try {
       await pi.plugin.setSettings({ [key]: next });
+      if (generation !== loadGeneration) return false;
       settings = { ...settings, [key]: next };
       settingsRevision += 1;
       localSettingsRevision += 1;
@@ -712,6 +724,7 @@ function resetDiscoveryCaches() {
  */
 async function onHostSettingsChanged(next) {
   if (next === null || typeof next !== "object" || Array.isArray(next)) return false;
+  const generation = loadGeneration;
   // A host announcement that was already in flight when a local save landed
   // carries the document from before that save. Queue it behind the write and
   // drop its stale copy. Re-reading instead of dropping the edit matters: the
@@ -720,14 +733,14 @@ async function onHostSettingsChanged(next) {
   // host's settings page unapplied until something else re-read the document.
   const localRevision = localSettingsRevision;
   return enqueueWrite(async () => {
-    if (serviceStopped) return false;
+    if (!stillLoaded(generation)) return false;
     const before = settings;
     if (localSettingsRevision !== localRevision) {
       if (!(await adoptHostSettings())) {
         // The read failed, so there is no merged document to apply. The next
         // state read or reload still sees the host's copy; do not replace this
         // process's copy with the stale event.
-        scheduleRefresh("settings");
+        if (stillLoaded(generation)) scheduleRefresh("settings");
         return false;
       }
     } else {
@@ -738,6 +751,7 @@ async function onHostSettingsChanged(next) {
       settings = next;
       settingsRevision += 1;
     }
+    if (!stillLoaded(generation)) return false;
     // A source switch changes what has to be discovered, and the credential
     // readers hold their answer for 30 s: without this the refresh that follows
     // the switch would re-read the cache the old switch filled and keep serving
@@ -748,8 +762,7 @@ async function onHostSettingsChanged(next) {
     if (toggled) {
       resetDiscoveryCaches();
     }
-    await applySettingsEverywhere(toggled);
-    return true;
+    return await applySettingsEverywhere(toggled);
   });
 }
 
@@ -761,13 +774,17 @@ async function onHostSettingsChanged(next) {
  * document to merge.
  */
 async function applySettingsEverywhere(toggled) {
+  const generation = loadGeneration;
+  if (!stillLoaded(generation)) return false;
   applySettingsToCore();
   traeAccountRows = traeAccountRows.filter((row) => regionEnabled("trae", row.region));
   qoderAccountRows = qoderAccountRows.filter((row) => regionEnabled("qoder", row.region));
   // A parked region must lose its gateway now, not at the next refresh: its
   // port would otherwise stay bound and its endpoint would keep serving.
   await reconcileTraeGateways();
+  if (!stillLoaded(generation)) return false;
   await reconcileQoderGateways();
+  if (!stillLoaded(generation)) return false;
   syncDeclaration();
   // The cached billing answers belong to the accounts the last switch left in
   // the pool, so only a switch invalidates them. Blanking them on every edit
@@ -1473,6 +1490,49 @@ async function settleWithin(work, budgetMs) {
   }
 }
 
+async function waitForRuntimeStops() {
+  const deadline = Date.now() + PORT_RESERVE_ATTEMPTS * PORT_RESERVE_INTERVAL_MS;
+  while (pendingRuntimeStops.length > 0) {
+    const left = deadline - Date.now();
+    if (left <= 0 || await settleWithin(Promise.allSettled(pendingRuntimeStops), left) === undefined) return;
+  }
+}
+
+async function waitForSourceStops(key) {
+  const deadline = Date.now() + PORT_RESERVE_ATTEMPTS * PORT_RESERVE_INTERVAL_MS;
+  while (pendingSourceStops.has(key)) {
+    const left = deadline - Date.now();
+    if (left <= 0 || await settleWithin(Promise.allSettled(pendingSourceStops.get(key)), left) === undefined) return;
+  }
+}
+
+function trackPendingSource(key, stopping) {
+  let pending = pendingSourceStops.get(key);
+  if (pending === undefined) {
+    pending = new Set();
+    pendingSourceStops.set(key, pending);
+  }
+  pending.add(stopping);
+  const forget = () => {
+    pending.delete(stopping);
+    if (pending.size === 0 && pendingSourceStops.get(key) === pending) pendingSourceStops.delete(key);
+  };
+  stopping.then(forget, forget);
+  return stopping;
+}
+
+function trackSourceStop(entry) {
+  const key = entry.source + ":" + entry.region;
+  const stopping = (async () => {
+    try {
+      await entry.gateway.close();
+    } catch (error) {
+      log("warn", "[" + key + "] gateway did not close cleanly: " + safeMessage(error));
+    }
+  })();
+  return trackPendingSource(key, stopping);
+}
+
 /**
  * One deadline, and the two things a bounded pass does with it.
  *
@@ -1727,12 +1787,57 @@ function syncDeclaration() {
   // published a stale model list for as long as the source stayed switched on -
   // which is what the rule above says must not happen.
   const warming = warmingGatewayIds();
-  const retained = declaredProviders().filter((provider) => activeIds.has(provider.id)
-    && !currentIds.has(provider.id)
-    && warming.has(provider.id));
+  const retained = declaredProviders().flatMap((provider) => {
+    if (!activeIds.has(provider.id) || currentIds.has(provider.id) || !warming.has(provider.id)) return [];
+    const rebound = warmingDescriptor(provider);
+    return rebound === undefined ? [] : [rebound];
+  });
   const result = writeDeclaration([...current, ...retained]);
   runtimeState.write = result;
   return result;
+}
+
+/**
+ * Rebind a retained roster to the address the current run serves on.
+ *
+ * A gateway that is still trying has no address to retain: the fallback each
+ * descriptor uses is its preferred port, and nothing is listening there before
+ * the listener is created. Republishing that address would leave the host with a
+ * row whose every request is refused while the panel reports no drift, which is
+ * the failure this retention exists to avoid.
+ *
+ * Only the placeholder is refused, not every missing address: a runtime that has
+ * been created but has not recorded an address yet is still on its way, and the
+ * preferred port is where it will land. WorkBuddy always checked the placeholder
+ * for its own gateways; the Trae and Qoder branches did not, so a gateway that
+ * had failed to bind left its saved row published over a dead port.
+ */
+function warmingDescriptor(provider) {
+  // The placeholder is spelled here rather than read from the module constant:
+  // this function is exercised on its own in a context that supplies only what
+  // it touches, and a gateway that reported this address is the one case that
+  // must not be republished.
+  const NOT_LISTENING = "http://127.0.0.1:1/v1";
+  const listeningAt = (address) => address !== NOT_LISTENING;
+  for (const [region, id] of Object.entries(PROVIDER_ID_BY_REGION)) {
+    if (id !== provider.id) continue;
+    const runtime = runtimes.get(region);
+    if (runtime !== undefined && !listeningAt(runtime.baseUrl)) return undefined;
+    return { ...provider, baseUrl: descriptorFor(region).baseUrl };
+  }
+  for (const [region, id] of Object.entries(TRAE_PROVIDER_ID_BY_REGION)) {
+    if (id !== provider.id) continue;
+    const entry = traeGateways.get(region);
+    if (entry !== undefined && !listeningAt(entry.baseUrl)) return undefined;
+    return { ...provider, baseUrl: descriptorForTrae(region).baseUrl };
+  }
+  for (const [region, id] of Object.entries(QODER_PROVIDER_ID_BY_REGION)) {
+    if (id !== provider.id) continue;
+    const entry = qoderGateways.get(region);
+    if (entry !== undefined && !listeningAt(entry.baseUrl)) return undefined;
+    return { ...provider, baseUrl: descriptorForQoder(region).baseUrl };
+  }
+  return undefined;
 }
 
 /**
@@ -1750,7 +1855,12 @@ function warmingGatewayIds() {
     // No runtime yet, or one mid-connect: the roster is still on its way. A
     // region whose start failed is not on its way - it is not coming.
     if (gatewayStartFailures.has(region)) continue;
-    if (runtime === undefined || runtime.connecting !== null) ids.add(PROVIDER_ID_BY_REGION[region]);
+    if (runtime === undefined || runtime.connecting !== null) {
+      ids.add(PROVIDER_ID_BY_REGION[region]);
+    } else {
+      const pool = core.pool?.status();
+      if (pool?.lastScanAtMs === 0 && pool.scanning === true) ids.add(PROVIDER_ID_BY_REGION[region]);
+    }
   }
   for (const [source, gateways, regions, idByRegion] of [
     ["trae", traeGateways, activeTraeRegions(), TRAE_PROVIDER_ID_BY_REGION],
@@ -1963,31 +2073,36 @@ async function reconcileTraeGateways() {
     if (active.includes(region)) continue;
     traeGateways.delete(region);
     sourceStartFailures.delete("trae:" + region);
-    try {
-      await entry.gateway.close();
-    } catch (error) {
-      log("warn", "[trae:" + region + "] gateway did not close cleanly: " + safeMessage(error));
-    }
+    await trackSourceStop(entry);
   }
   for (const region of active) {
     if (!stillLoaded(generation) || serviceStopped) return;
     if (traeGateways.has(region)) continue;
     const key = "trae:" + region;
+    await waitForSourceStops(key);
+    if (!stillLoaded(generation)) return;
+    if (!activeTraeRegions().includes(region)) continue;
+    if (traeGateways.has(region)) continue;
     // A rescan can reconcile beside the background refresh. Without the shared
     // promise both bind; the loser's EADDRINUSE then marks a healthy region as
     // failed, and addressDrift reports a gateway that is actually serving. The
     // second caller waits for that start, so a rescan still sees the gateway.
-    const pending = sourceGatewayStarts.get(key);
-    if (pending !== undefined) {
+    let pending = sourceGatewayStarts.get(key);
+    while (pending !== undefined) {
       await pending.catch(() => {});
-      continue;
+      await waitForSourceStops(key);
+      if (!stillLoaded(generation)) return;
+      if (!activeTraeRegions().includes(region) || traeGateways.has(region)) break;
+      if (sourceGatewayStarts.get(key) === pending) sourceGatewayStarts.delete(key);
+      pending = sourceGatewayStarts.get(key);
     }
+    if (!activeTraeRegions().includes(region) || traeGateways.has(region)) continue;
     const starting = createTraeRuntime(region);
     sourceGatewayStarts.set(key, starting);
     try {
       const entry = await starting;
       if (!stillLoaded(generation) || !activeTraeRegions().includes(region) || traeGateways.has(region)) {
-        await entry.gateway.close();
+        await trackSourceStop(entry);
       } else {
         traeGateways.set(region, entry);
         sourceStartFailures.delete(key);
@@ -2184,27 +2299,32 @@ async function reconcileQoderGateways() {
     if (active.includes(region)) continue;
     qoderGateways.delete(region);
     sourceStartFailures.delete("qoder:" + region);
-    try {
-      await entry.gateway.close();
-    } catch (error) {
-      log("warn", "[qoder:" + region + "] gateway did not close cleanly: " + safeMessage(error));
-    }
+    await trackSourceStop(entry);
   }
   for (const region of active) {
     if (!stillLoaded(generation) || serviceStopped) return;
     if (qoderGateways.has(region)) continue;
     const key = "qoder:" + region;
-    const pending = sourceGatewayStarts.get(key);
-    if (pending !== undefined) {
+    await waitForSourceStops(key);
+    if (!stillLoaded(generation)) return;
+    if (!activeQoderRegions().includes(region)) continue;
+    if (qoderGateways.has(region)) continue;
+    let pending = sourceGatewayStarts.get(key);
+    while (pending !== undefined) {
       await pending.catch(() => {});
-      continue;
+      await waitForSourceStops(key);
+      if (!stillLoaded(generation)) return;
+      if (!activeQoderRegions().includes(region) || qoderGateways.has(region)) break;
+      if (sourceGatewayStarts.get(key) === pending) sourceGatewayStarts.delete(key);
+      pending = sourceGatewayStarts.get(key);
     }
+    if (!activeQoderRegions().includes(region) || qoderGateways.has(region)) continue;
     const starting = createQoderRuntime(region);
     sourceGatewayStarts.set(key, starting);
     try {
       const entry = await starting;
       if (!stillLoaded(generation) || !activeQoderRegions().includes(region) || qoderGateways.has(region)) {
-        await entry.gateway.close();
+        await trackSourceStop(entry);
       } else {
         qoderGateways.set(region, entry);
         sourceStartFailures.delete(key);
@@ -2420,7 +2540,7 @@ async function settleStartedRuntime(region, runtime, unwanted) {
   // one branch: `unwanted` says nobody is waiting for it, and `held` says another
   // runtime already serves the region. Neither can keep it.
   if (unwanted || held !== undefined) {
-    await stopRuntime(runtime);
+    await trackRuntimeStop(runtime);
     return false;
   }
   runtimes.set(region, runtime);
@@ -2443,7 +2563,10 @@ async function startRuntimes() {
   if (!stillLoaded(generation)) return;
   // Gateways a settings change retired may still be closing; their ports are
   // only reusable once those closes settle. See `pendingRuntimeStops`.
-  if (pendingRuntimeStops.length > 0) await Promise.all(pendingRuntimeStops.splice(0));
+  if (pendingRuntimeStops.length > 0) {
+    await waitForRuntimeStops();
+    if (!stillLoaded(generation)) return;
+  }
   await Promise.all(activeRegions().map(async (region) => {
     if (runtimes.has(region)) return;
     try {
@@ -2468,13 +2591,27 @@ async function stopRuntime(runtime) {
   if (runtime.retired === true) return;
   runtime.retired = true;
   runtime.signedIn = false;
-  // The next start for this region begins from a clean slate: a failure left
-  // recorded here would keep a gateway that is being closed on purpose out of
-  // the "still warming" set the whole time it is down.
-  gatewayStartFailures.delete(runtime.region);
-  if (runtime.shim) await runtime.shim.close().catch((error) => {
+  // A late, unowned runtime must not erase the new activation's failure.
+  if (runtimes.get(runtime.region) === runtime) gatewayStartFailures.delete(runtime.region);
+  try {
+    if (runtime.shim) await runtime.shim.close();
+  } catch (error) {
     log("warn", "[workbuddy:" + runtime.region + "] gateway did not close cleanly: " + safeMessage(error));
-  });
+  }
+}
+
+function trackPendingRuntime(stopping) {
+  pendingRuntimeStops.push(stopping);
+  const forget = () => {
+    const index = pendingRuntimeStops.indexOf(stopping);
+    if (index !== -1) pendingRuntimeStops.splice(index, 1);
+  };
+  stopping.then(forget, forget);
+  return stopping;
+}
+
+function trackRuntimeStop(runtime) {
+  return trackPendingRuntime(stopRuntime(runtime));
 }
 
 /**
@@ -2764,7 +2901,7 @@ async function refreshAll(reason, force) {
       // same list before it binds, for the same reason - see
       // `pendingRuntimeStops`.
       if (pendingRuntimeStops.length > 0) {
-        await Promise.all(pendingRuntimeStops.splice(0));
+        await waitForRuntimeStops();
         // Checked before the bind rather than only after it: a service that
         // stopped during the drain used to cost one full port reservation and
         // shim bind before the pass discovered it was stale, which is the
@@ -2780,6 +2917,7 @@ async function refreshAll(reason, force) {
       try {
         runtime = await settle(starting);
       } catch (error) {
+        if (!stillLoaded(generation)) return stalePass();
         gatewayStartFailures.set(region, safeMessage(error));
         log("warn", "[" + region + "] gateway could not start: " + safeMessage(error));
         continue;
@@ -2790,7 +2928,7 @@ async function refreshAll(reason, force) {
       if (runtime === undefined) {
         // Released only when nobody registered it: a second caller shares this
         // promise, and its own `runtimes.set` is the one that matters.
-        starting.then((late) => { if (runtimes.get(region) !== late) return stopRuntime(late) }).catch(() => {});
+        starting.then((late) => { if (runtimes.get(region) !== late) return trackRuntimeStop(late) }).catch(() => {});
         continue;
       }
       // Both races - a stale generation and a region switched off while the
@@ -3218,7 +3356,7 @@ function reconcileRuntimes() {
       // The close is recorded rather than awaited: this runs synchronously from
       // settings application, and `startRuntimes` drains the list before it
       // binds, which is where the port the close is releasing gets reused.
-      pendingRuntimeStops.push(stopRuntime(runtime));
+      trackRuntimeStop(runtime);
       runtimes.delete(region);
     }
   }
@@ -5475,17 +5613,16 @@ async function redeemAccountStreak(account) {
     }
   }
   // Draws come only from the tiers just redeemed, so this runs after them and
-  // pays only when a tier actually opened a chance. The prize payload is passed
-  // through as-is and logged: its shape is the campaign's, not the API's, so
-  // there is no field to read a credit out of.
+  // pays only when a tier actually opened a chance. The prize payload stays out
+  // of logs because its shape is controlled by the remote campaign.
   if (signal.aborted) return result;
   try {
     const chances = await core.client.lotteryChances(account.credential);
     for (let draw = 0; draw < chances; draw += 1) {
       if (signal.aborted) return result;
-      const prize = await core.client.drawLottery(account.credential);
+      await core.client.drawLottery(account.credential);
       detail.lottery += 1;
-      log("info", "streak " + accountLogTag(account.label) + ": draw " + (draw + 1) + "/" + chances + " " + JSON.stringify(prize).slice(0, 160));
+      log("info", "streak " + accountLogTag(account.label) + ": draw " + (draw + 1) + "/" + chances);
     }
   } catch (error) {
     detail.failed += 1;
@@ -6361,8 +6498,9 @@ function stopAccountWatch() {
  * Note this is the only place the roster is fetched during load: opening the
  * panel no longer triggers detection of its own.
  */
-async function publishDeclarationEarly() {
+async function publishDeclarationEarly(generation) {
   await adoptHostSettings();
+  if (!stillLoaded(generation)) return;
   // Disabled is a declaration state too: the host serves whatever the last
   // registration said, so a run that opens no gateway must still erase the rows
   // a previous run left registered - otherwise the picker keeps offering
@@ -6385,9 +6523,13 @@ async function publishDeclarationEarly() {
   // answer; the refresh after the service start publishes whatever it finished.
   const { left: bootstrapLeft } = budget(LOAD_BOOTSTRAP_BUDGET_MS);
   await settleWithin(reconcileTraeGateways(), bootstrapLeft());
+  if (!stillLoaded(generation)) return;
   await settleWithin(reconcileQoderGateways(), bootstrapLeft());
+  if (!stillLoaded(generation)) return;
   if (activeRegions().length > 0) await settleWithin(core.pool.scan(), bootstrapLeft());
+  if (!stillLoaded(generation)) return;
   await settleWithin(startRuntimes(), bootstrapLeft());
+  if (!stillLoaded(generation)) return;
   // Bounded like every other read: a roster that does not answer inside the
   // budget still leaves a declaration to publish - the fallback roster plus
   // the saved selection - while the read it cut short finishes behind the
@@ -6400,6 +6542,7 @@ async function publishDeclarationEarly() {
       log("warn", runtime.region + " failed to start during load: " + runtime.lastError);
     }
   })), LOAD_ROSTER_BUDGET_MS);
+  if (!stillLoaded(generation)) return;
   const written = syncDeclaration();
   if (written.ok !== true) log("warn", "declaration not written: " + String(written.error));
   // The count, not the path: the panel footer is the place that says where the
@@ -6414,6 +6557,10 @@ async function onServiceStart() {
   const generation = loadGeneration;
   serviceStopped = false;
   if (warmAbort.signal.aborted) warmAbort = new AbortController();
+  // The host cannot cancel a setSettings call already in flight. Let it land
+  // before this activation reads, or storage can move behind its cached copy.
+  await writeChain;
+  if (!stillLoaded(generation)) return;
   await adoptHostSettings();
   if (!stillLoaded(generation)) return;
   if (settings.enabled === false) {
@@ -6465,6 +6612,7 @@ async function onServiceStart() {
 async function onServiceStop() {
   serviceStopped = true;
   loadGeneration += 1;
+  core.pool?.clear();
   if (refreshTimer !== null) {
     clearTimeout(refreshTimer);
     refreshTimer = null;
@@ -6485,15 +6633,14 @@ async function onServiceStop() {
   // per-account loops check it, instead of the pass keeping talking to a host
   // that is no longer there. A pass that starts later re-arms the flag.
   checkinAbort.abort();
-  const closing = Array.from(runtimes.values()).map(stopRuntime);
+  const closing = Array.from(runtimes.values()).map(trackRuntimeStop);
   runtimes.clear();
   // A bind still in flight belongs to this activation; its owner releases it
   // through the post-await check in `startRuntimes` or the refresh pass.
+  for (const starting of runtimeStarts.values()) trackPendingRuntime(starting);
   runtimeStarts.clear();
   for (const entry of [...traeGateways.values(), ...qoderGateways.values()]) {
-    closing.push(entry.gateway.close().catch((error) => {
-      log("warn", "[" + entry.source + ":" + entry.region + "] gateway did not close cleanly: " + safeMessage(error));
-    }));
+    closing.push(trackSourceStop(entry));
   }
   traeGateways.clear();
   qoderGateways.clear();
@@ -6502,6 +6649,7 @@ async function onServiceStop() {
   // close above was deliberate is not a drift.
   gatewayStartFailures.clear();
   sourceStartFailures.clear();
+  for (const [key, starting] of sourceGatewayStarts) trackPendingSource(key, starting);
   sourceGatewayStarts.clear();
   await Promise.all(closing);
 }
@@ -6512,6 +6660,8 @@ async function onLoad() {
   // retires the previous load's in-flight passes, and the teardown paths bump it
   // again so nothing of theirs survives into this one.
   loadGeneration += 1;
+  const generation = loadGeneration;
+  core.pool?.clear();
   // A reload can arrive without the previous activation's stop. Abort the
   // pass it still has, and close the gateways still bound to its pool.
   // `startRuntimes` waits out these closes before it binds.
@@ -6527,12 +6677,14 @@ async function onLoad() {
     refreshTimer = null;
   }
   refreshInflight = null;
-  for (const runtime of runtimes.values()) pendingRuntimeStops.push(stopRuntime(runtime));
+  for (const runtime of runtimes.values()) trackRuntimeStop(runtime);
   runtimes.clear();
   // Same reason as `onServiceStop`: an in-flight bind belongs to the activation
   // being torn down, and leaving it here would hand the next activation a
   // gateway whose owner is about to close it.
+  for (const starting of runtimeStarts.values()) trackPendingRuntime(starting);
   runtimeStarts.clear();
+  for (const [key, starting] of sourceGatewayStarts) trackPendingSource(key, starting);
   sourceGatewayStarts.clear();
   // The Trae and Qoder gateways are deliberately left alone: their options are
   // closures over module-level functions, and closing them here also dropped
@@ -6577,34 +6729,41 @@ async function onLoad() {
       error: (...args) => log("error", gatewayLogLine("", args)),
     },
   });
+  // A write issued by the previous activation may already be inside the host.
+  // Waiting here makes the read below the last word rather than a stale copy.
+  await writeChain;
+  if (!stillLoaded(generation)) return;
   await adoptHostSettings();
   // The teardown can run while this load is still between its awaits. An
   // activation disabled a moment after it started would otherwise register its
   // service and its check-in timer into a load that is already
   // gone, and nothing would ever stop them. Every step past this point is
   // re-checked the same way.
-  if (serviceStopped) return;
+  if (!stillLoaded(generation)) return;
   // The entry re-publishes the declaration as soon as the gateways come up.
   // `declarationIndex` survives the load so a gateway still warming keeps the
   // roster it last published; the next `syncDeclaration` replaces or filters it.
   publishedIds = new Set();
+  let nextDataPath;
   try {
-    dataPath = await pi.plugin.getDataPath();
+    nextDataPath = await pi.plugin.getDataPath();
   } catch (error) {
-    dataPath = "";
+    nextDataPath = "";
     log("warn", "no plugin data path: " + safeMessage(error));
   }
+  if (!stillLoaded(generation)) return;
+  dataPath = nextDataPath;
   // Now that the data root is known: the durable record of what today's pass
   // already collected, so a restart does not run it twice. See
   // `loadCheckinSlots`.
   loadCheckinSlots();
-  if (serviceStopped) return;
+  if (!stillLoaded(generation)) return;
   pi.services.register({ id: SERVICE_ID, start: onServiceStart, stop: onServiceStop });
   // The host pushes a settings document whenever the user edits this plugin in
   // its own settings UI. Without this listener those edits only took effect
   // after a full plugin reload.
   subscribeToHostSettings();
-  await publishDeclarationEarly();
+  await publishDeclarationEarly(generation);
 }
 
 async function onUnload() {
@@ -6624,7 +6783,7 @@ async function onUnload() {
   // No declaration is written here: the teardown in the entry has already
   // stopped the loader, so a registration from an unloading plugin is refused,
   // and the next load resets the declaration index and republishes anyway.
-  await onServiceStop();
+  const stopping = onServiceStop();
   probeCache.clear();
   // The module-level state a load builds is per-load state: a hold, an expiry
   // note or a rotation cursor left behind outlives the sign-ins it was keyed
@@ -6641,6 +6800,7 @@ async function onUnload() {
   // reload would otherwise be answered with a state this activation never issued.
   deviceLogins.clear();
   unsubscribeFromHostSettings();
+  await stopping;
 }
 
 function composerPointsEnabled() {

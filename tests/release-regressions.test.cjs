@@ -4,27 +4,13 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
-const { createRequire, registerHooks } = require('node:module')
-const { fileURLToPath } = require('node:url')
-const ts = require('typescript')
-
-const root = path.resolve(__dirname, '..')
-const transpile = (source) => ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },
-}).outputText
-
-registerHooks({
-  resolve(specifier, context, next) {
-    const ownSource = context.parentURL?.startsWith('file:') && fileURLToPath(context.parentURL).startsWith(path.join(root, 'src') + path.sep)
-    return next(ownSource && specifier.startsWith('.') && path.extname(specifier) === '' ? specifier + '.ts' : specifier, context)
-  },
-  load(url, context, next) {
-    if (url.startsWith('file:') && url.endsWith('.ts')) return {
-      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')),
-    }
-    return next(url, context)
-  },
-})
+const { createRequire } = require('node:module')
+const { root, transpile } = require('./ts-loader.cjs')
+const sourceFunction = (source, name) => {
+  const match = source.match(new RegExp(`^function ${name}\\([^]*?^}$`, 'm'))
+  assert.ok(match, `${name} must exist`)
+  return match[0]
+}
 
 const { createServer, request } = require('node:http')
 const encoder = new TextEncoder()
@@ -93,8 +79,9 @@ for (const source of ['trae', 'qoder']) {
  */
 test('a partial startup keeps the row of a warming gateway and drops an answered one', () => {
   const source = fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')
-  const fn = source.match(/^function syncDeclaration\(\) \{[^]*?^\}/m)[0]
-  const old = { id: 'wtqpool-qoder-cn', models: [{ id: 'saved-qoder' }] }
+  const fn = sourceFunction(source, 'syncDeclaration')
+  const rebound = sourceFunction(source, 'warmingDescriptor')
+  const old = { id: 'wtqpool-qoder-cn', baseUrl: 'http://127.0.0.1:45110/v1', models: [{ id: 'saved-qoder' }] }
   const byWarming = [
     // A Qoder gateway whose directory has not answered yet is the one case a row
     // is republished for; everything else that cannot publish drops its row.
@@ -107,15 +94,93 @@ test('a partial startup keeps the row of a warming gateway and drops an answered
     const writes = []
     const context = vm.createContext({
       runtimes: new Map([['cn', { signedIn: true }]]),
+      qoderGateways: new Map([['cn', { baseUrl: 'http://127.0.0.1:41871' }]]),
       activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => ['cn'],
       declarationModels: () => [{ id: 'workbuddy' }], traeDeclarationModels: () => [], qoderDeclarationModels: () => [],
       PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' }, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: { cn: old.id },
-      descriptorFor: () => ({ id: 'wtqpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder() {},
+      descriptorFor: () => ({ id: 'wtqpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder: () => ({ baseUrl: 'http://127.0.0.1:41871/v1' }),
       manifestProviders: () => [old], declaredProviders: () => [old], writeDeclaration: rows => { writes.push(rows); return { ok: true } }, runtimeState: {},
       warmingGatewayIds: () => new Set(warming),
     })
-    vm.runInContext(fn + '\nsyncDeclaration()', context)
+    vm.runInContext(fn + '\n' + rebound + '\nsyncDeclaration()', context)
     assert.deepEqual(Array.from(writes[0], row => row.id), kept, reason)
+    if (warming.length > 0) assert.equal(writes[0][1].baseUrl, 'http://127.0.0.1:41871/v1')
+  }
+})
+
+test('a cold source keeps its saved row at the preferred port', () => {
+  const source = fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')
+  const functions = ['syncDeclaration', 'warmingDescriptor', 'warmingGatewayIds']
+    .map(name => sourceFunction(source, name))
+    .join('\n')
+  const oldWorkBuddy = { id: 'wtqpool-cn', baseUrl: 'http://127.0.0.1:3/v1', models: [{ id: 'saved-workbuddy' }] }
+  const oldTrae = { id: 'wtqpool-trae-cn', baseUrl: 'http://127.0.0.1:1/v1', models: [{ id: 'saved-trae' }] }
+  const oldQoder = { id: 'wtqpool-qoder-cn', baseUrl: 'http://127.0.0.1:2/v1', models: [{ id: 'saved-qoder' }] }
+  const writes = []
+  const context = vm.createContext({
+    runtimes: new Map(), gatewayStartFailures: new Map(),
+    traeGateways: new Map(), qoderGateways: new Map(), sourceStartFailures: new Map(),
+    sourceKey: (s, r) => s + ':' + r,
+    PLACEHOLDER_BASE_URL: 'http://127.0.0.1:1/v1',
+    activeRegions: () => ['cn'], activeTraeRegions: () => ['cn'], activeQoderRegions: () => ['cn'],
+    PROVIDER_ID_BY_REGION: { cn: oldWorkBuddy.id }, TRAE_PROVIDER_ID_BY_REGION: { cn: oldTrae.id },
+    QODER_PROVIDER_ID_BY_REGION: { cn: oldQoder.id },
+    declarationModels: () => [], traeDeclarationModels: () => [], qoderDeclarationModels: () => [],
+    descriptorFor: () => ({ baseUrl: 'http://127.0.0.1:41871/v1' }),
+    descriptorForTrae: () => ({ baseUrl: 'http://127.0.0.1:42841/v1' }),
+    descriptorForQoder: () => ({ baseUrl: 'http://127.0.0.1:45110/v1' }),
+    declaredProviders: () => [oldWorkBuddy, oldTrae, oldQoder],
+    writeDeclaration: rows => { writes.push(rows); return { ok: true } }, runtimeState: {},
+  })
+  vm.runInContext(`${functions}\nsyncDeclaration()`, context)
+  assert.deepEqual(Array.from(writes[0], row => row.id), [oldWorkBuddy.id, oldTrae.id, oldQoder.id])
+  assert.deepEqual(Array.from(writes[0], row => row.baseUrl), [
+    'http://127.0.0.1:41871/v1', 'http://127.0.0.1:42841/v1', 'http://127.0.0.1:45110/v1',
+  ])
+})
+
+/**
+ * A gateway that answered on the placeholder has nothing to republish.
+ *
+ * The placeholder is the address a runtime is created with, before its listener
+ * binds. A gateway still sitting on it has tried and failed to bind, so
+ * republishing its saved roster would point the host at a port nothing is
+ * listening on - every request refused, while the panel reports no drift.
+ * WorkBuddy's branch always refused that case; the Trae and Qoder branches
+ * published their preferred port instead, which is the same dead address for
+ * those sources.
+ */
+test('a gateway stuck on the placeholder does not republish its saved row', () => {
+  const source = fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')
+  const functions = ['syncDeclaration', 'warmingDescriptor']
+    .map(name => sourceFunction(source, name))
+    .join('\n')
+  const placeholder = 'http://127.0.0.1:1/v1'
+  for (const source_ of ['trae', 'qoder']) {
+    const old = { id: `wtqpool-${source_}-cn`, baseUrl: 'http://127.0.0.1:9999/v1', models: [{ id: 'saved' }] }
+    const writes = []
+    // Only the source under test is active: it has a gateway that is still on
+    // the placeholder, so its saved row must not be republished.
+    const context = vm.createContext({
+      runtimes: new Map(), gatewayStartFailures: new Map(),
+      traeGateways: source_ === 'trae' ? new Map([['cn', { baseUrl: placeholder }]]) : new Map(),
+      qoderGateways: source_ === 'qoder' ? new Map([['cn', { baseUrl: placeholder }]]) : new Map(),
+      sourceStartFailures: new Map(),
+      activeRegions: () => [],
+      activeTraeRegions: () => (source_ === 'trae' ? ['cn'] : []),
+      activeQoderRegions: () => (source_ === 'qoder' ? ['cn'] : []),
+      PROVIDER_ID_BY_REGION: {},
+      TRAE_PROVIDER_ID_BY_REGION: source_ === 'trae' ? { cn: old.id } : {},
+      QODER_PROVIDER_ID_BY_REGION: source_ === 'qoder' ? { cn: old.id } : {},
+      declarationModels: () => [], traeDeclarationModels: () => [], qoderDeclarationModels: () => [],
+      descriptorFor: () => ({}),
+      descriptorForTrae: () => ({ baseUrl: 'http://127.0.0.1:42841/v1' }),
+      descriptorForQoder: () => ({ baseUrl: 'http://127.0.0.1:45110/v1' }),
+      declaredProviders: () => [old], writeDeclaration: rows => { writes.push(rows); return { ok: true } }, runtimeState: {},
+      warmingGatewayIds: () => new Set([old.id]),
+    })
+    vm.runInContext(`${functions}\nsyncDeclaration()`, context)
+    assert.deepEqual(Array.from(writes[0], row => row.id), [], `${source_}: a dead port must not keep its row`)
   }
 })
 
@@ -131,7 +196,7 @@ test('a partial startup keeps the row of a warming gateway and drops an answered
  */
 test('a runtime still connecting is warming and a settled signed-out one is not', () => {
   const source = fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')
-  const fn = source.match(/^function warmingGatewayIds\(\) \{[^]*?^\}/m)[0]
+  const fn = sourceFunction(source, 'warmingGatewayIds')
   const context = vm.createContext({
     runtimes: new Map(),
     gatewayStartFailures: new Map(),
@@ -139,6 +204,7 @@ test('a runtime still connecting is warming and a settled signed-out one is not'
     PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' },
     traeGateways: new Map(), activeTraeRegions: () => [], TRAE_PROVIDER_ID_BY_REGION: {},
     qoderGateways: new Map(), activeQoderRegions: () => [], QODER_PROVIDER_ID_BY_REGION: {},
+    core: { pool: { status: () => ({ lastScanAtMs: Date.now(), scanning: false }) } },
   })
   vm.runInContext(fn + '\nwarmingGatewayIds()', context)
   const warming = () => [...vm.runInContext('warmingGatewayIds()', context)]
@@ -152,6 +218,14 @@ test('a runtime still connecting is warming and a settled signed-out one is not'
   // rather than a wait.
   context.runtimes = new Map([['cn', { signedIn: false, connecting: null }]])
   assert.deepEqual(warming(), [], 'a runtime that has settled signed out must not read as warming')
+  // The gateway can settle before a slow at-rest account scan. Until that scan
+  // has either found an account or finished with none, its saved roster is still
+  // the only usable row for this provider.
+  context.core = { pool: { status: () => ({ lastScanAtMs: 0, scanning: true }) } }
+  assert.deepEqual(warming(), ['wtqpool-cn'],
+    'a settled runtime whose first account scan is still running remains warming')
+  context.core.pool.status = () => ({ lastScanAtMs: Date.now(), scanning: false })
+  assert.deepEqual(warming(), [], 'the row is dropped once the account scan has finished')
   // No runtime at all is still a roster on its way - the same row is at stake.
   context.runtimes = new Map()
   assert.deepEqual(warming(), ['wtqpool-cn'],
@@ -210,6 +284,699 @@ test('a gateway that could not bind is reported as address drift', () => {
   assert.equal(drift(), false, 'a Trae first start that failed has nothing to drift from yet')
   context.declaredSourceBaseUrl = () => 'http://127.0.0.1:42851'
   assert.equal(drift(), true, 'once its row is published, a Trae gateway with no bind is drift')
+})
+
+function blockedScanFixture(t, blocked = 'scan') {
+  const directory = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-scan-lifecycle-'))
+  const auth = path.join(directory, 'auth')
+  const data = path.join(directory, 'data')
+  const oldData = path.join(directory, 'old-data')
+  fs.mkdirSync(auth)
+  const authFile = path.join(auth, 'workbuddy-desktop.info')
+  const signIn = uin => JSON.stringify({ auth: { accessToken: `fixture-${uin}`, expiresAt: Date.now() + 3600000 }, account: { uin } })
+  fs.writeFileSync(authFile, signIn('old'))
+  const io = require('node:fs/promises')
+  const original = io.readFile
+  let release, reached, held = false
+  const gate = new Promise(resolve => { release = resolve })
+  const waiting = new Promise(resolve => { reached = resolve })
+  t.mock.method(io, 'readFile', async (file, ...args) => {
+    const answer = await original(file, ...args)
+    if (blocked === 'scan' && !held && String(file) === authFile) {
+      held = true
+      reached()
+      await gate
+    }
+    return answer
+  })
+  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [{ id: 'fixture', name: 'Fixture', contextWindow: 128000, maxTokens: 4096 }])
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
+  const { installPi, startRegisteredService, stopRegisteredService } = require('../src/pi-compat.ts')
+  let settingsReads = 0
+  let dataPathReads = 0
+  const listeners = new Set()
+  const settings = { enabled: true, sourceWorkbuddy: true, sourceTrae: blocked === 'gateway' || blocked === 'close', sourceQoder: false,
+    disabledRegions: ['workbuddy:global', 'trae:ai'], authFile, autoCheckin: { enabled: false } }
+  installPi({
+    getSettings: async () => {
+      const snapshot = { ...settings }
+      settingsReads += 1
+      if (blocked === 'settings' && settingsReads === 2) {
+        reached()
+        await gate
+      }
+      if (blocked === 'event-read' && settingsReads === 3) {
+        reached()
+        await gate
+      }
+      return snapshot
+    },
+    setSettings: patch => Object.assign(settings, patch),
+    getDataPath: async () => {
+      dataPathReads += 1
+      if (blocked === 'dataPath' && dataPathReads === 1) {
+        reached()
+        await gate
+        return oldData
+      }
+      return data
+    }, declareProviders: () => ({ ok: true, changed: false }),
+    onSettingsChanged: handler => listeners.add(handler), offSettingsChanged: handler => listeners.delete(handler),
+  })
+  const ownRequire = createRequire(path.join(root, 'src/host.ts'))
+  const context = vm.createContext({ module: { exports: {} }, exports: {}, require: specifier => {
+    if ((blocked === 'gateway' || blocked === 'close') && (specifier === './trae-gateway' || specifier === './trae-gateway.ts')) return {
+      createTraeGateway: () => ({
+        ready: blocked === 'gateway' ? (async () => { reached(); await gate })() : Promise.resolve(),
+        baseUrl: () => 'http://127.0.0.1:1/v1', port: () => 1, models: () => [],
+        close: async () => {
+          if (blocked === 'close' && !held) { held = true; reached(); await gate }
+        },
+      }),
+    }
+    return ownRequire(specifier)
+  },
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval })
+  context.exports = context.module.exports
+  vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8'))
+    + '\nmodule.exports.__enqueueWrite = enqueueWrite\nmodule.exports.__saveSettings = saveSettings\nmodule.exports.__mutateSettings = mutateSettings\nmodule.exports.__onHostSettingsChanged = onHostSettingsChanged\nmodule.exports.__replaceActivation = (generation, next) => { loadGeneration = generation; serviceStopped = false; settings = next }\nmodule.exports.__settings = () => settings\n', context)
+  const plugin = context.module.exports
+  const load = plugin.onLoad()
+  t.after(async () => {
+    release()
+    await load.catch(() => {})
+    await stopRegisteredService()
+    await plugin.onUnload()
+    fs.rmSync(directory, { recursive: true, force: true })
+  })
+  return { authFile, data, signIn, settings, listeners, waiting, release, load, plugin, startRegisteredService, stopRegisteredService }
+}
+
+test('cancelled sign-in writes leave no sign-in or temporary file', async (t) => {
+  const directory = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-cancel-write-'))
+  const target = path.join(directory, 'signins')
+  const signIn = { uin: 'fixture', uid: '', accessToken: 'fixture' }
+  try {
+    const { writeOwnSignIn } = require('../src/accounts.ts')
+    await t.test('before the directory is created', async () => {
+      await assert.rejects(writeOwnSignIn(target, signIn, AbortSignal.abort()), { name: 'AbortError' })
+      assert.equal(fs.existsSync(target), false)
+    })
+    await t.test('while the temporary file is being written', async () => {
+      const io = require('node:fs/promises')
+      const write = io.writeFile
+      let release, reached
+      const started = new Promise(resolve => { reached = resolve })
+      const gate = new Promise(resolve => { release = resolve })
+      t.mock.method(io, 'writeFile', async (file, ...args) => {
+        reached()
+        await gate
+        return write(file, ...args)
+      })
+      const controller = new AbortController()
+      const pending = writeOwnSignIn(target, signIn, controller.signal)
+      await started
+      controller.abort()
+      release()
+      await assert.rejects(pending, { name: 'AbortError' })
+      assert.deepEqual(fs.readdirSync(target), [])
+    })
+    await t.test('after the atomic commit starts', async () => {
+      const io = require('node:fs/promises')
+      const rename = io.rename
+      let release, reached
+      const started = new Promise(resolve => { reached = resolve })
+      const gate = new Promise(resolve => { release = resolve })
+      t.mock.method(io, 'rename', async (from, to) => {
+        reached()
+        await gate
+        return rename(from, to)
+      })
+      const controller = new AbortController()
+      const pending = writeOwnSignIn(target, signIn, controller.signal)
+      await started
+      controller.abort()
+      release()
+      const file = await pending
+      assert.deepEqual(fs.readdirSync(target), [path.basename(file)],
+        'a completed rename must leave one complete sign-in and no temporary file')
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).auth.accessToken, signIn.accessToken)
+    })
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('settings writes from a replaced activation cannot reach the new one', async (t) => {
+  const fixture = blockedScanFixture(t, 'none')
+  await fixture.load
+  let releaseQueue
+  const gate = new Promise(resolve => { releaseQueue = resolve })
+  await fixture.plugin.__replaceActivation(100, { sourceWorkbuddy: true, authFile: '/old' })
+  const queued = fixture.plugin.__enqueueWrite(() => gate)
+  const saved = fixture.plugin.__saveSettings({ sourceWorkbuddy: false })
+  const mutated = fixture.plugin.__mutateSettings('authFile', current => current + '/old')
+  await fixture.plugin.__replaceActivation(101, { sourceWorkbuddy: true, authFile: '/new' })
+  releaseQueue()
+  await queued
+  assert.equal(await saved, false)
+  assert.equal(await mutated, false)
+  assert.deepEqual(fixture.plugin.__settings(), { sourceWorkbuddy: true, authFile: '/new' })
+  assert.deepEqual(fixture.settings, { enabled: true, sourceWorkbuddy: true, sourceTrae: false, sourceQoder: false,
+    disabledRegions: ['workbuddy:global', 'trae:ai'], authFile: fixture.authFile, autoCheckin: { enabled: false } })
+})
+
+test('stopping the service retires an in-flight credential scan', async (t) => {
+  const fixture = blockedScanFixture(t)
+  await fixture.waiting
+  await fixture.stopRegisteredService()
+  fixture.release()
+  await fixture.load
+  assert.equal(fs.existsSync(path.join(fixture.data, 'credentials-archive.json')), false,
+    'the stopped scan cannot write discovered credentials')
+  await fixture.startRegisteredService()
+  assert.equal(fs.existsSync(path.join(fixture.data, 'credentials-archive.json')), true,
+    'restarting the service must still scan and keep the account')
+})
+
+test('reloading the plugin retires the previous credential scan', async (t) => {
+  const fixture = blockedScanFixture(t)
+  await fixture.waiting
+  fs.writeFileSync(fixture.authFile, fixture.signIn('new'))
+  await fixture.plugin.onLoad()
+  fixture.release()
+  await fixture.load
+  const archive = JSON.parse(fs.readFileSync(path.join(fixture.data, 'credentials-archive.json'), 'utf8'))
+  assert.deepEqual(archive.entries.map(entry => entry.uin), ['new'],
+    'a retired activation must not archive its stale account after the replacement')
+})
+
+test('a stopped load cannot start a credential scan after reading settings', async (t) => {
+  const fixture = blockedScanFixture(t, 'settings')
+  await fixture.waiting
+  await fixture.stopRegisteredService()
+  fixture.release()
+  await fixture.load
+  assert.equal(fs.existsSync(path.join(fixture.data, 'credentials-archive.json')), false,
+    'a retired load cannot restart credential discovery')
+})
+
+test('a stopped load cannot start a credential scan after a gateway starts', async (t) => {
+  const fixture = blockedScanFixture(t, 'gateway')
+  await fixture.waiting
+  await fixture.stopRegisteredService()
+  fixture.release()
+  await fixture.load
+  assert.equal(fs.existsSync(path.join(fixture.data, 'credentials-archive.json')), false,
+    'a retired load cannot restart credential discovery')
+})
+
+test('a replaced load cannot overwrite the new activation settings', async (t) => {
+  const fixture = blockedScanFixture(t, 'settings')
+  await fixture.waiting
+  fixture.settings.sourceWorkbuddy = false
+  await fixture.plugin.onLoad()
+  fixture.release()
+  await fixture.load
+  const state = await fixture.plugin.onPanelInvoke('xd.state')
+  assert.equal(state.sources.workbuddy, false,
+    'a stale settings read cannot switch the source back on')
+})
+
+test('a replaced load cannot redirect the new credential pool to its data path', async (t) => {
+  const fixture = blockedScanFixture(t, 'dataPath')
+  await fixture.waiting
+  await fixture.plugin.onLoad()
+  fs.rmSync(path.join(fixture.data, 'credentials-archive.json'), { force: true })
+  fixture.release()
+  await fixture.load
+  await fixture.startRegisteredService()
+  assert.equal(fs.existsSync(path.join(fixture.data, 'credentials-archive.json')), true)
+  assert.equal(fs.existsSync(path.join(fixture.data, '..', 'old-data', 'credentials-archive.json')), false,
+    'the old activation cannot repoint the new pool after getDataPath resolves')
+})
+
+test('an older unload does not detach the new activation settings listener', async (t) => {
+  const fixture = blockedScanFixture(t, 'close')
+  await fixture.load
+  const unloading = fixture.plugin.onUnload()
+  await fixture.waiting
+  fixture.settings.sourceTrae = false
+  await fixture.plugin.onLoad()
+  fixture.release()
+  await unloading
+  assert.equal(fixture.listeners.size, 1, 'the new activation must still receive host settings edits')
+  for (const listener of fixture.listeners) listener({ ...fixture.settings, sourceWorkbuddy: false })
+  await fixture.plugin.__enqueueWrite(() => {})
+  const state = await fixture.plugin.onPanelInvoke('xd.state')
+  assert.equal(state.sources.workbuddy, false)
+})
+
+test('a queued settings event from a replaced activation cannot overwrite the new settings', async (t) => {
+  const fixture = blockedScanFixture(t, 'none')
+  await fixture.load
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const held = fixture.plugin.__enqueueWrite(() => gate)
+  t.after(() => release())
+  for (const listener of fixture.listeners) listener({ ...fixture.settings, sourceWorkbuddy: true })
+  fixture.settings.sourceWorkbuddy = false
+  const loading = fixture.plugin.onLoad()
+  release()
+  await loading
+  await held
+  await fixture.plugin.__enqueueWrite(() => {})
+  const state = await fixture.plugin.onPanelInvoke('xd.state')
+  assert.equal(state.sources.workbuddy, false, 'the retired event must not switch the source back on')
+})
+
+test('a settings read from a replaced event cannot overwrite the new settings', async (t) => {
+  const fixture = blockedScanFixture(t, 'event-read')
+  await fixture.load
+  let releaseWrite, startWrite
+  const writeStarted = new Promise(resolve => { startWrite = resolve })
+  const held = fixture.plugin.__enqueueWrite(() => new Promise(resolve => { releaseWrite = resolve; startWrite() }))
+  await writeStarted
+  const saving = fixture.plugin.__saveSettings({ cooldownSeconds: 120 })
+  const event = fixture.plugin.__onHostSettingsChanged({ ...fixture.settings, sourceWorkbuddy: true })
+  releaseWrite()
+  await saving
+  await fixture.waiting
+  fixture.settings.sourceWorkbuddy = false
+  const loading = fixture.plugin.onLoad()
+  fixture.release()
+  await loading
+  await Promise.all([held, event])
+  const state = await fixture.plugin.onPanelInvoke('xd.state')
+  assert.equal(state.sources.workbuddy, false, 'a stale event read must not replace the new activation settings')
+})
+
+test('gateway restarts share a bounded wait for previous ports to close', async (t) => {
+  const net = require('node:net')
+  const listen = (server, port) => new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(port, '127.0.0.1', resolve)
+  })
+  const close = server => new Promise(resolve => server.close(resolve))
+  for (const scenario of ['stop', 'parallel', 'newer-close', 'stalled', 'failure', 'starting', 'late', 'stale-failure']) {
+    await t.test(scenario, async () => {
+      const oldServer = net.createServer()
+      await listen(oldServer, 0)
+      const preferred = oldServer.address().port
+      let release, releaseClose
+      const gate = new Promise(resolve => { release = resolve })
+      const closeGate = new Promise(resolve => { releaseClose = resolve })
+      const previous = { region: 'cn', shim: { close: () => {
+        if (scenario === 'failure') throw new Error('close failed')
+        return (async () => { await (scenario === 'late' ? closeGate : gate); await close(oldServer) })()
+      } } }
+      const created = []
+      let attempts = 0
+      const context = vm.createContext({ module: { exports: {} }, exports: {},
+        require: createRequire(path.join(root, 'src/host.ts')), console: { log() {} },
+        AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval })
+      context.exports = context.module.exports
+      const hooks = `
+        module.exports.__ports = {
+          setup(previous, create) {
+            serviceStopped = false; loadGeneration += 1;
+            core.pool = { clear() {} };
+            runtimes.set('cn', previous);
+            activeRegions = () => ['cn'];
+            createRuntime = create;
+          },
+          stop: onServiceStop,
+          start: startRuntimes,
+          restart() { serviceStopped = false; loadGeneration += 1 },
+          clearRuntimes() { runtimes.clear() },
+          refresh() {
+            adoptHostSettings = async () => true; applySettingsToCore = () => {};
+            poolNeedsScan = false; reconcileTraeGateways = async () => {};
+            reconcileQoderGateways = async () => {}; refreshSourceAccounts = async () => {};
+            syncDeclaration = () => ({ ok: true }); statusDocument = async () => ({});
+            budget = () => ({ left: () => 0, settle: async () => undefined });
+            return refreshAll('fixture', true);
+          },
+          hold(previous) { trackRuntimeStop(previous); runtimes.clear() },
+          runtime() { return runtimes.get('cn') },
+          failure() { return gatewayStartFailures.get('cn') },
+          reserve: reservePort,
+        }`
+      vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')) + hooks, context)
+      const host = context.module.exports.__ports
+      host.setup(previous, async () => {
+        attempts += 1
+        if (['starting', 'late', 'stale-failure'].includes(scenario) && attempts === 1) { await gate; return previous }
+        if (scenario === 'stale-failure') throw new Error('new activation bind failed')
+        const bound = await host.reserve(preferred)
+        const server = net.createServer()
+        await listen(server, bound)
+        created.push(server)
+        return { region: 'cn', port: server.address().port, shim: { close: () => close(server) } }
+      })
+      let stopping, first, second, deadlineTimer, releaseNewer
+      try {
+        if (scenario === 'stale-failure') {
+          host.clearRuntimes()
+          first = host.start()
+          stopping = host.stop()
+          host.restart()
+          second = host.start()
+          await second
+          assert.equal(host.failure(), 'new activation bind failed')
+          release()
+          await first
+          assert.equal(host.failure(), 'new activation bind failed', 'retiring an old bind must not erase the new failure')
+          return
+        } else if (scenario === 'late') {
+          host.clearRuntimes()
+          await host.refresh()
+          stopping = host.stop()
+          host.restart()
+          first = host.start()
+          release()
+          releaseClose()
+        } else if (scenario === 'starting') {
+          host.clearRuntimes()
+          first = host.start()
+          stopping = host.stop()
+          host.restart()
+          second = host.start()
+          await new Promise(resolve => setImmediate(resolve))
+          assert.equal(attempts, 1, 'the replacement must wait for the retired start')
+          release()
+        } else if (scenario === 'parallel') host.hold(previous)
+        else { stopping = host.stop(); stopping.catch(() => {}); host.restart() }
+        if (scenario === 'newer-close') {
+          const newer = new Promise(resolve => { releaseNewer = resolve })
+          host.hold({ region: 'cn', shim: { close: () => newer } })
+        }
+        if (scenario !== 'starting' && scenario !== 'late') first = host.start()
+        if (scenario === 'parallel') second = host.start()
+        if (scenario === 'stop' || scenario === 'parallel') {
+          await new Promise(resolve => setImmediate(resolve))
+          assert.equal(attempts, 0, 'the replacement must wait for the previous port to close')
+          release()
+        }
+        if (scenario === 'newer-close') {
+          release()
+          await stopping
+          await new Promise(resolve => setTimeout(resolve, 30))
+          assert.equal(attempts, 0, 'an older close cannot erase a later in-flight close')
+          releaseNewer()
+        }
+        await Promise.race([
+          Promise.all([first, second]),
+          new Promise((_, reject) => { deadlineTimer = setTimeout(() => reject(new Error('restart did not finish')), 5000) }),
+        ])
+        const actual = host.runtime().port
+        if (scenario === 'stalled' || scenario === 'failure') assert.notEqual(actual, preferred, 'a failed close must not block startup indefinitely')
+        else assert.equal(actual, preferred, 'the old port must be reused when it closes inside the wait budget')
+        if (scenario === 'failure') await stopping
+      } finally {
+        clearTimeout(deadlineTimer)
+        release()
+        releaseClose()
+        releaseNewer?.()
+        await Promise.allSettled([stopping, first, second])
+        for (const server of created) if (server.listening) await close(server)
+        if (oldServer.listening) await close(oldServer)
+      }
+    })
+  }
+})
+
+test('a failed bind from a retired refresh cannot mark the new activation as failed', async () => {
+  let rejectBind, began
+  const started = new Promise(resolve => { began = resolve })
+  const context = vm.createContext({ module: { exports: {} }, exports: {},
+    require: createRequire(path.join(root, 'src/host.ts')), console: { log() {} },
+    AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval })
+  context.exports = context.module.exports
+  const hooks = `
+    module.exports.__staleBind = {
+      setup(create) {
+        serviceStopped = false; loadGeneration += 1;
+        core.pool = { clear() {} }; activeRegions = () => ['cn']; createRuntime = create;
+        adoptHostSettings = async () => true; applySettingsToCore = () => {};
+        poolNeedsScan = false; reconcileTraeGateways = async () => {};
+        budget = () => ({ left: () => 1000, settle: async work => await work });
+      },
+      refresh: () => refreshAll('fixture', true),
+      stop: onServiceStop,
+      restart() { serviceStopped = false; loadGeneration += 1 },
+      failure: () => gatewayStartFailures.get('cn'),
+    }`
+  vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')) + hooks, context)
+  const host = context.module.exports.__staleBind
+  host.setup(() => new Promise((_, reject) => { rejectBind = reject; began() }))
+  const refreshing = host.refresh()
+  try {
+    await started
+    await host.stop()
+    host.restart()
+    rejectBind(new Error('old activation bind failed'))
+    await refreshing
+    assert.equal(host.failure(), undefined)
+  } finally {
+    rejectBind?.(new Error('fixture finished'))
+    await refreshing.catch(() => {})
+  }
+})
+
+test('source gateways reuse their ports after a concurrent stop or switch', async (t) => {
+  const net = require('node:net')
+  const listen = (server, port) => new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(port, '127.0.0.1', resolve)
+  })
+  const close = server => new Promise(resolve => server.close(resolve))
+  for (const source of ['trae', 'qoder']) {
+    for (const reason of source === 'trae' ? ['switch', 'stop', 'stalled'] : ['switch', 'stop', 'failure']) {
+      await t.test(`${source} ${reason}`, async () => {
+        const oldServer = net.createServer()
+        await listen(oldServer, 0)
+        const preferred = oldServer.address().port
+        let release
+        const gate = new Promise(resolve => { release = resolve })
+        const previous = { source, region: 'cn', gateway: { close: () => {
+          if (reason === 'failure') throw new Error('close failed')
+          return (async () => { await gate; await close(oldServer) })()
+        } } }
+        const created = []
+        const context = vm.createContext({ module: { exports: {} }, exports: {},
+          require: createRequire(path.join(root, 'src/host.ts')), console: { log() {} },
+          AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval })
+        context.exports = context.module.exports
+        const hooks = `
+          let sourceOn = true;
+          module.exports.__sourcePorts = {
+            setup(previous, create) {
+              serviceStopped = false; loadGeneration += 1;
+              core.pool = { clear() {} };
+              activeTraeRegions = () => sourceOn && previous.source === 'trae' ? ['cn'] : [];
+              activeQoderRegions = () => sourceOn && previous.source === 'qoder' ? ['cn'] : [];
+              createTraeRuntime = create; createQoderRuntime = create;
+              (previous.source === 'trae' ? traeGateways : qoderGateways).set('cn', previous);
+            },
+            toggle(on) { sourceOn = on },
+            stop: onServiceStop,
+            restart() { serviceStopped = false; loadGeneration += 1 },
+            reconcile: source => source === 'trae' ? reconcileTraeGateways() : reconcileQoderGateways(),
+            entry: source => (source === 'trae' ? traeGateways : qoderGateways).get('cn'),
+            reserve: reservePort,
+          }`
+        vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')) + hooks, context)
+        const host = context.module.exports.__sourcePorts
+        host.setup(previous, async () => {
+          const bound = await host.reserve(preferred)
+          const server = net.createServer()
+          await listen(server, bound)
+          created.push(server)
+          return { source, region: 'cn', baseUrl: `http://127.0.0.1:${server.address().port}`,
+            gateway: { close: () => close(server) } }
+        })
+        let stopping, starting, deadline
+        try {
+          if (reason === 'switch') {
+            host.toggle(false)
+            stopping = host.reconcile(source)
+            host.toggle(true)
+          } else {
+            stopping = host.stop()
+            host.restart()
+          }
+          starting = host.reconcile(source)
+          if (reason === 'stalled' || reason === 'failure') {
+            await Promise.race([starting, new Promise((_, reject) => {
+              deadline = setTimeout(() => reject(new Error('restart did not finish')), 5000)
+            })])
+            assert.notEqual(new URL(host.entry(source).baseUrl).port, String(preferred),
+              'a stuck close must eventually permit a temporary port')
+            release()
+            await stopping
+          } else {
+            await new Promise(resolve => setImmediate(resolve))
+            release()
+            await Promise.all([stopping, starting])
+            assert.equal(new URL(host.entry(source).baseUrl).port, String(preferred),
+              'the released preferred port must be reused')
+          }
+        } finally {
+          clearTimeout(deadline)
+          release()
+          await Promise.allSettled([stopping, starting])
+          for (const server of created) if (server.listening) await close(server)
+          if (oldServer.listening) await close(oldServer)
+        }
+      })
+    }
+  }
+})
+
+test('a source gateway still starting is retired before its replacement', async (t) => {
+  const net = require('node:net')
+  const listen = (server, port) => new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(port, '127.0.0.1', resolve)
+  })
+  const close = server => new Promise(resolve => server.close(resolve))
+  for (const source of ['trae', 'qoder']) {
+    for (const reason of ['switch', 'stop']) {
+    await t.test(`${source} ${reason}`, async () => {
+      const preferred = await new Promise((resolve, reject) => {
+        const probe = net.createServer()
+        probe.once('error', reject)
+        probe.listen(0, '127.0.0.1', () => {
+          const port = probe.address().port
+          probe.close(() => resolve(port))
+        })
+      })
+      let releaseCreate, createdFirst, startedClose, releaseClose
+      const createGate = new Promise(resolve => { releaseCreate = resolve })
+      const closeGate = new Promise(resolve => { releaseClose = resolve })
+      const ready = new Promise(resolve => { createdFirst = resolve })
+      const closing = new Promise(resolve => { startedClose = resolve })
+      let created = 0
+      const servers = []
+      const context = vm.createContext({ module: { exports: {} }, exports: {},
+        require: createRequire(path.join(root, 'src/host.ts')), console: { log() {} },
+        AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval })
+      context.exports = context.module.exports
+      const hooks = `
+        let sourceOn = true;
+        module.exports.__unfinishedSource = {
+          setup(create) {
+            serviceStopped = false; loadGeneration += 1;
+            core.pool = { clear() {} };
+            activeTraeRegions = () => sourceOn && '${source}' === 'trae' ? ['cn'] : [];
+            activeQoderRegions = () => sourceOn && '${source}' === 'qoder' ? ['cn'] : [];
+            createTraeRuntime = create; createQoderRuntime = create;
+          },
+          toggle(on) { sourceOn = on },
+          stop: onServiceStop,
+          restart() { serviceStopped = false; loadGeneration += 1 },
+          reconcile: source => source === 'trae' ? reconcileTraeGateways() : reconcileQoderGateways(),
+          entry: source => (source === 'trae' ? traeGateways : qoderGateways).get('cn'),
+          reserve: reservePort,
+        }`
+      vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')) + hooks, context)
+      const host = context.module.exports.__unfinishedSource
+      host.setup(async () => {
+        created += 1
+        const firstAttempt = created === 1
+        const bound = await host.reserve(preferred)
+        const server = net.createServer()
+        await listen(server, bound)
+        servers.push(server)
+        if (firstAttempt) {
+          createdFirst()
+          await createGate
+        }
+        return { source, region: 'cn', baseUrl: `http://127.0.0.1:${server.address().port}`,
+          gateway: { close: async () => { if (firstAttempt) { startedClose(); await closeGate } await close(server) } } }
+      })
+      let first, second, third, stopping
+      try {
+        first = host.reconcile(source)
+        await ready
+        if (reason === 'switch') {
+          second = host.reconcile(source)
+          third = host.reconcile(source)
+          await new Promise(resolve => setImmediate(resolve))
+          host.toggle(false)
+          releaseCreate()
+          await closing
+          host.toggle(true)
+          releaseClose()
+        } else {
+          stopping = host.stop()
+          host.restart()
+          releaseClose()
+          second = host.reconcile(source)
+          await new Promise(resolve => setImmediate(resolve))
+          releaseCreate()
+        }
+        await Promise.all([first, second, third, stopping])
+        assert.ok(host.entry(source), 're-enabling must leave a live gateway after the first start was retired')
+        assert.equal(created, 2, 'the joined reconcile must retry after the retired start closes')
+        assert.equal(new URL(host.entry(source).baseUrl).port, String(preferred), 'the replacement must reuse the released port')
+      } finally {
+        releaseCreate()
+        releaseClose()
+        await Promise.allSettled([first, second, third, stopping])
+        for (const server of servers) if (server.listening) await close(server)
+      }
+    })
+    }
+  }
+})
+
+test('a region disabled while another start waits does not block the remaining region', async (t) => {
+  for (const source of ['trae', 'qoder']) {
+    await t.test(source, async () => {
+      let release
+      const gate = new Promise(resolve => { release = resolve })
+      const previous = { source, region: 'cn', gateway: { close: () => gate } }
+      const context = vm.createContext({ module: { exports: {} }, exports: {},
+        require: createRequire(path.join(root, 'src/host.ts')), console: { log() {} },
+        AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval })
+      context.exports = context.module.exports
+      const hooks = `
+        let active = [];
+        module.exports.__sourceRegions = {
+          setup(previous) {
+            serviceStopped = false; loadGeneration += 1;
+            activeTraeRegions = () => previous.source === 'trae' ? active : [];
+            activeQoderRegions = () => previous.source === 'qoder' ? active : [];
+            const create = async region => ({ source: previous.source, region, gateway: { close: async () => {} } });
+            createTraeRuntime = create; createQoderRuntime = create;
+            (previous.source === 'trae' ? traeGateways : qoderGateways).set('cn', previous);
+          },
+          active(value) { active = value },
+          reconcile: source => source === 'trae' ? reconcileTraeGateways() : reconcileQoderGateways(),
+          entry: source => (source === 'trae' ? traeGateways : qoderGateways).get('global'),
+        }`
+      vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')) + hooks, context)
+      const host = context.module.exports.__sourceRegions
+      host.setup(previous)
+      let stopping, starting
+      try {
+        stopping = host.reconcile(source)
+        host.active(['cn', 'global'])
+        starting = host.reconcile(source)
+        host.active(['global'])
+        release()
+        await Promise.all([stopping, starting])
+        assert.ok(host.entry(source), 'the still-enabled region must start')
+      } finally {
+        release()
+        await Promise.allSettled([stopping, starting])
+      }
+    })
+  }
 })
 
 test('DSH publishes the live gateway after its preferred port is occupied', async (t) => {

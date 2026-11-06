@@ -123,6 +123,15 @@ function queueSeconds(frame: QoderFrame & { type: 'failure' }): number {
  * and a multi-hour Retry-After, and classifying it as a queue would turn it
  * into a long sleep instead of a failover.
  */
+/**
+ * The failure class of a refused peek, carried on the response the peek returns.
+ *
+ * A status code alone cannot separate "this sign-in answered nothing" from "the
+ * service is down for everyone": both are 502, and only the first belongs to
+ * the account. The gateway reads the class from this header.
+ */
+export const QODER_FAILURE_KIND_HEADER = 'x-wtq-failure-kind'
+
 export function classifyQoderFailure(failure: QoderFailure): { status: number; kind: 'soft_rate' | 'hard_credit' | 'authentication' | 'client'; error: Error } {
   const code = failure.code.trim()
   const text = `${code} ${failure.message} ${failure.signals ?? ''}`
@@ -588,7 +597,10 @@ export async function openQoderResponse(
     return Response.json(
       {
         error: {
-          message: detail === '' ? `Qoder returned HTTP ${response.status}` : detail,
+          // Redacted here as well as in the gateway: this response is a value
+          // other code paths may read directly, and Trae's counterpart already
+          // does this. The gateway's own pass stays, so one miss cannot leak.
+          message: detail === '' ? `Qoder returned HTTP ${response.status}` : redactSecrets(detail),
           type: 'upstream_error',
           code: response.status,
         },
@@ -691,7 +703,7 @@ export async function openQoderResponse(
   // real status code. Once output has started, the stream is already committed.
   if (failure !== undefined && !sawOutput) {
     await reader.cancel().catch(() => {})
-    const { status, error } = classifyQoderFailure(failure)
+    const { status, kind, error } = classifyQoderFailure(failure)
     const retryAfter = error instanceof QoderQueueRejection || error instanceof QoderDailyLimitRejection
       ? error.retryAfterSeconds
       : undefined
@@ -701,7 +713,12 @@ export async function openQoderResponse(
     return Response.json(
       {
         error: {
-          message: error.message === '' ? `Qoder refused the request (${failure.code})` : error.message.slice(0, 1024),
+          // Redacted as well as in the gateway: this response is a value other
+          // code paths may read directly, and Trae's counterpart starts from a
+          // redacted text. An echoed request carries the account's own token.
+          message: error.message === ''
+            ? `Qoder refused the request (${failure.code})`
+            : redactSecrets(error.message).slice(0, 1024),
           type: 'upstream_error',
           code: status,
           ...retryAfter === undefined || !(retryAfter > 0) ? {} : { retryAfterSeconds: retryAfter },
@@ -709,8 +726,24 @@ export async function openQoderResponse(
       },
       {
         status,
-        ...wait === undefined ? {} : { headers: { 'Retry-After': wait } },
+        headers: {
+          [QODER_FAILURE_KIND_HEADER]: kind,
+          ...wait === undefined ? {} : { 'Retry-After': wait },
+        },
       },
+    )
+  }
+  // A 200 whose body ended before a single frame is the same hiccup the Trae
+  // path answers this way: forwarding it told the client the turn succeeded
+  // with nothing in it, and left the sign-in that hiccuped at the head of the
+  // queue. The class rides on the response because the status cannot carry it -
+  // an outage and an empty answer are both 502, and only the second belongs to
+  // the account.
+  if (failure === undefined && bufferedBytes === 0 && ended) {
+    await reader.cancel().catch(() => {})
+    return Response.json(
+      { error: { message: 'Qoder returned an empty answer stream', type: 'upstream_error', code: 502 } },
+      { status: 502, headers: { [QODER_FAILURE_KIND_HEADER]: 'empty_stream' } },
     )
   }
   // A grace that ran out leaves its read in flight. Handing the relay the same

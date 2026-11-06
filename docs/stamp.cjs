@@ -32,10 +32,17 @@ const SHOTS = [
   'preview-page.png',
 ]
 
-const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(ROOT, file))).digest('hex')
+const { withoutComments } = require('./capture-shape.cjs')
+
+const digest = (file) => {
+  const text = fs.readFileSync(path.join(ROOT, file), 'utf8')
+  const stripped = withoutComments(text, file)
+  return crypto.createHash('sha256').update(stripped).digest('hex')
+}
+const shotDigest = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(ROOT, file))).digest('hex')
 const stamp = {
   rendered: Object.fromEntries(RENDERED.map((file) => [file, digest(file)])),
-  shots: Object.fromEntries(SHOTS.map((file) => [file, digest('docs/' + file)])),
+  shots: Object.fromEntries(SHOTS.map((file) => [file, shotDigest('docs/' + file)])),
 }
 
 fs.writeFileSync(path.join(ROOT, 'docs', 'preview-capture.json'), JSON.stringify(stamp, null, 2) + '\n')

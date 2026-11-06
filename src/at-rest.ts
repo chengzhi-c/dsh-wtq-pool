@@ -7,9 +7,9 @@
  */
 import { createDecipheriv, createHash } from 'node:crypto'
 import { execFile, execFileSync } from 'node:child_process'
-import { statSync } from 'node:fs'
+import { lstatSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, parse, resolve } from 'node:path'
 
 const AAD_DOMAIN = Buffer.from('WB-AAD\0', 'ascii')
 const KEY_FETCH_TIMEOUT_MS = 30_000
@@ -125,17 +125,103 @@ function cleanIconPath(raw: string): string {
   return raw.replace(/^"/u, '').replace(/",-?\d+$/u, '').replace(/,-?\d+$/u, '').trim()
 }
 
-/**
- * Whether a Windows path names a local file rather than a network share.
- *
- * The registry scan reads values any process running as the user can write. A
- * `DisplayIcon` naming `\\host\share\x.exe` would make PowerShell's own path
- * check authenticate to that host before any signature was read, leaking the
- * user's NTLM response. Only absolute drive paths are considered, and every
- * stat and spawn goes through the same filter.
- */
+/** Reject direct UNC and device paths before checking a candidate. */
 function localWindowsPath(candidate: string): boolean {
   return /^[A-Za-z]:[\\/]/u.test(candidate)
+}
+
+/**
+ * Keep only candidates on fixed local volumes.
+ *
+ * A mapped drive still looks like `Z:\...` to Node, and even `lstatSync` can
+ * contact its SMB server. Windows exposes the volume type without opening a
+ * file, so every candidate is filtered before any path component is inspected.
+ */
+function fixedWindowsPaths(candidates: string[]): string[] {
+  const local = candidates
+    .filter((candidate) => localWindowsPath(candidate))
+    .map((candidate) => resolve(candidate))
+  if (local.length === 0) return []
+  // The install lives on the system volume on virtually every machine, and a
+  // volume query is a PowerShell spawn the host waits on. Asking only about the
+  // roots that are *not* the system one keeps the common case free while still
+  // refusing a mapped or removable drive.
+  //
+  // With no system root to compare against, the filter is skipped rather than
+  // refusing everything: the stat below still refuses what it cannot reach, and
+  // the signature check is what decides.
+  const anchor = systemRootOf(process.env) ?? process.env['SystemRoot'] ?? process.env['windir']
+  if (anchor === undefined) return local
+  const systemRoot = parse(resolve(anchor)).root.toUpperCase()
+  const elsewhere = [...new Set(local
+    .map((candidate) => parse(candidate).root.toUpperCase())
+    .filter((candidateRoot) => candidateRoot !== '' && candidateRoot !== systemRoot))]
+  const fixed = new Set(elsewhere.length === 0 ? [] : scanFixedRoots(elsewhere))
+  return local.filter((candidate) => {
+    const candidateRoot = parse(candidate).root.toUpperCase()
+    return candidateRoot === systemRoot || (candidateRoot !== '' && fixed.has(candidateRoot))
+  })
+}
+
+/** Which of `roots` are fixed drives, asked of PowerShell in one spawn. */
+function scanFixedRoots(roots: readonly string[]): string[] {
+  const interpreter = scanInterpreter(process.env)
+  if (interpreter === undefined) return []
+  const payload = Buffer.from(JSON.stringify(roots), 'utf8').toString('base64')
+  const script = [
+    "$env:PSModulePath=[IO.Path]::Combine($env:SystemRoot,'System32\\WindowsPowerShell\\v1.0\\Modules')",
+    "$ErrorActionPreference='SilentlyContinue'",
+    'try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}',
+    `$roots=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json`,
+    '$out = foreach ($root in @($roots)) {',
+    '  try {',
+    '    if ([IO.DriveInfo]::new([string]$root).DriveType -eq [IO.DriveType]::Fixed) { [string]$root }',
+    '  } catch {}',
+    '}',
+    'ConvertTo-Json -InputObject @($out) -Compress',
+  ].join('\n')
+  let parsed: unknown
+  try {
+    const stdout = execFileSync(interpreter, [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+    ], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      windowsHide: true,
+      maxBuffer: 65_536,
+      env: signatureScanEnv(),
+      cwd: dirname(dirname(dirname(interpreter))),
+    })
+    parsed = JSON.parse(stdout)
+  } catch {
+    return []
+  }
+  const entries = Array.isArray(parsed) ? parsed : [parsed]
+  return entries
+    .filter((entry): entry is string => typeof entry === 'string')
+    .map((entry) => entry.toUpperCase())
+}
+
+/** Walk every Windows path component without following a reparse point. */
+function windowsPathHasReparsePoint(candidate: string): boolean {
+  if (process.platform !== 'win32') return false
+  const normalized = resolve(candidate)
+  const root = parse(normalized).root
+  let current = root
+  for (const part of normalized.slice(root.length).split(/[\\/]+/u).filter(Boolean)) {
+    current = join(current, part)
+    try {
+      const entry = lstatSync(current, { throwIfNoEntry: false })
+      // The OS would not resolve a missing component either. Treat it as unsafe
+      // so the path it later opens is the one whose components were inspected.
+      if (entry === undefined) return true
+      if (entry.isSymbolicLink()) return true
+    } catch {
+      // A path we cannot inspect without following it is not safe to touch.
+      return true
+    }
+  }
+  return false
 }
 
 function windowsRegistryAppPaths(): string[] {
@@ -159,59 +245,35 @@ function windowsRegistryAppPaths(): string[] {
   return registryAppPaths
 }
 
-/**
- * The Windows directory, whichever of the two variables holds it.
- *
- * Both are read here rather than only in `scanInterpreter`, because the module
- * path and the interpreter have to come from the same place: pinning the
- * absolute path from `windir` while the 5.1 module directory was skipped for a
- * missing `SystemRoot` left `Get-AuthenticodeSignature` unable to load for every
- * candidate, which is the failure this pair exists to avoid.
- */
+/** Resolve the OS directory without trusting inherited Windows environment variables. */
 function systemRootOf(env: NodeJS.ProcessEnv): string | undefined {
+  if (process.platform === 'win32') {
+    try {
+      return realpathSync.native('\\\\?\\GLOBALROOT\\SystemRoot')
+    } catch {
+      return undefined
+    }
+  }
   const value = env['SystemRoot']?.trim() || env['windir']?.trim()
   return value === undefined || value === '' ? undefined : value
 }
 
-/**
- * The environment the signature scan runs in.
- *
- * `powershell` is Windows PowerShell 5.1, and it resolves
- * `Microsoft.PowerShell.Security` by walking `PSModulePath` in order. Any machine
- * with a Store-installed PowerShell 7 carries that build's Modules directory
- * ahead of the system one, because the Store install prepends it to the variable
- * the desktop host inherited. 5.1 then binds the 7 build's copy of the module
- * first and the import dies on a type-data conflict, so
- * `Get-AuthenticodeSignature` throws for every candidate. The scan's own catch
- * swallows that, the policy function is handed an empty status, and the at-rest
- * key reads as "no WorkBuddy executable found" on a machine holding two signed
- * installs. Putting the 5.1 directory first makes the right copy win.
- *
- * The directory is derived from `SystemRoot` rather than written out, and the
- * rest of the ambient path is left alone so a user's own modules still resolve.
- * Applying it twice is a no-op, so the answer stays one directory long however
- * often it is built.
- */
+/** Do not pass user-controlled CLR, module, or executable search paths to PowerShell. */
 export function signatureScanEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const systemRoot = systemRootOf(env)
-  const ambient = env['PSModulePath']
-  const modules = systemRoot === undefined
-    ? undefined
-    : join(systemRoot, 'system32', 'WindowsPowerShell', 'v1.0', 'Modules')
-  if (modules === undefined) return { ...env }
-  if (ambient === modules || ambient?.startsWith(`${modules};`) === true) return { ...env }
-  return { ...env, PSModulePath: ambient === undefined || ambient === '' ? modules : `${modules};${ambient}` }
+  if (systemRoot === undefined) return {}
+  return {
+    SystemRoot: systemRoot,
+    windir: systemRoot,
+    PATH: join(systemRoot, 'System32'),
+    PSModulePath: join(systemRoot, 'system32', 'WindowsPowerShell', 'v1.0', 'Modules'),
+  }
 }
 
 /**
  * The interpreter to run the scan with, by absolute path.
  *
- * Resolved from `SystemRoot` rather than through `PATH`, for the same reason the
- * scan exists at all: a user-level directory is on the default `PATH`
- * (`%LOCALAPPDATA%\Microsoft\WindowsApps`), so a bare `powershell` would let
- * whatever sits there be spawned inside a process holding every WorkBuddy token.
- * Neither variable set answers `undefined`, and the caller treats that as "no
- * scan" rather than guessing a path.
+ * The OS directory comes from the Windows object manager, not an inherited path.
  */
 export function scanInterpreter(env: NodeJS.ProcessEnv): string | undefined {
   const systemRoot = systemRootOf(env)
@@ -224,10 +286,8 @@ export function scanInterpreter(env: NodeJS.ProcessEnv): string | undefined {
  *
  * The scan reads `DisplayName`, `DisplayIcon` and `InstallLocation` out of the
  * user's own uninstall keys, which means any process running as the user can add
- * one. It only enumerates here: a path is filtered to a local drive, stat'ed,
- * and signature-checked in Node before anything is spawned. Doing the stat or
- * signature read in PowerShell would touch a planted UNC path first and leak an
- * NTLM response to the host it names.
+ * one. It only enumerates here: directly specified UNC and device paths are
+ * filtered before candidates are stat'ed and signature-checked in Node.
  *
  * PowerShell does the part only it can do: enumerate the keys and clean the
  * resource index and quotes off `DisplayIcon`. The decision is
@@ -238,6 +298,7 @@ export function scanInterpreter(env: NodeJS.ProcessEnv): string | undefined {
 function readRegistryAppPaths(): string[] {
   const script = [
     "$ErrorActionPreference='SilentlyContinue'",
+    "$env:PSModulePath=[IO.Path]::Combine($env:SystemRoot,'System32\\WindowsPowerShell\\v1.0\\Modules')",
     'try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}',
     'function Clean([string]$v) {',
     '  $v = $v.Trim()',
@@ -268,7 +329,7 @@ function readRegistryAppPaths(): string[] {
   try {
     stdout = execFileSync(interpreter, [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-    ], { encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 8_388_608, env: signatureScanEnv() })
+    ], { encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 8_388_608, env: signatureScanEnv(), cwd: dirname(dirname(dirname(interpreter))) })
   } catch {
     return []
   }
@@ -289,31 +350,12 @@ function readRegistryAppPaths(): string[] {
   return out
 }
 
-/**
- * Whether a scanned file's signature makes it safe to run.
- *
- * Exported so the policy can be tested without a registry to plant a key in: the
- * PowerShell half is not unit-testable, and this half is where the decision
- * actually lives.
- *
- * `Valid` means the chain resolved to a trusted root. A user process cannot
- * forge the vendor's signature, but it can trust a certificate of its own in the
- * current user's root store without elevation, so this check raises the bar
- * rather than proving the file is the vendor's. It still rejects an unsigned
- * planted executable, and every cached registry path is checked again before it
- * is run.
- *
- * The publisher is deliberately not pinned. The plugin is a third-party build and
- * the vendor can change its signing certificate; a pinned name would turn that
- * into a silent loss of the at-rest key on every machine at once, which is a
- * worse failure than the one being prevented.
- *
- * An unknown status is refused, not assumed: `HashMismatch`, `NotSigned` and a
- * signature PowerShell could not read at all all mean the file is not the
- * vendor's, and the caller answers "no key" rather than running something.
- */
-export function signatureAccepts(status: string | undefined, signer: string | undefined): boolean {
-  return status === 'Valid' && signer !== undefined && signer.trim() !== ''
+/** Trust the vendor's signing keys, not a subject name or a user-trusted root. */
+export function signatureAccepts(status: string | undefined, publicKeyHash: string | undefined, elevated: boolean | undefined): boolean {
+  return status === 'Valid' && elevated === false && [
+    '2F95C8391B09328BC42D131C50CC7B4E06F9E2A7B1E3624E14C9070A1BE9CC97',
+    '307ECCDC80B73FF1662464E2591BF027124F11175039423BA2FEC1CDE64DB212',
+  ].includes(publicKeyHash?.toUpperCase() ?? '')
 }
 
 /** Why the last signature scan could not produce an answer, if it could not. */
@@ -322,12 +364,8 @@ let signatureScanFailure = ''
 /**
  * The candidates whose Authenticode signature is valid.
  *
- * The standard install roots and the environment override were trusted by path
- * alone, while only the registry fallback checked a signature. A process running
- * as the user can write `%LOCALAPPDATA%\\Programs\\WorkBuddy\\WorkBuddy.exe`; when
- * the host runs elevated, spawning that file would hand it the plugin's whole
- * environment and every WorkBuddy token. Every path is checked here, and the
- * registry result is passed through the same check before it is spawned.
+ * A signed file can still be replaced between inspection and execution. Refuse
+ * to run any candidate from an elevated process, including user-writable paths.
  */
 async function signedExecutables(candidates: string[]): Promise<string[]> {
   if (process.platform !== 'win32' || candidates.length === 0) return candidates
@@ -339,27 +377,39 @@ async function signedExecutables(candidates: string[]): Promise<string[]> {
   }
   const payload = Buffer.from(JSON.stringify(candidates), 'utf8').toString('base64')
   const script = [
-    "$ErrorActionPreference='SilentlyContinue'",
+    "$ErrorActionPreference='Stop'",
+    "$env:PSModulePath=[IO.Path]::Combine($env:SystemRoot,'System32\\WindowsPowerShell\\v1.0\\Modules')",
     'try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}',
+    'try {',
+    '  $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())',
+    '  $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
+    '} catch { ConvertTo-Json -InputObject @{ elevated = $null; entries = @() } -Compress; exit }',
+    'if ($elevated) { ConvertTo-Json -InputObject @{ elevated = $true; entries = @() } -Compress; exit }',
+    "$ErrorActionPreference='SilentlyContinue'",
     `$paths = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json`,
     '$out = foreach ($p in @($paths)) {',
     '  if ([string]::IsNullOrWhiteSpace([string]$p)) { continue }',
     '  $s = $null',
     '  try { $s = Get-AuthenticodeSignature -LiteralPath ([string]$p) } catch { $s = $null }',
+    '  $keyHash = ""',
+    '  if ($s -ne $null -and $s.SignerCertificate -ne $null) {',
+    '    $sha = [System.Security.Cryptography.SHA256]::Create()',
+    '    try { $keyHash = [BitConverter]::ToString($sha.ComputeHash($s.SignerCertificate.GetPublicKey())).Replace("-", "") } finally { $sha.Dispose() }',
+    '  }',
     '  [pscustomobject]@{',
     '    path = [string]$p',
     '    status = if ($s -ne $null) { [string]$s.Status } else { "" }',
-    '    signer = if ($s -ne $null -and $s.SignerCertificate -ne $null) { [string]$s.SignerCertificate.Subject } else { "" }',
+    '    publicKeyHash = $keyHash',
     '  }',
     '}',
-    'ConvertTo-Json -InputObject @($out) -Compress',
+    'ConvertTo-Json -InputObject @{ elevated = $false; entries = @($out) } -Compress -Depth 3',
   ].join('\n')
   let stdout: string
   try {
     stdout = await new Promise<string>((resolve, reject) => {
       execFile(interpreter, [
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-      ], { encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 8_388_608, env: signatureScanEnv() }, (error, output) => {
+      ], { encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 8_388_608, env: signatureScanEnv(), cwd: dirname(dirname(dirname(interpreter))) }, (error, output) => {
         if (error !== null) reject(error)
         else resolve(output)
       })
@@ -375,29 +425,41 @@ async function signedExecutables(candidates: string[]): Promise<string[]> {
     signatureScanFailure = 'the signature check returned no readable answer'
     return []
   }
-  const entries = Array.isArray(parsed) ? parsed : [parsed]
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    signatureScanFailure = 'the signature check returned no readable answer'
+    return []
+  }
+  const result = parsed as Record<string, unknown>
+  if (result['elevated'] !== false) {
+    signatureScanFailure = result['elevated'] === true
+      ? 'WorkBuddy key retrieval is unavailable when the host runs elevated; restart it as a regular user'
+      : 'the host elevation could not be determined; WorkBuddy key retrieval was skipped'
+    return []
+  }
+  const entries = Array.isArray(result['entries']) ? result['entries'] : []
   const accepted: string[] = []
   for (const entry of entries) {
     if (entry === null || typeof entry !== 'object') continue
     const record = entry as Record<string, unknown>
     const file = record['path']
     const status = record['status']
-    const signer = record['signer']
+    const publicKeyHash = record['publicKeyHash']
     if (typeof file !== 'string' || file === '') continue
     if (!signatureAccepts(typeof status === 'string' ? status : undefined,
-      typeof signer === 'string' ? signer : undefined)) continue
+      typeof publicKeyHash === 'string' ? publicKeyHash : undefined, false)) continue
     accepted.push(file)
   }
   return accepted
 }
 
 function statExecutables(candidates: string[]): string[] {
+  const localCandidates = process.platform === 'win32' ? fixedWindowsPaths(candidates) : candidates
   const files: string[] = []
-  for (const candidate of candidates) {
+  for (const candidate of localCandidates) {
     if (candidate === '') continue
-    // A UNC path would make `statSync` open an SMB connection, which is the
-    // same leak the registry scan avoids. Only local drive paths are touched.
-    if (process.platform === 'win32' && !localWindowsPath(candidate)) continue
+    // A reparse point can turn an apparently local path into an SMB request.
+    if (process.platform === 'win32'
+      && windowsPathHasReparsePoint(candidate)) continue
     try {
       // A file, not merely something that exists: the registry scan emits
       // InstallLocation, which is a directory, and spawning one spent a doomed
@@ -410,6 +472,18 @@ function statExecutables(candidates: string[]): string[] {
 }
 
 async function executableCandidates(env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
+  signatureScanFailure = ''
+  if (process.platform !== 'win32') {
+    try {
+      if (typeof process.geteuid !== 'function' || process.geteuid() === 0) {
+        signatureScanFailure = 'WorkBuddy key retrieval requires a non-root host'
+        return []
+      }
+    } catch {
+      signatureScanFailure = 'the host privileges could not be determined; WorkBuddy key retrieval was skipped'
+      return []
+    }
+  }
   const override = env[WORKBUDDY_APP_EXECUTABLE_ENV]?.trim()
   const known = override === undefined ? [] : [override]
   if (process.platform === 'win32') {
@@ -445,9 +519,29 @@ async function executableCandidates(env: NodeJS.ProcessEnv = process.env): Promi
 }
 
 function fetchAtRestKeyPayload(executable: string): Promise<string> {
+  const root = process.platform === 'win32' ? systemRootOf(process.env) : '/'
+  if (root === undefined) return Promise.reject(new Error('workbuddy: the system directory is unavailable'))
+  const allowed = process.platform === 'win32'
+    ? ['SystemRoot', 'windir', 'SystemDrive', 'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA']
+    : ['HOME', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE']
+  const names = new Set(allowed.map(name => name.toUpperCase()))
+  const trustedWindowsNames = new Set(['SYSTEMROOT', 'WINDIR', 'SYSTEMDRIVE', 'PATH', 'PSMODULEPATH'])
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => {
+    const normalized = name.toUpperCase()
+    return names.has(normalized) && (process.platform !== 'win32' || !trustedWindowsNames.has(normalized))
+  }))
+  if (process.platform === 'win32') {
+    env['SystemRoot'] = root
+    env['windir'] = root
+    if (/^[A-Za-z]:\\/.test(root)) env['SystemDrive'] = root.slice(0, 2)
+    env['PATH'] = join(root, 'System32')
+    env['PSModulePath'] = join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules')
+  }
+  env['ELECTRON_RUN_AS_NODE'] = '1'
   return new Promise((resolve, reject) => {
     execFile(executable, ['-e', "try{process.stdout.write(process._linkedBinding('electron_browser_workbuddy_storage').loggerGet())}catch(e){process.exitCode=3;process.stderr.write(String(e&&e.message||e))}"], {
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      env,
+      cwd: process.platform === 'win32' ? join(root, 'System32') : root,
       timeout: KEY_FETCH_TIMEOUT_MS,
       windowsHide: true,
       maxBuffer: 1_048_576,
@@ -509,10 +603,8 @@ function ensureAtRestKeys(): Promise<void> {
       // credential found" for a sign-in whose sealed fields simply could not be
       // opened. A scan that never ran is reported as its own condition rather
       // than as a verdict that the installed file is unsigned.
-      lastKeyFailure = process.platform === 'win32'
-        ? signatureScanFailure !== ''
-          ? signatureScanFailure
-          : 'no WorkBuddy executable with a valid signature was found'
+      lastKeyFailure = signatureScanFailure !== '' ? signatureScanFailure : process.platform === 'win32'
+        ? 'no WorkBuddy executable with a trusted signing key was found'
         : 'no WorkBuddy executable found in the standard install roots'
       return
     }

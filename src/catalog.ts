@@ -51,7 +51,6 @@ export const FALLBACK_WORKBUDDY_MODELS: readonly WorkBuddyModelInfo[] = [
   { id: 'kimi-k3', name: 'Kimi-K3', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
   { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
   { id: 'hy3', name: 'Hy3', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
-  { id: 'hy4-preview', name: 'Hy4-Preview', contextWindow: 1_000_000, maxOutputTokens: 128_000, supportsImages: true },
 ]
 
 /**

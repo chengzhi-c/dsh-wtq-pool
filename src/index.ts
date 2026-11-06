@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url'
 
 import * as piAi from '@earendil-works/pi-ai'
 import { createProvider } from '@earendil-works/pi-ai'
-import type { Api, AuthContext, CredentialStore, Model, Provider, ProviderStreams, TextContent, TranscriptContext } from '@earendil-works/pi-ai'
+import type { Api, AuthContext, CredentialStore, Model, Provider, ProviderStreams, Tool, TranscriptContext } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { resolveImageAttachmentAccess, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
@@ -54,6 +54,8 @@ const STREAM_IDLE_TIMEOUT_MS = 300_000
 /** Image-request budgets at the dsh-llm-pi-ai defaults. */
 const REQUEST_IMAGE_BUDGETS = {
   maxRequestImageBytes: 20_971_520,
+  maxRequestImages: 50,
+  imageOffloadCountQuantum: 10,
   requestImagePixelBudget: 4_194_304,
   requestImageMaxBytes: 1_048_576,
 } as const
@@ -349,75 +351,52 @@ function toPiModel(
 /** The attachment store the harness hands the adapter; derived, not re-declared. */
 type AttachmentStore = Parameters<typeof resolveImageAttachmentAccess>[0]
 
-/**
- * Whether the resolved pi-ai carries the prompt inside the transcript.
- *
- * The host folds `Context.systemPrompt` and `Context.tools` into a leading
- * `role:"system"` message before a provider sees a request, and only a
- * generation that exports `normalizeContext` reads that message back. Which
- * generation this plugin gets is not its own call: the harness resolves
- * `@earendil-works/pi-ai` through the profile's hoisted linker, so a profile
- * that hoists an older generation hands this provider a transcript its own copy
- * of pi-ai never learned to read.
- */
+/** Whether this delegate reads the prompt and tools from a transcript. */
 const PI_AI_FOLDS_TRANSCRIPT = typeof piAi.normalizeContext === 'function'
 
-/** The complete prompt of a leading system message: its text, then its sections. */
-function promptText(message: { content?: unknown; sections?: Record<string, unknown> }): string {
-  const parts = [piAi.contentText(message.content as string | readonly TextContent[])]
-  for (const value of Object.values(message.sections ?? {})) {
-    if (typeof value === 'string') parts.push(value)
+/** Match the adapter's request shape to the pi-ai generation used by the delegate. */
+function contextForDelegate(context: unknown): unknown {
+  if (PI_AI_FOLDS_TRANSCRIPT) {
+    const legacy = context as Parameters<typeof piAi.normalizeContext>[0]
+    return legacy.systemPrompt === undefined && legacy.tools === undefined
+      ? context
+      : piAi.normalizeContext(legacy)
   }
-  return parts.filter((part) => part.length > 0).join('\n\n')
-}
-
-/**
- * Re-shape one request context into the form the delegate's own generation reads.
- *
- * A generation without `normalizeContext` has no `role:"system"` handling in
- * either its request converter or its context estimator, so the transcript the
- * host folds either throws there (with string content) or drops the prompt and
- * every tool without a word (with block content). Unfolding restores the
- * `{systemPrompt, tools, messages}` form that generation was written against,
- * which is exactly what the fold undoes. On a generation that does fold, the
- * host's transcript is already the expected shape and passes through untouched.
- */
-function contextForDelegate(context: unknown, log?: { warn(...args: unknown[]): void }): unknown {
-  // A generation that folds reads its own transcript: the host's request is
-  // already the shape it expects, and re-shaping it would drop the prompt.
-  if (PI_AI_FOLDS_TRANSCRIPT) return context
-  const messages = (context as { messages?: unknown }).messages
-  if (!Array.isArray(messages)) return context
-  const leading = messages[0] as
-    | { role?: unknown; content?: unknown; sections?: Record<string, unknown>; toolsAdded?: unknown }
-    | undefined
-  if (leading?.role !== 'system') return context
-  const prompt = promptText(leading)
-  // `toolsAdded` is the fold's own field, so a transcript without it carried no
-  // tools at all: an empty array says that, while `undefined` would leave the
-  // delegate guessing whether it was handed any.
-  const tools = Array.isArray(leading.toolsAdded) ? leading.toolsAdded : []
-  if (prompt.length === 0) {
-    // The folded message carried no text, so unfolding it removes the system
-    // prompt outright: the request then runs with none, which is worth a word
-    // rather than a silent difference from the host's own folded form.
-    log?.warn('dsh-wtq-pool: the folded system message carried no prompt text, so this request is sent without one')
+  const legacy = context as { systemPrompt?: string; tools?: Tool[]; messages?: TranscriptContext['messages'] }
+  const messages = legacy.messages
+  if (!Array.isArray(messages) || !messages.some((message) => message.role === 'system')) return context
+  const text = legacy.systemPrompt ? [legacy.systemPrompt] : []
+  const sections = new Map<string, string>()
+  const tools = new Map((legacy.tools ?? []).map((tool) => [tool.name, tool]))
+  // Older delegates lack transcript updates; match the newer OpenAI delegate's collapsed state.
+  for (const message of messages) {
+    if (message.role !== 'system') continue
+    const part = piAi.contentText(message.content)
+    if (part.length > 0) text.push(part)
+    for (const [name, value] of Object.entries(message.sections ?? {})) {
+      if (value === null) sections.delete(name)
+      else sections.set(name, value)
+    }
+    for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name)
+    for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool)
   }
+  const prompt = [...text, ...Object.values(Object.fromEntries(sections))].filter(Boolean).join('\n\n')
   return {
-    ...(prompt.length > 0 ? { systemPrompt: prompt } : {}),
-    tools,
-    messages: messages.slice(1),
+    ...legacy,
+    systemPrompt: prompt || undefined,
+    tools: [...tools.values()],
+    messages: messages.filter((message) => message.role !== 'system'),
   }
 }
 
 /** Wrap one API implementation so every request arrives in the shape it reads. */
-function withDelegateShape(api: ProviderStreams, log?: { warn(...args: unknown[]): void }): ProviderStreams {
+function withDelegateShape(api: ProviderStreams): ProviderStreams {
   return {
     ...api,
     stream: (model, context, options) =>
-      api.stream(model, contextForDelegate(context, log) as TranscriptContext, options),
+      api.stream(model, contextForDelegate(context) as TranscriptContext, options),
     streamSimple: (model, context, options) =>
-      api.streamSimple(model, contextForDelegate(context, log) as TranscriptContext, options),
+      api.streamSimple(model, contextForDelegate(context) as TranscriptContext, options),
   }
 }
 
@@ -433,21 +412,6 @@ function buildAdapter(descriptors: ProviderDescriptor[], ctx: ClientContext): {
   profiles: Map<string, ResolvedPiAiProviderProfile>
   providerIds: string[]
 } {
-  // The generation this plugin is written against, asserted rather than assumed.
-  // `normalizeContext` (see {@link PI_AI_FOLDS_TRANSCRIPT}) is the first export
-  // that says which one the host resolved; the adapter is the second, and the
-  // same hoisted linker picks both. A `dsh-llm-pi-ai` built against another
-  // pi-ai hands these profiles a transcript that copy never learned to read, and
-  // the reshaping below would then drop the prompt and every tool without a
-  // word - so the mismatch is named here, on the pass that would serve it,
-  // instead of being absorbed request by request.
-  const adapterPrototype = PiAiAdapter.prototype
-  if (typeof PiAiAdapter !== 'function'
-    || typeof adapterPrototype.resolveModel !== 'function'
-    || typeof adapterPrototype.prepareCall !== 'function'
-    || typeof adapterPrototype.stream !== 'function') {
-    ctx.logger.error('dsh-wtq-pool: the resolved @deepseek-ai/dsh-llm-pi-ai is not the generation this plugin is written against (its adapter is missing members this plugin binds), so every request would be reshaped for a transcript that copy never learned to read')
-  }
   const profiles = new Map<string, ResolvedPiAiProviderProfile>()
   const providerIds: string[] = []
   for (const row of descriptors) {
@@ -468,7 +432,7 @@ function buildAdapter(descriptors: ProviderDescriptor[], ctx: ClientContext): {
         },
       },
       models,
-      api: withDelegateShape(openAICompletionsApi(), ctx.logger),
+      api: withDelegateShape(openAICompletionsApi()),
     })
     const provider: Provider = { ...base, getModels: () => models }
     profiles.set(row.id, {

@@ -18,32 +18,12 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
-const ts = require('typescript')
-const { createRequire, registerHooks } = require('node:module')
-const { fileURLToPath } = require('node:url')
+const { createRequire } = require('node:module')
 const { WebServer } = require('@deepseek-ai/dsh-host-webserver')
 
-const root = path.resolve(__dirname, '..')
+const { root, transpile } = require('./ts-loader.cjs')
+const { withoutComments } = require('../docs/capture-shape.cjs')
 const sourceOf = file => fs.readFileSync(path.join(root, file), 'utf8')
-const transpile = source => ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },
-}).outputText
-
-// The host half imports its siblings without an extension, so the loader needs
-// the same `.ts` resolution the DSH entry builds against.
-registerHooks({
-  resolve(specifier, context, next) {
-    const ownSource = context.parentURL?.startsWith('file:')
-      && fileURLToPath(context.parentURL).startsWith(path.join(root, 'src') + path.sep)
-    return next(ownSource && specifier.startsWith('.') && path.extname(specifier) === '' ? specifier + '.ts' : specifier, context)
-  },
-  load(url, context, next) {
-    if (url.startsWith('file:') && url.endsWith('.ts')) return {
-      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')),
-    }
-    return next(url, context)
-  },
-})
 
 /** Every channel the panel page and the composer component actually call. */
 function uiChannels() {
@@ -278,6 +258,29 @@ test('a panel route that fails to mount releases the routes that already registe
   })
   assert.ok(retry.exact.size > 0, 'a retry must be able to mount the panel')
   mounted()
+})
+
+test('panel assets cannot escape the package through a junction', (t) => {
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-panel-assets-'))
+  const pluginRoot = path.join(temporary, 'package')
+  const renderer = path.join(pluginRoot, 'renderer')
+  const outside = path.join(temporary, 'outside')
+  fs.mkdirSync(pluginRoot)
+  fs.mkdirSync(outside)
+  fs.writeFileSync(path.join(outside, 'panel.js'), 'outside')
+  try {
+    fs.symlinkSync(outside, renderer, process.platform === 'win32' ? 'junction' : 'dir')
+  } catch (error) {
+    fs.rmSync(temporary, { recursive: true, force: true })
+    t.skip(`directory links are unavailable: ${error.message}`)
+    return
+  }
+  try {
+    const { panelAsset } = require('../src/web-panel.ts')
+    assert.equal(panelAsset(pluginRoot, 'panel.js'), undefined)
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
 })
 
 function loadSource(file, overrides = {}) {
@@ -598,12 +601,14 @@ test('a panel.css that 404s twice before it loads is waited out, not reported mi
     const context = vm.createContext({
       React: { useEffect: run => run() },
       view, generation: 0,
+      t: key => key,
       setMissing: value => missing.push(value),
       setProbeFailure: value => failures.push(value),
       PANEL_BASE: '/panel-base',
       fetch: async () => {
         const answer = answers[Math.min(asked, answers.length - 1)] ?? new Response('', { status: 404 })
         asked += 1
+        if (answer instanceof Error) throw answer
         return answer
       },
       setTimeout: (callback, ms) => { waits.push(ms); callback(); return 1 },
@@ -631,6 +636,15 @@ test('a panel.css that 404s twice before it loads is waited out, not reported mi
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(concluded.missing, [false, true],
     'three 404s in a row are the missing-assets verdict, and it must still be reachable')
+
+  const recovered = drive([new Error('network'), served], 'full')
+  const offline = drive([new Error('network')], 'full')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual([recovered.asked(), offline.asked()], [2, 3], 'rejected requests must be retried')
+  assert.deepEqual(recovered.waits, [500])
+  assert.deepEqual(recovered.missing, [false, false])
+  assert.deepEqual(offline.missing, [false, true])
+  assert.equal(offline.failures.at(-1), 'card.networkError')
 
   // A refusal that is not 404 carries the reason: reinstalling cannot fix a
   // browser address or origin the host's loopback guard turned away.
@@ -1100,11 +1114,19 @@ test('the README screenshots show the panel the repository ships', () => {
   assert.ok(fs.existsSync(stampAt), 'docs/preview-capture.json has to exist: the capture writes it')
   const stamp = JSON.parse(fs.readFileSync(stampAt, 'utf8'))
   const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')
+  // Comments and blank lines never reach a pixel, so the capture records each
+  // file with them gone: an edit to either never made a picture stale, and
+  // comparing whole files forced a re-stamp on every one of them. The
+  // screenshots keep their own whole-file hashes below, because those bytes are
+  // the picture.
+  const shape = (file) => crypto.createHash('sha256')
+    .update(withoutComments(fs.readFileSync(path.join(root, file), 'utf8'), file))
+    .digest('hex')
 
   assert.deepEqual(Object.keys(stamp.rendered).sort(), [...rendered].sort(),
     'the capture has to name every source that decides what the screenshots show')
   for (const file of rendered) {
-    assert.equal(stamp.rendered[file], digest(file),
+    assert.equal(stamp.rendered[file], shape(file),
       `${file} changed since the screenshots were taken: re-capture, then run node docs/stamp.cjs`)
   }
   assert.deepEqual(Object.keys(stamp.shots).sort(), [...shots].sort(),

@@ -19,6 +19,7 @@
 import { randomUUID } from 'node:crypto'
 import type { QoderRegion } from './qoder-discovery'
 import { buildCosyAuthHeaders, encodeBody, QODER_GATEWAYS } from './qoder-upstream'
+import { isAcknowledgementCode } from './qoder-sse'
 import { headersDeadline, readErrorBody, withIdleWatchdog } from './upstream'
 
 /** One callable Qoder model, as the `chat` group lists it. */
@@ -60,6 +61,10 @@ export type QoderUpstreamErrorKind =
   | 'server'
   | 'client'
   | 'aborted'
+  // A 200 that ended before a single frame: the sign-in answered nothing, which
+  // says nothing about the accounts behind it. Separate from `server` because
+  // the status is the same 502 and only this one is worth rotating past.
+  | 'empty_stream'
 
 export type QoderChatResult =
   | { ok: true; response: Response }
@@ -202,6 +207,15 @@ function qoderRawEpochMs(value: unknown): number | undefined {
     return value < QODER_EPOCH_SECONDS_BOUNDARY_MS ? Math.floor(value * 1000) : Math.floor(value)
   }
   if (typeof value === 'string') {
+    // A numeric spelling is an epoch, not a date string: `Date.parse` answers
+    // NaN for both "1793902169" and "1793902169000", so a plan whose expiry
+    // arrived as a string read as undated and the card called it "never
+    // expires". The credential parser already reads it this way; the two
+    // spellings of one field must not disagree.
+    const numeric = Number(value)
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return numeric < QODER_EPOCH_SECONDS_BOUNDARY_MS ? Math.floor(numeric * 1000) : Math.floor(numeric)
+    }
     const parsed = Date.parse(value)
     return Number.isFinite(parsed) ? parsed : undefined
   }
@@ -227,9 +241,9 @@ export interface QoderCheckinState {
   endsAt?: number
   /**
    * When the next claimable round opens, in ms, when this account has a round
-   * that is not open yet. Qoder's daily window runs 10:00 → 09:59 Beijing, so
-   * before 10:00 the card can say when the next one starts instead of "no
-   * check-in"; the automatic pass uses the same value to come back at 10:00.
+   * that is not open yet. The hour comes from the campaign list's own start, so
+   * before then the card can say when the next round starts instead of "no
+   * check-in"; the automatic pass uses the same value to come back for.
    */
   opensAt?: number
 }
@@ -401,9 +415,9 @@ export function qoderCheckinStateFrom(payload: unknown, nowMs: number = Date.now
  * When the next round opens, for an account whose current round is not
  * claimable right now (already collected, or its window has not started).
  *
- * Qoder re-issues the daily round at 10:00 Beijing and the window then runs to
- * 09:59 the next day, so before 10:00 this is the honest answer to "when can I
- * claim" — and the moment the automatic pass comes back for.
+ * Read off the campaigns the upstream listed, not from a fixed hour: this is
+ * the answer to "when can I claim" - and the moment the automatic pass comes
+ * back for.
  */
 function qoderNextOpenAt(payload: unknown, nowMs: number): number | undefined {
   const holder = payload as { campaigns?: unknown } | null | undefined
@@ -429,7 +443,7 @@ function qoderNextOpenAt(payload: unknown, nowMs: number): number | undefined {
 function qoderClaimCampaignPath(campaignId: string): string {
   return `${QODER_CAMPAIGNS_PATH}/${encodeURIComponent(campaignId)}/claim`
 }
-/** What one claim answered, after `normalizeClaimResult`. */
+/** What one claim answered, after {@link qoderNormalizeClaimResult}. */
 export interface QoderClaimResult {
   claimed: boolean
   replayed: boolean
@@ -467,9 +481,12 @@ export function qoderNormalizeClaimResult(payload: unknown, campaign?: unknown):
   const amountValue = Number(body?.reward?.amount ?? body?.benefit?.amount ?? (typeof campaign !== 'undefined' ? qoderBenefitOf(campaign)?.amount : undefined))
   const expiresAt = qoderEpochMs(body?.expiresAt)
   // A 200 with a business error code is a refusal, not a "nothing to claim":
-  // it has to reach the caller as a failure, with the upstream's own words.
+  // it has to reach the caller as a failure, with the upstream's own words. A
+  // success-range code is the opposite - `{"code":200,"message":"ok"}` is how
+  // the same upstream acks a claim, and reading it as a refusal reported a
+  // granted claim as "the upstream refused it".
   const code = Number(body?.code ?? body?.errcode)
-  const refusal = Number.isFinite(code) && code !== 0
+  const refusal = Number.isFinite(code) && !isAcknowledgementCode(code)
     ? String(body?.message ?? body?.msg ?? ('upstream code ' + code)).slice(0, 200)
     : ''
   return {
@@ -1005,8 +1022,6 @@ export class QoderUpstreamClient {
       throw new Error(`Qoder check-in: response is not valid JSON (${contentType}) — ${text.slice(0, 300)}`)
     }
   }
-
-
 
   /**
    * Open one chat stream for a model. The caller owns the SSE translation;

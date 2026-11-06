@@ -121,11 +121,18 @@ test('the row is disabled while any action is in flight', () => {
   // `setAccountState` answers a press made while another control is busy with
   // nothing at all - not even the busy banner - so a row that stayed enabled was a
   // press that did nothing and said nothing, on the delete button of all places.
+  //
+  // Asserting that `rowBusy` is assigned proves nothing: the value has to reach
+  // the three controls, or the row looks live while every press is swallowed.
   const text = source()
   const at = text.indexOf('function accountCard(')
   assert.notEqual(at, -1)
   const body = text.slice(at, at + 6000)
   assert.match(body, /var rowBusy = busy !== null;/, 'the whole panel being busy disables the row')
+  for (const control of ['toggle', 'removeBtn', 'deleteBtn']) {
+    assert.match(body, new RegExp(`^\\s*${control}\\.disabled = rowBusy;`, 'm'),
+      `${control} must be disabled with the row, not left live while its press is ignored`)
+  }
 })
 
 test('both locales carry the armed label', () => {

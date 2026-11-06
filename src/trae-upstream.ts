@@ -101,6 +101,10 @@ export type TraeUpstreamErrorKind =
   | 'client'
   | 'unconfigured'
   | 'aborted'
+  // A 200 that ended before a single frame: the sign-in answered nothing, which
+  // says nothing about the accounts behind it. Separate from `server` because
+  // the status is the same 502 and only this one is worth rotating past.
+  | 'empty_stream'
 
 export type TraeChatResult =
   | { ok: true; response: Response }
@@ -323,7 +327,10 @@ function buildTraeHeaders(
     'request-traffic-type': 'prod',
     'Content-Type': 'application/json',
     'X-Cloudide-Token': credential.accessToken,
-    'x-uid': credential.userId,
+    // Omitted rather than sent empty: the desktop store does not always carry a
+    // `userId` (an install that only recorded a username leaves it blank), and
+    // an empty header claims an identity the request does not have.
+    ...credential.userId === '' ? {} : { 'x-uid': credential.userId },
     'x-request-id': requestId,
     'x-trae-request-id': requestId,
     'Accept': 'text/event-stream',

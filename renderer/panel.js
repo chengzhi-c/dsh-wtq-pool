@@ -246,7 +246,7 @@ var EN = {
   "auto.rowGrowth": "Streak: {streak} tier(s) · +{credit} credits · {failed} failed",
   "auto.rowKeepAlive": "Token keep-alive {when}: {refreshed} refreshed · {fresh} already fresh · {failed} failed · {noToken} with no refresh token",
   "auto.rowTravelCounts": "{label}: {departed} sent · {claimed} claimed · {adopted} adopted",
-  "auto.hint": "Claims the daily reward of all three sources (WorkBuddy / Trae / Qoder), the streak bonus of domestic WorkBuddy accounts, and runs the travel patrol in one pass. A slot already collected today is skipped. A slot missed earlier today is collected at the next start.",
+  "auto.hint": "Claims daily rewards for WorkBuddy, Trae and Qoder, and WorkBuddy streak rewards. Streak claims can use make-up cards and lottery draws. Cat travel runs for domestic accounts only. A slot already collected today is skipped; a missed slot is collected at the next start that day.",
   "keepAlive.runNow": "Refresh now",
   "keepAlive.running": "Refreshing…",
   "keepAlive.label": "Token keep-alive",
@@ -564,7 +564,7 @@ var ZH = {
   "auto.rowGrowth": "连登：{streak} 档 · +{credit} 积分 · 失败 {failed}",
   "auto.rowKeepAlive": "令牌保活 {when}：刷新 {refreshed} 个 · 已是最新 {fresh} 个 · 失败 {failed} 个 · 无刷新令牌 {noToken} 个",
   "auto.rowTravelCounts": "{label}：派出 {departed} · 领奖 {claimed} · 领养 {adopted}",
-  "auto.hint": "时间到后一次性领取三家（WorkBuddy / Trae / Qoder）的签到奖励、WorkBuddy 国内账号的连登奖励，并顺带完成猫猫旅行；今天已领过的时段跳过。当天错过的时段在下次启动时补领。",
+  "auto.hint": "按时领取 WorkBuddy、Trae、Qoder 的签到奖励和 WorkBuddy 连登奖励。连登奖励可能使用补签卡和抽奖次数；猫猫旅行仅处理国内账号。当天已领取的时段会跳过，错过的时段会在当天后续运行时补领。",
   "keepAlive.runNow": "立即刷新",
   "keepAlive.running": "刷新中…",
   "keepAlive.label": "登录令牌保活",
@@ -1273,10 +1273,10 @@ function sourceGroupHead(source, titleKey, count, claimable, busyHere, offerChec
 /**
  * Whether an account has a check-in surface worth drawing.
  *
- * Qoder's international service lists promotion campaigns but no daily
- * CLAIM_BENEFIT round, so its accounts carry `active: false` and no opening
- * hour. Drawing a disabled button and "no check-in" line for those accounts
- * reads as a broken control; the card simply has no check-in.
+ * An account whose upstream answer carries no round and no opening hour has
+ * nothing to show: a disabled button and a "no check-in" line read as a broken
+ * control, so the card has no check-in at all. `campaignsUnavailable` keeps the
+ * surface for a failed read, which is a state to report rather than to hide.
  */
 function checkinOffered(checkin) {
   return checkin !== undefined && checkin !== null
@@ -1340,8 +1340,8 @@ function sourceAccountCard(account, kind) {
     // say so instead of offering a click the upstream will refuse (9095).
     var doneToday = checkin.todayCheckedIn === true;
     var deviceDone = doneToday !== true && checkin.deviceCheckedIn === true;
-    // Qoder issues its daily round at 10:00 Beijing, so before then the card
-    // names the hour instead of claiming there is no check-in at all.
+    // The opening hour comes from the campaign list's own start, so the card
+    // names it rather than claiming there is no check-in at all.
     var opensLabel = doneToday || deviceDone || typeof checkin.opensAtHour !== "number"
       ? ""
       : t("source.claimableAt", { time: clockHour(checkin.opensAtHour) });
@@ -1490,8 +1490,9 @@ function renderSourceStrip(source) {
   }).length;
   if (regions.indexOf(activeRegionOf(source)) < 0) setActiveRegion(source, regions[0]);
   var region = activeRegionOf(source);
-  // An international region has no daily round. Hiding the source-wide button
-  // there keeps it from reading as an action on the accounts below.
+  // The source-wide button follows the accounts of the region on screen: it
+  // appears where one of them has a check-in surface, and stays off a region
+  // whose accounts carry none, where it would read as an action on nothing.
   var offerCheckin = accounts.some(function (account) {
     return account.region === region && checkinOffered(account.checkin);
   });

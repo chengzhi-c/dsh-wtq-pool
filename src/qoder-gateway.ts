@@ -15,7 +15,7 @@ import { createLoopbackServer, guardsPass, isJsonContentType, liftUpstreamMessag
 import type { QoderRegion } from './qoder-discovery'
 import type { QoderChatModel, QoderClientCredential, QoderUpstreamErrorKind } from './qoder-client'
 import { QoderUpstreamClient } from './qoder-client'
-import { openQoderResponse, qoderRequestBody } from './qoder-shim'
+import { openQoderResponse, qoderRequestBody, QODER_FAILURE_KIND_HEADER } from './qoder-shim'
 import { LOG_PREFIX } from './log'
 
 export interface QoderGatewayLogger {
@@ -148,7 +148,15 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
     res.on('close', () => watcher.abort())
     const raw = (await readRequestBody(req)).toString('utf8')
     let model = ''
-    try { model = (JSON.parse(raw) as Record<string, unknown>)['model'] as string ?? '' } catch { model = '' }
+    let bodyIsJson = true
+    try { model = (JSON.parse(raw) as Record<string, unknown>)['model'] as string ?? '' } catch { bodyIsJson = false }
+    // A body that does not parse is not a missing field: the caller sent
+    // something no reader can open, and answering "model is required" hides
+    // that. Both gateways state the real problem.
+    if (!bodyIsJson) {
+      writeOpenAIError(res, 400, 'invalid_request_error', 'body is not valid JSON')
+      return
+    }
     if (typeof model !== 'string' || model.trim() === '') {
       writeOpenAIError(res, 400, 'invalid_request_error', 'model is required')
       return
@@ -255,7 +263,17 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
         // A failure that arrived before any output: answer it as a real status
         // instead of a stream the client would read as an empty turn.
         const detail = await relayed.text().catch(() => '')
-        return { ok: false, status: relayed.status, message: detail, retryAfter: relayed.headers.get('retry-after') }
+        // The class the peek recorded: an empty answer from this sign-in and an
+        // upstream that is down for everyone are both 502, and only the first
+        // belongs to the account.
+        const failedKind = relayed.headers.get(QODER_FAILURE_KIND_HEADER)
+        return {
+          ok: false,
+          status: relayed.status,
+          message: detail,
+          retryAfter: relayed.headers.get('retry-after'),
+          ...failedKind === null ? {} : { kind: failedKind as QoderUpstreamErrorKind },
+        }
       }
       return { ok: true, relayed }
     }
@@ -271,7 +289,7 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       // answer, and rotating would spend the next account on a dropped request.
       if (kind === 'aborted') return false
       if (status === 0) return true
-      return kind === 'authentication' || kind === 'soft_rate' || kind === 'hard_credit'
+      return kind === 'authentication' || kind === 'soft_rate' || kind === 'hard_credit' || kind === 'empty_stream'
         || status === 401 || status === 402 || status === 429
     }
 

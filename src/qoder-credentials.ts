@@ -10,6 +10,7 @@ import { readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { QoderRegion, QoderStorageCandidate } from './qoder-discovery'
 import { decryptQoderOscrypt, qoderStorageCandidates } from './qoder-discovery'
+import { trustedWindowsChildEnv, trustedWindowsPowerShell } from './trusted-process'
 
 /** One Qoder sign-in, token kept in memory only. */
 export interface QoderCredential {
@@ -53,6 +54,7 @@ const DPAPI_PREFIX = 'DPAPI'
  */
 const DPAPI_SCRIPT = `
 $ErrorActionPreference = 'Stop'
+$env:PSModulePath=[IO.Path]::Combine($env:SystemRoot,'System32\\WindowsPowerShell\\v1.0\\Modules')
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -85,23 +87,6 @@ export class QoderKeyError extends Error {
     super(message ?? `Qoder OSCrypt key ${reason}`)
     this.name = 'QoderKeyError'
   }
-}
-
-function powershellPath(env: NodeJS.ProcessEnv): string | undefined {
-  const systemRoot = env.SystemRoot ?? env.windir
-  if (systemRoot === undefined || systemRoot === '') return undefined
-  return join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-}
-
-/** Run the interpreter with a whitelisted environment; nothing user-set rides along. */
-function childEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const allowed = ['SystemRoot', 'SystemDrive', 'windir', 'TEMP', 'TMP'] as const
-  const result: NodeJS.ProcessEnv = {}
-  for (const name of allowed) {
-    const value = env[name]
-    if (typeof value === 'string' && value !== '') result[name] = value
-  }
-  return result
 }
 
 /**
@@ -151,13 +136,13 @@ export async function unwrapQoderOscryptKey(
     } catch { /* an unstatable file is treated as stale */ }
     const cached = oscryptKeyCache.get(localStatePath)
     if (cached !== undefined && cached.mtimeMs === mtimeMs) return Buffer.from(cached.key)
-    const exe = powershellPath(env)
+    const exe = trustedWindowsPowerShell(env)
     if (exe === undefined) throw new QoderKeyError('unavailable', 'SystemRoot is not set, cannot locate PowerShell')
     // `spawn` rather than `execFile`, because the blob has to go in on stdin and
     // only the key comes back on stdout.
     const stdout = await new Promise<string>((resolve, reject) => {
       const child = spawn(exe, ['-NoProfile', '-NonInteractive', '-Command', DPAPI_SCRIPT], {
-        env: childEnv(env),
+        env: trustedWindowsChildEnv(env, { inheritTemp: true, includeSystemDrive: true }),
         windowsHide: true,
         stdio: ['pipe', 'pipe', 'pipe'],
       })

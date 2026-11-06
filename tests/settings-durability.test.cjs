@@ -14,30 +14,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
-const { createRequire, registerHooks } = require('node:module')
-const { fileURLToPath } = require('node:url')
-const ts = require('typescript')
-
-const root = path.resolve(__dirname, '..')
-const transpile = (source) => ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },
-}).outputText
-
-// `src/host.ts` imports its siblings without an extension, so the loader needs
-// the same `.ts` resolution the DSH entry builds against.
-registerHooks({
-  resolve(specifier, context, next) {
-    const ownSource = context.parentURL?.startsWith('file:')
-      && fileURLToPath(context.parentURL).startsWith(path.join(root, 'src') + path.sep)
-    return next(ownSource && specifier.startsWith('.') && path.extname(specifier) === '' ? specifier + '.ts' : specifier, context)
-  },
-  load(url, context, next) {
-    if (url.startsWith('file:') && url.endsWith('.ts')) return {
-      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')),
-    }
-    return next(url, context)
-  },
-})
+const { createRequire } = require('node:module')
+const { root, transpile } = require('./ts-loader.cjs')
 
 /**
  * Load `src/host.ts` in an isolated context.
@@ -54,9 +32,15 @@ function loadHost(options = {}) {
   let readFails = false
   let gate = null
   let writeGate = null
+  let controlledReads = null
+  let readCount = 0
   const ownRequire = createRequire(path.join(root, 'src/host.ts'))
   const bridge = {
     getSettings: async () => {
+      readCount += 1
+      if (controlledReads !== null) {
+        return await new Promise(resolve => controlledReads.push(resolve))
+      }
       // Snapshot BEFORE the gate: a read issued before a save must answer with
       // the document as it stood then, which is the whole point of the race
       // case. Reading after the gate would hand back the newer document and make
@@ -83,7 +67,7 @@ function loadHost(options = {}) {
   context.exports = context.module.exports
   // The internals under test are module-scope bindings, so they are published
   // alongside the module's own exports rather than reached by name.
-  const internals = ['loadSettings', 'adoptHostSettings', 'saveSettings', 'mutateSettings', 'onHostSettingsChanged', 'normalizeSelection', 'parseSelection',
+  const internals = ['loadSettings', 'adoptHostSettings', 'saveSettings', 'mutateSettings', 'onHostSettingsChanged', 'onServiceStart', 'normalizeSelection', 'parseSelection',
     'parseKnownModelIds', 'mergeSelectionForPartialRoster',
     'orderSourceCredentials', 'traeClaimFor', 'gatewaySelectionFor', 'sourceDistribution',
     'sourceRosterFor', 'traeNativeOf', 'traeDeclarationModels', 'traeGateways',
@@ -113,10 +97,18 @@ function loadHost(options = {}) {
       writeGate = new Promise((resolve) => { release = resolve })
       return release
     },
+    queueReads() {
+      controlledReads = []
+    },
+    releaseRead(index, value) {
+      controlledReads[index](value)
+    },
+    readCount() { return readCount },
     readSettings() { return context.module.exports.__readSettings() },
     setCorePool(pool) { context.module.exports.__setCorePool(pool) },
     start() { context.module.exports.__start() },
     stop() { return context.module.exports.onUnload() },
+    read(expression) { return vm.runInContext(expression, context) },
     cleanup() { fs.rmSync(temporary, { recursive: true, force: true }) },
   }
 }
@@ -183,7 +175,7 @@ test('a host edit that raced a local save is re-read, not dropped', async () => 
     host.start()
     host.setCorePool({
       applyConfig: () => false, applyRemoved: () => {}, prefer: () => {},
-      list: () => [], isDisabled: () => false,
+      list: () => [], isDisabled: () => false, clear: () => {},
     })
     const release = host.holdWrite()
     const saving = host.internals.saveSettings({ showComposerPoints: true })
@@ -268,6 +260,78 @@ test('a settings read that raced a save does not revert it', async () => {
     assert.equal(host.getSettingsDocument().sourceTrae, false)
   } finally {
     host.cleanup()
+  }
+})
+
+test('overlapping settings reads keep the newest document', async () => {
+  const host = loadHost()
+  try {
+    host.queueReads()
+    const older = host.internals.adoptHostSettings()
+    const newer = host.internals.adoptHostSettings()
+    await new Promise((resolve) => setImmediate(resolve))
+    host.releaseRead(1, { sourceTrae: true })
+    host.releaseRead(0, { sourceTrae: false })
+    assert.equal(await newer, true)
+    assert.equal(await older, false)
+    assert.equal(host.readSettings().sourceTrae, true)
+  } finally {
+    host.cleanup()
+  }
+})
+
+test('an activation replaced while waiting for a write does not read settings', async () => {
+  const host = loadHost()
+  try {
+    host.read(`
+      loadGeneration = 1
+      serviceStopped = false
+      applySettingsToCore = () => {}
+      syncDeclaration = () => ({ ok: true })
+      startAccountWatch = () => {}
+    `)
+    host.queueReads()
+    const release = host.holdWrite()
+    const saving = host.internals.saveSettings({ sourceTrae: true })
+    await new Promise((resolve) => setImmediate(resolve))
+    const starting = host.internals.onServiceStart()
+    await new Promise((resolve) => setImmediate(resolve))
+    host.read('loadGeneration += 1')
+    release()
+    await saving
+    await starting
+    assert.equal(host.readCount(), 0)
+  } finally {
+    host.cleanup()
+  }
+})
+
+test('a replacement load waits for an in-flight settings write', async () => {
+  for (const start of ['module.exports.onLoad()', 'module.exports.__internals.onServiceStart()']) {
+    const host = loadHost({
+      settings: {
+        enabled: false, sourceWorkbuddy: false, sourceTrae: false, sourceQoder: false,
+        cooldownSeconds: 60,
+      },
+    })
+    try {
+      const release = host.holdWrite()
+      const saving = host.internals.saveSettings({ cooldownSeconds: 120 })
+      await new Promise((resolve) => setImmediate(resolve))
+      if (start.includes('onServiceStart')) host.read('loadGeneration += 1')
+      let loaded = false
+      const loading = host.read(start).then(() => { loaded = true })
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.equal(loaded, false, `${start} must not read settings around the old write`)
+      release()
+      assert.equal(await saving, false, 'the retired activation still reports that its write did not commit')
+      await loading
+      assert.equal(host.readSettings().cooldownSeconds, 120,
+        `${start} must read the host document after the old write lands`)
+    } finally {
+      await host.stop()
+      host.cleanup()
+    }
   }
 })
 
@@ -541,6 +605,33 @@ test('a queued write sees the edit the host made while it waited', async () => {
     assert.equal(await queued, true)
     assert.deepEqual(host.getSettingsDocument().creditReserves, { 'account-a': 99, 'account-b': 20 },
       'the host edit must survive alongside the queued one')
+  } finally { host.cleanup() }
+})
+
+test('a dictionary write that loses a settings read race does not overwrite the host value', async () => {
+  const host = loadHost({ settings: { creditReserves: { persisted: 1 } } })
+  try {
+    assert.equal(await host.internals.adoptHostSettings(), true)
+    host.queueReads()
+    const queued = host.internals.mutateSettings(
+      'creditReserves',
+      (current) => ({ ...(current ?? {}), mine: 2 }),
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+    const newest = host.internals.adoptHostSettings()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    // The queued mutation gets an older read while a newer host read is still
+    // pending. It must not edit the stale document and commit it first.
+    host.releaseRead(0, { creditReserves: { persisted: 1 } })
+    await new Promise((resolve) => setImmediate(resolve))
+    host.releaseRead(2, { creditReserves: { host: 99 } })
+    assert.equal(await queued, true)
+    host.releaseRead(1, { creditReserves: { host: 99 } })
+    await newest
+
+    assert.deepEqual(host.getSettingsDocument().creditReserves, { host: 99, mine: 2 },
+      'the mutation must merge into the host value it retried to read')
   } finally { host.cleanup() }
 })
 

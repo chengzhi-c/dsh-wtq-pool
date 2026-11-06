@@ -11,11 +11,12 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { tokenExpiryMs, regionOf, upstreamErrorKind, type WorkBuddyRegion } from './upstream'
 import { encryptedFieldOpener, isEncryptedFieldWrapper } from './at-rest'
+import { replaceFile, withFileLock } from './file-lock'
 import { LOG_PREFIX, accountLogTag } from './log'
 
 /** Minimal upstream surface the pool needs to refresh a token (no circular import). */
@@ -118,6 +119,8 @@ const ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 export interface WorkBuddyCredential {
   accessToken: string
   refreshToken: string
+  /** True only when the source carried an encrypted refresh field we could not open. */
+  refreshTokenUnavailable?: boolean
   expiresAtMs: number
   refreshExpiresAtMs?: number
   /**
@@ -326,6 +329,7 @@ export function parseWorkBuddyAuth(
 
   const refreshExpiresAtMs =
     typeof auth['refreshExpiresAt'] === 'number' ? expiryToMs(auth['refreshExpiresAt']) : undefined
+  const refreshField = encryptedField(auth['refreshToken'])
   const refreshToken = decryptableString(auth['refreshToken'], decrypt)
   // A refresh token past its own expiry cannot renew anything, but the access
   // token issued beside it may still have hours left. Returning the whole
@@ -345,6 +349,8 @@ export function parseWorkBuddyAuth(
   return {
     accessToken,
     refreshToken: refreshExpired ? '' : refreshToken,
+    ...!refreshExpired && refreshField !== undefined && refreshToken === ''
+      ? { refreshTokenUnavailable: true } : {},
     expiresAtMs: typeof auth['expiresAt'] === 'number' ? expiryToMs(auth['expiresAt']) : 0,
     ...refreshExpiresAtMs === undefined || refreshExpired ? {} : { refreshExpiresAtMs },
     ...lastRefreshAtMs === undefined ? {} : { lastRefreshAtMs },
@@ -365,17 +371,31 @@ export function parseWorkBuddyAuth(
  * that cannot be opened is an empty string so the caller skips the file
  * instead of treating a sealed token as "not signed in".
  */
+function encryptedField(value: unknown): unknown | undefined {
+  if (typeof value === 'string') {
+    if (!value.trimStart().startsWith('{')) return undefined
+    const text = value
+    try { value = JSON.parse(text) } catch {
+      return /"\$wbEncrypted"\s*:/u.test(text) ? null : undefined
+    }
+  }
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    && Object.hasOwn(value, '$wbEncrypted') ? value : undefined
+}
+
 function decryptableString(
   value: unknown,
   decrypt?: (value: unknown) => string,
 ): string {
-  if (typeof value === 'string') return value
-  if (isEncryptedFieldWrapper(value) && decrypt !== undefined) {
+  const field = encryptedField(value)
+  if (field !== undefined) {
+    if (!isEncryptedFieldWrapper(field)) return ''
     try {
-      return decrypt(value)
+      return decrypt?.(field) ?? ''
     } catch { /* an unavailable key leaves this field unreadable */ }
+    return ''
   }
-  return ''
+  return typeof value === 'string' ? value : ''
 }
 
 /**
@@ -451,7 +471,22 @@ function credentialRank(credential: WorkBuddyCredential, ownDir: string): number
 
 /** True when `candidate` should replace `incumbent` for the same account. */
 function isFresher(candidate: WorkBuddyCredential, incumbent: WorkBuddyCredential, ownDir: string): boolean {
-  return compareFreshness(candidate, incumbent, ownDir) < 0
+  const ordering = compareFreshness(candidate, incumbent, ownDir)
+  if (candidate.accessToken !== incumbent.accessToken) return ordering < 0
+
+  // A sealed field is not an empty refresh token. Keep a usable incumbent until
+  // the at-rest key is available, even when the sealed file is otherwise newer.
+  if (candidate.refreshTokenUnavailable && incumbent.refreshToken !== '') return false
+  if (ordering !== 0) return ordering < 0
+
+  // The same source can rotate the refresh token without changing its issue
+  // stamp. Accept that update, and accept an explicit empty/expired value so a
+  // revoked refresh token is not resurrected from the previous scan.
+  if (candidate.sourcePath === incumbent.sourcePath) {
+    return candidate.refreshToken !== incumbent.refreshToken
+      || candidate.refreshTokenUnavailable !== incumbent.refreshTokenUnavailable
+  }
+  return false
 }
 
 /**
@@ -500,45 +535,15 @@ function tokenDigest(accessToken: string): string {
  * data directory then kept a stale tombstone set; the size is in here so a rewrite
  * that lands in the same reported millisecond still reads as a different file.
  */
-async function signInFileStamp(file: string): Promise<string> {
+const MISSING_FILE_STAMP = 'missing'
+
+async function signInFileStamp(file: string): Promise<string | undefined> {
   try {
     const entry = await stat(file)
     return `${entry.mtimeMs}:${entry.size}`
-  } catch {
-    return ''
-  }
-}
-
-/**
- * Run `work` while holding a lock file, or without it when the lock stays taken.
- *
- * The tombstone document is the one file two pools over the same data directory
- * both write, and a read-union-write is only as good as its serialisation. The
- * budget is short on purpose: a panel call is answered within seconds, and the
- * work is a few kilobytes of JSON. A lock older than that is a process that died
- * holding it, so it is dropped and retried.
- */
-async function withFileLock(lock: string, work: () => Promise<void>): Promise<void> {
-  let held = false
-  for (let attempt = 0; attempt < 25 && !held; attempt += 1) {
-    try {
-      await writeFile(lock, '', { flag: 'wx', mode: 0o600 })
-      held = true
-      break
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') break
-      const age = await stat(lock).then(entry => Date.now() - entry.mtimeMs, (): number => 0)
-      if (age > 5_000) {
-        await unlink(lock).catch(() => {})
-        continue
-      }
-      await new Promise(resolve => setTimeout(resolve, 10))
-    }
-  }
-  try {
-    await work()
-  } finally {
-    if (held) await unlink(lock).catch(() => {})
+  } catch (error: unknown) {
+    const code = (error as NodeJS.ErrnoException).code
+    return code === 'ENOENT' || code === 'ENOTDIR' ? MISSING_FILE_STAMP : undefined
   }
 }
 
@@ -672,18 +677,19 @@ function disambiguateLabels(accounts: readonly WorkBuddyAccount[]): void {
  * Filenames are plain strings, and the ordering here is only a first pass —
  * `isFresher` makes the real call once each file has been parsed.
  */
-async function authFilesIn(dir: string): Promise<string[] | undefined> {
+async function authFilesIn(dir: string): Promise<{ files?: string[]; unavailable: boolean }> {
   let entries: string[]
   try {
     entries = await readdir(dir)
-  } catch {
+  } catch (error: unknown) {
+    const code = (error as NodeJS.ErrnoException).code
     // Unreadable is not "empty": the caller keeps accounts it already has from here.
-    return undefined
+    return { unavailable: code !== 'ENOENT' && code !== 'ENOTDIR' }
   }
   const files = entries.filter(name => name.endsWith('.info'))
   // Newest snapshot first so the freshest token wins when uids collide.
   files.sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))
-  return files.map(name => join(dir, name))
+  return { files: files.map(name => join(dir, name)), unavailable: false }
 }
 
 /**
@@ -696,7 +702,8 @@ async function authFilesIn(dir: string): Promise<string[] | undefined> {
  */
 type CredentialRead =
   | { kind: 'credential'; credential: WorkBuddyCredential }
-  | { kind: 'sealed' }
+  | { kind: 'sealed'; id?: string }
+  | { kind: 'unreadable' }
   | { kind: 'absent' }
 
 /** True when the document's access token is a `$wbEncrypted` envelope. */
@@ -712,21 +719,47 @@ function sealedAccessToken(text: string): boolean {
   const auth = typeof document['auth'] === 'object' && document['auth'] !== null
     ? document['auth'] as Record<string, unknown>
     : document
-  return isEncryptedFieldWrapper(auth['accessToken'])
+  return encryptedField(auth['accessToken']) !== undefined
+}
+
+/** Identity from a sealed document, using only fields left in plaintext. */
+function sealedIdentity(text: string, sourcePath: string): string | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+  const document = parsed as Record<string, unknown>
+  const account = typeof document['account'] === 'object' && document['account'] !== null
+    && !Array.isArray(document['account']) ? document['account'] as Record<string, unknown> : document
+  const uin = typeof account['uin'] === 'string' && account['uin'] !== '' ? account['uin'] : undefined
+  const uid = typeof account['uid'] === 'string' && account['uid'] !== '' ? account['uid'] : undefined
+  if (uin === undefined && uid === undefined) return undefined
+  return workbuddyAccountId({ uin, uid, nickname: undefined, sourcePath })
 }
 
 async function readCredential(path: string): Promise<CredentialRead> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
-  } catch {
-    return { kind: 'absent' }
+  } catch (error: unknown) {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? (error as { code?: unknown }).code : undefined
+    return code === 'ENOENT' || code === 'ENOTDIR' ? { kind: 'absent' } : { kind: 'unreadable' }
   }
-  const decrypt = text.includes('"$wbEncrypted"') ? await encryptedFieldOpener() : undefined
+  const decrypt = text.includes('"$wbEncrypted"') || text.includes('\\"$wbEncrypted\\"')
+    ? await encryptedFieldOpener() : undefined
   const credential = parseWorkBuddyAuth(text, path, decrypt)
   if (credential !== undefined) return { kind: 'credential', credential }
-  if (sealedAccessToken(text)) return { kind: 'sealed' }
-  return { kind: 'absent' }
+  if (sealedAccessToken(text)) return { kind: 'sealed', id: sealedIdentity(text, path) }
+  try {
+    JSON.parse(text)
+    return { kind: 'absent' }
+  } catch {
+    return { kind: 'unreadable' }
+  }
 }
 
 
@@ -889,27 +922,62 @@ export async function writeOwnSignIn(
   signIn: OwnSignIn,
   signal?: AbortSignal,
 ): Promise<string> {
+  const file = ownSignInFile(directory, signIn)
+  return await withSignInWriteLock(file, async () => {
+    await writeOwnSignInDocument(file, signIn, signal)
+    return file
+  })
+}
+
+const signInWriteQueues = new Map<string, Promise<void>>()
+
+async function withSignInWriteLock<T>(file: string, work: () => Promise<T>): Promise<T> {
+  const previous = signInWriteQueues.get(file) ?? Promise.resolve()
+  const run = previous.then(work, work)
+  const settled = run.then(() => undefined, () => undefined)
+  signInWriteQueues.set(file, settled)
+  try {
+    return await run
+  } finally {
+    if (signInWriteQueues.get(file) === settled) signInWriteQueues.delete(file)
+  }
+}
+
+function ownSignInFile(directory: string, signIn: OwnSignIn): string {
   const stable = signIn.uin === '' ? signIn.uid : signIn.uin
   const suffix = stable === '' ? randomUUID() : stable.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32)
-  const file = join(directory, `${OWN_SIGN_IN_PREFIX}${suffix === '' ? randomUUID() : suffix}.info`)
-  await mkdir(directory, { recursive: true })
+  return join(directory, `${OWN_SIGN_IN_PREFIX}${suffix === '' ? randomUUID() : suffix}.info`)
+}
+
+async function writeOwnSignInDocument(file: string, signIn: OwnSignIn, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted()
-  await writeFile(file, JSON.stringify({
-    auth: {
-      accessToken: signIn.accessToken,
-      refreshToken: signIn.refreshToken,
-      expiresAt: signIn.expiresAtMs,
-      domain: signIn.domain,
-      lastRefreshTime: signIn.lastRefreshAtMs ?? Date.now(),
-    },
-    account: {
-      ...signIn.uid === '' ? {} : { uid: signIn.uid },
-      ...signIn.uin === '' ? {} : { uin: signIn.uin },
-      ...signIn.enterpriseId === '' ? {} : { enterpriseId: signIn.enterpriseId },
-      ...signIn.nickname === '' ? {} : { nickname: signIn.nickname },
-    },
-  }, null, 2), { mode: 0o600 })
-  return file
+  await mkdir(dirname(file), { recursive: true })
+  signal?.throwIfAborted()
+  const temporary = `${file}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temporary, JSON.stringify({
+      auth: {
+        accessToken: signIn.accessToken,
+        refreshToken: signIn.refreshToken,
+        expiresAt: signIn.expiresAtMs,
+        domain: signIn.domain,
+        lastRefreshTime: signIn.lastRefreshAtMs ?? Date.now(),
+      },
+      account: {
+        ...signIn.uid === '' ? {} : { uid: signIn.uid },
+        ...signIn.uin === '' ? {} : { uin: signIn.uin },
+        ...signIn.enterpriseId === '' ? {} : { enterpriseId: signIn.enterpriseId },
+        ...signIn.nickname === '' ? {} : { nickname: signIn.nickname },
+      },
+    }, null, 2), { mode: 0o600 })
+    signal?.throwIfAborted()
+    // `rename` is the commit boundary. Once the OS call starts it cannot be
+    // cancelled atomically, so a completed rename leaves one valid sign-in.
+    await replaceFile(temporary, file)
+  } catch (error) {
+    await unlink(temporary).catch(() => {})
+    throw error
+  }
 }
 
 /**
@@ -920,22 +988,60 @@ export async function writeOwnSignIn(
  * auth values a refresh replaces are written. Atomic for the same reason as the
  * archive: a truncated `.info` is an account the scan cannot open.
  */
-export async function renewOwnSignInFile(file: string, credential: WorkBuddyCredential): Promise<void> {
-  const document = JSON.parse(await readFile(file, 'utf8')) as { auth?: Record<string, unknown> }
-  const auth = document.auth ?? {}
-  auth.accessToken = credential.accessToken
-  auth.refreshToken = credential.refreshToken
-  auth.expiresAt = credential.expiresAtMs
-  auth.lastRefreshTime = credential.lastRefreshAtMs ?? Date.now()
-  document.auth = auth
-  const temporary = `${file}.${randomUUID()}.tmp`
-  try {
-    await writeFile(temporary, JSON.stringify(document, null, 2), { mode: 0o600 })
-    await rename(temporary, file)
-  } catch (error: unknown) {
-    await unlink(temporary).catch(() => {})
-    throw error
-  }
+export async function renewOwnSignInFile(
+  file: string,
+  credential: WorkBuddyCredential,
+  previous: WorkBuddyCredential,
+  createIfMissing = false,
+  beforeCommit?: () => Promise<boolean>,
+): Promise<boolean> {
+  return await withSignInWriteLock(file, async () => {
+    let text: string
+    try {
+      text = await readFile(file, 'utf8')
+    } catch (error: unknown) {
+      if (!createIfMissing || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      if (beforeCommit !== undefined && !await beforeCommit()) return false
+      await writeOwnSignInDocument(file, ownSignInOf(credential))
+      return true
+    }
+    const document = JSON.parse(text) as { auth?: Record<string, unknown> }
+    const auth = document.auth ?? {}
+    if (auth.accessToken !== previous.accessToken) {
+      const onDisk = parseWorkBuddyAuth(text, file)
+      if (onDisk === undefined) throw new Error('sign-in changed while the token refresh was in flight')
+      if (isFresher(onDisk, previous, dirname(file))) return false
+    }
+    auth.accessToken = credential.accessToken
+    auth.refreshToken = credential.refreshToken
+    auth.expiresAt = credential.expiresAtMs
+    auth.lastRefreshTime = credential.lastRefreshAtMs ?? Date.now()
+    document.auth = auth
+    const temporary = `${file}.${randomUUID()}.tmp`
+    try {
+      await writeFile(temporary, JSON.stringify(document, null, 2), { mode: 0o600 })
+      // Checked here, right before the commit, because this is the last moment a
+      // delete can be seen: the write above takes long enough for one to land.
+      if (beforeCommit !== undefined && !await beforeCommit()) {
+        await unlink(temporary).catch(() => {})
+        return false
+      }
+      await replaceFile(temporary, file)
+      // A delete can commit inside that rename (it is the wide window: the
+      // temp write and the replace both yield to the event loop). The tombstone
+      // is the user's intent and outranks this write, so the file goes back out
+      // rather than staying as a token newer than the delete - which the next
+      // scan would read as a re-login and use to clear the record.
+      if (beforeCommit !== undefined && !await beforeCommit()) {
+        await unlink(file).catch(() => {})
+        return false
+      }
+      return true
+    } catch (error: unknown) {
+      await unlink(temporary).catch(() => {})
+      throw error
+    }
+  })
 }
 /**
  * Soonest future one-off expiry. Missing or past sorts last. None left -> list head.
@@ -973,7 +1079,7 @@ export function candidateAuthDirs(env: NodeJS.ProcessEnv = process.env): string[
     // The env var may name the file or its directory; accept both.
     dirs.push(override.toLowerCase().endsWith('.info') ? resolve(override, '..') : override)
   }
-  dirs.push(...defaultDesktopAuthDirs())
+  dirs.push(...defaultDesktopAuthDirs(process.platform, homedir(), env))
   return dirs
 }
 
@@ -1050,6 +1156,22 @@ async function readArchivedCredentials(file: string): Promise<Map<string, WorkBu
   return stored
 }
 
+async function removeAbandonedArchiveTemps(file: string): Promise<void> {
+  const prefix = `${basename(file)}.`
+  let names: string[]
+  try {
+    names = await readdir(dirname(file))
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue
+    const id = name.slice(prefix.length, -4)
+    if (!/^[a-f\d]{8}-(?:[a-f\d]{4}-){3}[a-f\d]{12}$/iu.test(id)) continue
+    await unlink(join(dirname(file), name)).catch(() => {})
+  }
+}
+
 /**
  * Write the archive, replacing the previous file only once the new one is whole.
  *
@@ -1062,6 +1184,7 @@ async function writeArchivedCredentials(
   entries: ReadonlyMap<string, WorkBuddyCredential>,
   signal?: AbortSignal,
 ): Promise<void> {
+  signal?.throwIfAborted()
   await mkdir(dirname(file), { recursive: true })
   signal?.throwIfAborted()
   const body = JSON.stringify({
@@ -1087,7 +1210,7 @@ async function writeArchivedCredentials(
   try {
     await writeFile(temporary, body, { encoding: 'utf8', mode: 0o600 })
     signal?.throwIfAborted()
-    await rename(temporary, file)
+    await replaceFile(temporary, file)
   } catch (error: unknown) {
     await unlink(temporary).catch(() => {})
     throw error
@@ -1260,6 +1383,8 @@ export class WorkBuddyAccountPool {
   /** The directories the in-flight scan is reading, so a repoint supersedes it. */
   private scanDirs: readonly string[] = []
   private scanAbort = new AbortController()
+  /** A committed delete retires scans that read the roster before it. */
+  private rosterRevision = 0
   /**
    * Accounts whose "expired with no refresh token" warning has been logged.
    *
@@ -1288,7 +1413,13 @@ export class WorkBuddyAccountPool {
    * a delete would hide the account from the pool while the user believed they
    * were removing something the plugin had added.
    */
-  private appHeldIds: ReadonlySet<string> = new Set()
+  private appHeldFiles: ReadonlyMap<string, string> = new Map()
+  /** An unreadable live sign-in whose account cannot be identified. */
+  private unknownLiveSignIn = false
+  /** Unknown live files stay protected while their directory cannot answer. */
+  private unknownLiveFiles: ReadonlySet<string> = new Set()
+  /** Accounts whose desktop live sign-in is present but currently unreadable. */
+  private refreshBlockedIds: ReadonlySet<string> = new Set()
   /**
    * The sign-ins each account's own files hold, as of the last scan.
    *
@@ -1447,7 +1578,7 @@ export class WorkBuddyAccountPool {
    */
   ownsSignIn(accountId: string): boolean {
     const account = this.accounts.find(item => item.id === accountId)
-    if (account === undefined || this.appHeldIds.has(accountId)) return false
+    if (account === undefined || this.unknownLiveSignIn || [...this.appHeldFiles.values()].includes(accountId)) return false
     return this.isOwnSignInPath(account.credential.sourcePath)
   }
 
@@ -1469,6 +1600,12 @@ export class WorkBuddyAccountPool {
     const account = this.accounts.find(item => item.id === accountId)
     if (account === undefined) return false
     if (!this.ownsSignIn(accountId)) return false
+    const ownedPath = account.credential.sourcePath
+    if (!this.isOwnSignInPath(ownedPath)) return false
+    const deletingCredential = account.credential
+    const sameCredential = (credential: WorkBuddyCredential): boolean =>
+      credential.accessToken === deletingCredential.accessToken
+      && credential.refreshToken === deletingCredential.refreshToken
     // Let a scan that is already reading the directories finish first. Its copy
     // of this sign-in is queued for the archive, and an archive write queued
     // behind the drop below would put the entry back - the file gone, the
@@ -1485,7 +1622,9 @@ export class WorkBuddyAccountPool {
     // still in the archive and its snapshot still in the client's directory, and a
     // walk that got past the tombstone check before this point would put the
     // account straight back on assignment.
-    const known = (await this.loadDeletedSignIns()).has(account.id)
+    const knownTombstones = await this.loadDeletedSignIns()
+    if (knownTombstones === undefined) throw new Error('could not read the deleted sign-ins')
+    const known = knownTombstones.has(account.id)
     // A delete whose tombstone could not be recorded is not a delete: the file is
     // about to go, and the only thing that keeps the client's copy from taking the
     // account back is that record. Reporting success would leave a row that
@@ -1493,14 +1632,48 @@ export class WorkBuddyAccountPool {
     if (!await this.rememberDeletedSignIn(account.id, account.credential)) {
       throw new Error('could not record the deleted sign-in')
     }
-    if (running !== undefined) {
-      const settled = await raceWithTimeout(running.catch(() => {}), DELETE_SCAN_WAIT_MS)
-      if (!settled) void running.catch(() => {}).then(() => this.forgetArchived(account.id))
+    const settled = running === undefined
+      ? true
+      : await raceWithTimeout(running.catch(() => {}), DELETE_SCAN_WAIT_MS)
+    const current = this.accounts.find(item => item.id === account.id)
+    let replaced = current !== undefined
+      && (!this.ownsSignIn(account.id)
+        || resolve(current.credential.sourcePath) !== resolve(ownedPath)
+        || !sameCredential(current.credential))
+    if (current === undefined) {
+      // The scan may have applied the tombstone this delete just wrote and
+      // removed the row before returning. Accept that state only when the file
+      // being deleted is still the same sign-in; a re-login at the same path
+      // must survive.
+      const tombstone = (await this.loadDeletedSignIns())?.get(account.id)
+      replaced = tombstone === undefined
+        || (tombstone !== undefined && endsTombstone(tombstone, deletingCredential))
+    }
+    const onDisk = await readCredential(ownedPath)
+    if (!replaced) {
+      replaced = onDisk.kind === 'sealed'
+        || onDisk.kind === 'unreadable'
+        || (onDisk.kind === 'credential'
+          && (workbuddyAccountId(onDisk.credential) !== account.id
+            || !sameCredential(onDisk.credential)))
+    }
+    if (replaced) {
+      if (!known) {
+        knownTombstones.delete(account.id)
+        await this.writeDeletedSignIns([account.id])
+      }
+      return false
     }
     // Already gone is success: the point is that no sign-in is left, and a
-    // second delete must not read as a failure.
+    // second delete must not read as a failure. The unlink runs under the same
+    // tombstone lock a renewal takes, so a rotation in flight either lands
+    // before this remove or is refused after it; without that, its rename
+    // landed past the unlink and recreated the file with a token newer than the
+    // tombstone, which `endsTombstone` read as a re-login.
     try {
-      await unlink(account.credential.sourcePath)
+      const tombstoneFile = this.deletedSignInsFile()
+      if (tombstoneFile === undefined) await unlink(ownedPath)
+      else await withFileLock(`${tombstoneFile}.lock`, async () => { await unlink(ownedPath) })
     } catch (error: unknown) {
       const code = (error as NodeJS.ErrnoException).code
       if (code !== 'ENOENT') {
@@ -1509,18 +1682,33 @@ export class WorkBuddyAccountPool {
         // account while the panel had just reported the delete as failed, and the
         // file left behind would bring it back once the tombstone was gone.
         if (!known) {
-          ;(await this.loadDeletedSignIns()).delete(account.id)
+          knownTombstones.delete(account.id)
           await this.writeDeletedSignIns([account.id])
         }
+        this.rosterRevision += 1
+        await this.rescan().catch((rescanError: unknown) => {
+          this.logger?.warn?.(`${LOG_PREFIX}: could not restore the roster after a failed delete: ${String(rescanError)}`)
+        })
         throw error
       }
+    }
+    // Any scan that passed the tombstone read before the unlink still holds the
+    // account being removed. Retire it at the successful commit boundary.
+    this.rosterRevision += 1
+    if (!settled) {
+      void running!.catch(() => {}).then(() => this.forgetArchived(account.id))
     }
     await this.forgetArchived(account.id)
     // Dropped from the pool here, not on the next walk. The credential in memory
     // is one whose file is gone, and until a walk replaces the list it outranks
     // every copy a walk finds: the row came straight back after a delete, serving
     // a token the user asked to be rid of.
-    this.forgetAccount(account.id)
+    const remaining = this.accounts.find(item => item.id === account.id)
+    if (remaining === undefined
+      || (this.isOwnSignInPath(remaining.credential.sourcePath)
+        && resolve(remaining.credential.sourcePath) === resolve(ownedPath))) {
+      this.forgetAccount(account.id)
+    }
     return true
   }
 
@@ -1549,6 +1737,7 @@ export class WorkBuddyAccountPool {
    */
   private async rememberDeletedSignIn(id: string, credential: WorkBuddyCredential): Promise<boolean> {
     const tombstones = await this.loadDeletedSignIns()
+    if (tombstones === undefined) return false
     const previous = tombstones.get(id)
     tombstones.set(id, {
       tokenDigest: tokenDigest(credential.accessToken),
@@ -1571,13 +1760,16 @@ export class WorkBuddyAccountPool {
    * client's directory until the client overwrites it, so a tombstone that
    * expired would bring that copy straight back, refresh token included.
    */
-  private async loadDeletedSignIns(signal?: AbortSignal): Promise<Map<string, DeletedSignIn>> {
+  private async loadDeletedSignIns(
+    signal?: AbortSignal,
+  ): Promise<Map<string, DeletedSignIn> | undefined> {
     const file = this.deletedSignInsFile()
-    const stamp = file === undefined ? '' : await signInFileStamp(file)
+    const stamp = file === undefined ? MISSING_FILE_STAMP : await signInFileStamp(file)
+    if (stamp === undefined) return undefined
     if (signal?.aborted) return this.deletedSignIns ?? new Map()
     if (this.deletedSignIns !== undefined && this.deletedSignInsStamp === stamp) return this.deletedSignIns
     if (file === undefined) {
-      this.deletedSignInsStamp = ''
+      this.deletedSignInsStamp = MISSING_FILE_STAMP
       this.deletedSignIns = new Map()
       return this.deletedSignIns
     }
@@ -1593,13 +1785,14 @@ export class WorkBuddyAccountPool {
       // the set we already have is what stops the next scan from adopting every
       // account the user deleted, and stops the next write from persisting an
       // empty set over theirs. The stamp is left unrecorded so the read is retried.
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        this.deletedSignInsStamp = stamp
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        this.deletedSignInsStamp = MISSING_FILE_STAMP
         this.deletedSignIns = new Map()
         return this.deletedSignIns
       }
       this.logger?.warn?.(`${LOG_PREFIX}: could not read the deleted sign-ins: ${String(error)}`)
-      return this.deletedSignIns ?? new Map()
+      return this.deletedSignIns
     }
   }
 
@@ -1618,32 +1811,53 @@ export class WorkBuddyAccountPool {
   private async writeDeletedSignIns(removed: readonly string[] = [], signal?: AbortSignal): Promise<boolean> {
     const tombstones = this.deletedSignIns
     const file = this.deletedSignInsFile()
-    if (tombstones === undefined || file === undefined) return true
+    if (tombstones === undefined) return false
+    if (file === undefined) return true
     let written = false
-    await withFileLock(`${file}.lock`, async () => {
-      if (signal?.aborted) return
-      const onDisk = await readDeletedSignInsFile(file).catch(() => new Map<string, DeletedSignIn>())
-      if (signal?.aborted) return
-      for (const [id, entry] of onDisk) {
-        if (removed.includes(id)) continue
-        const ours = tombstones.get(id)
-        if (ours === undefined || entry.deletedAtMs > ours.deletedAtMs) tombstones.set(id, entry)
+    try {
+      await withFileLock(`${file}.lock`, async () => {
+        if (signal?.aborted) return
+        let onDisk: Map<string, DeletedSignIn>
+        try {
+          onDisk = await readDeletedSignInsFile(file)
+        } catch (error: unknown) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            if (!signal?.aborted) {
+              this.logger?.warn?.(`${LOG_PREFIX}: could not merge the deleted sign-ins: ${String(error)}`)
+            }
+            return
+          }
+          onDisk = new Map()
+        }
+        if (signal?.aborted) return
+        for (const [id, entry] of onDisk) {
+          if (removed.includes(id)) continue
+          const ours = tombstones.get(id)
+          if (ours === undefined || entry.deletedAtMs > ours.deletedAtMs) tombstones.set(id, entry)
+        }
+        const temporary = `${file}.${randomUUID()}.tmp`
+        try {
+          signal?.throwIfAborted()
+          await mkdir(dirname(file), { recursive: true })
+          signal?.throwIfAborted()
+          await writeFile(temporary, JSON.stringify({ version: 1, entries: Object.fromEntries(tombstones) }, null, 2), { mode: 0o600 })
+          signal?.throwIfAborted()
+          await replaceFile(temporary, file)
+          const stamp = await signInFileStamp(file)
+          if (!signal?.aborted && this.deletedSignIns === tombstones) this.deletedSignInsStamp = stamp
+          written = true
+        } catch (error: unknown) {
+          await unlink(temporary).catch(() => {})
+          if (!signal?.aborted) this.logger?.warn?.(`${LOG_PREFIX}: could not record the deleted sign-ins: ${String(error)}`)
+        }
+      })
+    } catch (error: unknown) {
+      if (!signal?.aborted) {
+        this.logger?.warn?.(written
+          ? `${LOG_PREFIX}: the deleted sign-ins were saved but their lock was not released: ${String(error)}`
+          : `${LOG_PREFIX}: could not lock the deleted sign-ins: ${String(error)}`)
       }
-      const temporary = `${file}.${randomUUID()}.tmp`
-      try {
-        await mkdir(dirname(file), { recursive: true })
-        signal?.throwIfAborted()
-        await writeFile(temporary, JSON.stringify({ version: 1, entries: Object.fromEntries(tombstones) }, null, 2), { mode: 0o600 })
-        signal?.throwIfAborted()
-        await rename(temporary, file)
-        const stamp = await signInFileStamp(file)
-        if (!signal?.aborted && this.deletedSignIns === tombstones) this.deletedSignInsStamp = stamp
-        written = true
-      } catch (error: unknown) {
-        await unlink(temporary).catch(() => {})
-        if (!signal?.aborted) this.logger?.warn?.(`${LOG_PREFIX}: could not record the deleted sign-ins: ${String(error)}`)
-      }
-    })
+    }
     return written
   }
 
@@ -1701,11 +1915,13 @@ export class WorkBuddyAccountPool {
   private async adoptOrphanedSignIns(
     found: readonly WorkBuddyCredential[],
     tornDown: ReadonlySet<string>,
+    sealedLiveIds: ReadonlySet<string>,
+    unknownLiveDirs: ReadonlySet<string>,
     signal: AbortSignal,
   ): Promise<WorkBuddyCredential[]> {
     const directory = ownSignInDir(this.dataPath?.() ?? '')
     if (directory === '') return []
-    const liveIds = new Set<string>()
+    const liveIds = new Set<string>(sealedLiveIds)
     const ownedIds = new Set<string>()
     for (const credential of found) {
       const id = workbuddyAccountId(credential)
@@ -1720,7 +1936,7 @@ export class WorkBuddyAccountPool {
       const id = workbuddyAccountId(credential)
       // The client is signed into this account, the plugin already holds a copy of
       // it, or the user deleted it: either way there is nothing to take over.
-      if (liveIds.has(id) || ownedIds.has(id) || tornDown.has(id)) continue
+      if (unknownLiveDirs.has(this.homeOf(credential)) || liveIds.has(id) || ownedIds.has(id) || tornDown.has(id)) continue
       // Without an identity the pool key falls back to the source path, so the
       // copy would be a different account on every scan and the pool would grow
       // without bound. Such a snapshot keeps serving from where it lies.
@@ -1752,17 +1968,22 @@ export class WorkBuddyAccountPool {
    * request already in flight. Anything that did not come from the plugin's own
    * directory is left alone - the desktop app owns its files.
    */
-  private async renewOwnSignIn(credential: WorkBuddyCredential): Promise<void> {
-    if (this.isOwnSignInPath(credential.sourcePath)) {
-      try {
-        await renewOwnSignInFile(credential.sourcePath, credential)
-      } catch (error: unknown) {
-        this.logger?.warn?.(
-          `${LOG_PREFIX}: could not write the renewed token back for ${accountLogTag(credential.nickname ?? credential.uid)}: ${String(error)}`,
-        )
-      }
-      return
+  private async renewOwnSignIn(previous: WorkBuddyCredential, credential: WorkBuddyCredential): Promise<boolean> {
+    // A tombstone recorded after this rotation began is the user deleting an
+    // account that was still there: writing it back would resurrect it with a
+    // token newer than the delete, which `endsTombstone` reads as a re-login.
+    const sinceMs = Date.now()
+    const guard = async (): Promise<boolean> => await this.deleteDidNotTake(credential, sinceMs)
+    if (this.isOwnSignInPath(previous.sourcePath)) {
+      return await renewOwnSignInFile(previous.sourcePath, credential, previous, false, guard)
     }
+    // A credential with no identity at all keys the pool by its source path, so
+    // a copy written under a new file is a *second account* to the next scan:
+    // same token, two ids, and each id spends the one refresh token. The second
+    // rotation is then refused and the account gets a session hold while a
+    // working token sits right next to it. The adoption path already refuses to
+    // copy such a snapshot for this reason; renewal must hold the same line.
+    if ((credential.uin ?? credential.uid ?? credential.nickname ?? '') === '') return true
     // The rotation was just spent on a copy the plugin does not own: a desktop
     // sign-in it read, or one the archive handed back. Keeping the result in the
     // archive alone left the plugin's own copy of that account one rotation
@@ -1770,14 +1991,53 @@ export class WorkBuddyAccountPool {
     // marked as needing a sign-in. Writing the token into the directory the pool
     // maintains claims the account with the token that was just minted.
     const directory = ownSignInDir(this.dataPath?.() ?? '')
-    if (directory === '') return
-    try {
-      credential.sourcePath = await writeOwnSignIn(directory, ownSignInOf(credential))
-    } catch (error: unknown) {
-      this.logger?.warn?.(
-        `${LOG_PREFIX}: could not keep the renewed token for ${accountLogTag(credential.nickname ?? credential.uid)}: ${String(error)}`,
-      )
-    }
+    if (directory === '') return true
+    const file = ownSignInFile(directory, ownSignInOf(credential))
+    if (!await guard()) return false
+    const written = await renewOwnSignInFile(file, credential, previous, true, guard)
+    if (written) credential.sourcePath = file
+    return written
+  }
+
+  /**
+   * Whether a delete recorded elsewhere still stands against this sign-in.
+   *
+   * A delete records a tombstone, unlinks the file, and reports success. A
+   * renewal in another pool over the same data directory used to race that: its
+   * rename landed after the unlink, the file came back with a token issued
+   * *after* the tombstone, and `endsTombstone` read the recreation as a
+   * re-login and cleared the record - a deleted account came back.
+   *
+   * The test here is not `endsTombstone`, which asks whether the token is newer
+   * than the delete and would call this very rotation a re-login. What matters
+   * is the order of the two acts: a tombstone recorded after this renewal began
+   * is the user deleting an account that was still there, so the write must not
+   * land. `sinceMs` is when this renewal's token was minted - earlier than the
+   * delete, which is exactly the case that used to resurrect the account.
+   *
+   * The set is read under the lock a delete writes it with, so a delete that
+   * committed a moment ago is visible. Nothing blocking runs under that lock.
+   */
+  private async deleteDidNotTake(
+    credential: WorkBuddyCredential,
+    sinceMs: number,
+  ): Promise<boolean> {
+    const file = this.deletedSignInsFile()
+    if (file === undefined) return true
+    // No tombstone file means nothing was ever deleted: reading it under the
+    // lock would create the data directory as a side effect, which is a write
+    // the caller did not ask for and a scan that runs after `clear()` must not
+    // perform.
+    const present = await stat(file).then(() => true, (error: unknown) =>
+      (error as NodeJS.ErrnoException).code !== 'ENOENT')
+    if (!present) return true
+    let alive = true
+    await withFileLock(`${file}.lock`, async () => {
+      const tombstones = await this.loadDeletedSignIns()
+      const tombstone = tombstones?.get(workbuddyAccountId(credential))
+      if (tombstone !== undefined && tombstone.deletedAtMs >= sinceMs) alive = false
+    })
+    return alive
   }
 
   /**
@@ -1791,9 +2051,11 @@ export class WorkBuddyAccountPool {
     const file = this.archiveFile()
     if (file === undefined) return
     const run = this.archiveQueue.then(async () => {
-      const stored = await readArchivedCredentials(file)
-      if (!stored.delete(id)) return
-      await writeArchivedCredentials(file, stored)
+      await withFileLock(`${file}.lock`, async () => {
+        const stored = await readArchivedCredentials(file)
+        if (!stored.delete(id)) return
+        await writeArchivedCredentials(file, stored)
+      })
     })
     this.archiveQueue = run.catch(() => {})
     try {
@@ -1802,7 +2064,7 @@ export class WorkBuddyAccountPool {
       // The file is already gone at this point, so a failed archive write means
       // the account comes back on the next scan. Loud rather than silent: the
       // user was told it was deleted.
-      this.logger?.warn?.(`${LOG_PREFIX}: could not drop ${id} from the credential archive: ${String(error)}`)
+      this.logger?.warn?.(`${LOG_PREFIX}: could not drop a sign-in from the credential archive: ${String(error)}`)
     }
   }
 
@@ -1814,7 +2076,10 @@ export class WorkBuddyAccountPool {
     this.scanInflight = undefined
     this.scanDirs = []
     this.accounts = []
-    this.appHeldIds = new Set()
+    this.appHeldFiles = new Map()
+    this.unknownLiveSignIn = false
+    this.unknownLiveFiles = new Set()
+    this.refreshBlockedIds = new Set()
   }
 
   /** Read after any scan already running, so a manual request gets a fresh snapshot. */
@@ -1880,18 +2145,20 @@ export class WorkBuddyAccountPool {
     // writers overwrite each other's entries, and a half-written archive reads
     // back as empty, which would cost every archived account at once.
     const run = this.archiveQueue.then(async () => {
-      if (signal?.aborted) return
-      const stored = await readArchivedCredentials(file)
-      if (signal?.aborted) return
-      let changed = false
-      for (const credential of credentials) {
-        const id = workbuddyAccountId(credential)
-        const previous = stored.get(id)
-        if (previous !== undefined && !isFresher(credential, previous, ownDir)) continue
-        stored.set(id, credential)
-        changed = true
-      }
-      if (changed) await writeArchivedCredentials(file, stored, signal)
+      await withFileLock(`${file}.lock`, async () => {
+        if (signal?.aborted) return
+        const stored = await readArchivedCredentials(file)
+        if (signal?.aborted) return
+        let changed = false
+        for (const credential of credentials) {
+          const id = workbuddyAccountId(credential)
+          const previous = stored.get(id)
+          if (previous !== undefined && !isFresher(credential, previous, ownDir)) continue
+          stored.set(id, credential)
+          changed = true
+        }
+        if (changed) await writeArchivedCredentials(file, stored, signal)
+      })
     })
     // The queue must survive a failed write, or every later archive write would
     // be skipped as if one were still running.
@@ -1908,7 +2175,11 @@ export class WorkBuddyAccountPool {
     const file = this.archiveFile()
     if (file === undefined) return []
     try {
-      const stored = await readArchivedCredentials(file)
+      let stored = new Map<string, WorkBuddyCredential>()
+      await withFileLock(`${file}.lock`, async () => {
+        await removeAbandonedArchiveTemps(file)
+        stored = await readArchivedCredentials(file)
+      })
       return [...stored.values()].filter(credential => homes.has(this.homeOf(credential)))
     } catch (error: unknown) {
       this.logger?.warn?.(`${LOG_PREFIX}: could not read the credential archive: ${String(error)}`)
@@ -1926,6 +2197,7 @@ export class WorkBuddyAccountPool {
   }
 
   private async scanOnce(dirs: readonly string[], signal = this.scanAbort.signal): Promise<WorkBuddyAccount[]> {
+    const rosterRevision = this.rosterRevision
     const found: WorkBuddyCredential[] = []
     // Directories that answered. An account is dropped only when its own directory
     // answered and no longer contains it — a directory that could not be read
@@ -1934,17 +2206,32 @@ export class WorkBuddyAccountPool {
     // Directories holding a sealed token this build cannot open. Treated like an
     // unreadable directory: the account is kept until the key is available again.
     const sealedDirs = new Set<string>()
+    const sealedFiles = new Set<string>()
+    const sealedFileIds = new Map<string, string>()
+    const unreadableFiles = new Set<string>()
+    const unavailableDirs = new Set<string>()
     for (const dir of dirs) {
       if (signal.aborted) return this.accounts
-      const files = await authFilesIn(dir)
+      const read = await authFilesIn(dir)
       if (signal.aborted) return this.accounts
-      if (files === undefined) continue
+      if (read.files === undefined) {
+        if (read.unavailable) unavailableDirs.add(resolve(dir))
+        continue
+      }
       readableDirs.add(resolve(dir))
-      for (const file of files) {
-        const read = await readCredential(file)
+      for (const file of read.files) {
+        const credentialRead = await readCredential(file)
         if (signal.aborted) return this.accounts
-        if (read.kind === 'credential') found.push(read.credential)
-        else if (read.kind === 'sealed') sealedDirs.add(resolve(dir))
+        if (credentialRead.kind === 'credential') found.push(credentialRead.credential)
+        else if (credentialRead.kind === 'sealed') {
+          sealedDirs.add(resolve(dir))
+          const resolvedFile = resolve(file)
+          sealedFiles.add(resolvedFile)
+          if (credentialRead.id !== undefined) sealedFileIds.set(resolvedFile, credentialRead.id)
+        } else if (credentialRead.kind === 'unreadable') {
+          sealedDirs.add(resolve(dir))
+          unreadableFiles.add(resolve(file))
+        }
       }
     }
 
@@ -1954,7 +2241,14 @@ export class WorkBuddyAccountPool {
     // back: the row never moved and the delete read as a button that does nothing.
     // A sign-in the client minted after the delete is a re-login and ends it.
     const tombstones = await this.loadDeletedSignIns(signal)
-    if (signal.aborted) return this.accounts
+    if (signal.aborted || rosterRevision !== this.rosterRevision) return this.accounts
+    if (tombstones === undefined) {
+      // A cold process has no previous roster to keep. Treat an unreadable
+      // tombstone as "unknown", never as "nothing was deleted", or the client's
+      // superseded snapshots would bring a deleted sign-in back into rotation.
+      this.lastScanAtMs = Date.now()
+      return this.accounts
+    }
     const tornDown = new Set<string>()
     const releasedIds: string[] = []
     const held: WorkBuddyCredential[] = []
@@ -1981,20 +2275,31 @@ export class WorkBuddyAccountPool {
     // on a scan where no file exists to carry the tombstone check.
     for (const id of tombstones.keys()) tornDown.add(id)
     if (releasedIds.length > 0) await this.writeDeletedSignIns(releasedIds, signal)
-    if (signal.aborted) return this.accounts
+    if (signal.aborted || rosterRevision !== this.rosterRevision) return this.accounts
 
-    // Remember every sign-in this walk saw before anything about it is dropped.
-    // The global client keeps no snapshot beside its live file, so a re-login
-    // overwrites the previous account's only copy on disk; the archive is what
-    // lets that account stay in the pool afterwards.
-    await this.archiveCredentials(found, signal)
-    if (signal.aborted) return this.accounts
-
+    const sealedLiveIds = new Set(sealedFileIds.values())
+    for (let index = found.length - 1; index >= 0; index -= 1) {
+      const credential = found[index]!
+      if (isLiveAuthFile(credential.sourcePath)) continue
+      if (ownSignInPath(credential.sourcePath, ownSignInDir(this.dataPath?.() ?? ''))) continue
+      const id = workbuddyAccountId(credential)
+      if (sealedLiveIds.has(id) || sealedDirs.has(this.homeOf(credential))) found.splice(index, 1)
+    }
     // Sign-ins the client left behind become the plugin's own, so something
     // renews them. After the archive write, so the snapshot being copied is
     // already kept, and before anything below reads `found`.
-    found.push(...(await this.adoptOrphanedSignIns(found, tornDown, signal)))
-    if (signal.aborted) return this.accounts
+    // Archive only after the tombstone check, so a scan cannot put a deleted
+    // credential back into a file the next process may read.
+    await this.archiveCredentials(found, signal)
+    if (signal.aborted || rosterRevision !== this.rosterRevision) return this.accounts
+    found.push(...(await this.adoptOrphanedSignIns(
+      found,
+      tornDown,
+      sealedLiveIds,
+      sealedDirs,
+      signal,
+    )))
+    if (signal.aborted || rosterRevision !== this.rosterRevision) return this.accounts
 
     // The sign-in each account's own files hold, taken from the walk before the
     // archive's copies join `found`: those carry whatever this process last
@@ -2026,14 +2331,51 @@ export class WorkBuddyAccountPool {
     // repoints the serving credential at it, so deriving this from the winner
     // dropped the account out of the set one scan later and offered a delete for
     // an account the user never added to the pool.
-    const appHeld = new Set(
-      found.filter(credential => isLiveAuthFile(credential.sourcePath)).map(credential => workbuddyAccountId(credential)),
-    )
+    const appHeld = new Map<string, string>()
+    for (const [file, id] of this.appHeldFiles) {
+      if (sealedFiles.has(file) || unreadableFiles.has(file) || !readableDirs.has(resolve(dirname(file)))) {
+        appHeld.set(file, id)
+      }
+    }
+    for (const credential of found) {
+      if (isLiveAuthFile(credential.sourcePath)) appHeld.set(resolve(credential.sourcePath), workbuddyAccountId(credential))
+    }
+    for (const [file, id] of sealedFileIds) {
+      if (isLiveAuthFile(file)) appHeld.set(file, id)
+    }
+    const unknownLiveFiles = new Set<string>()
+    for (const file of this.unknownLiveFiles) {
+      if (unreadableFiles.has(file) || !readableDirs.has(resolve(dirname(file)))) unknownLiveFiles.add(file)
+    }
+    for (const file of sealedFiles) {
+      if (isLiveAuthFile(file) && !sealedFileIds.has(file)) unknownLiveFiles.add(file)
+    }
+    for (const file of unreadableFiles) {
+      if (isLiveAuthFile(file)) unknownLiveFiles.add(file)
+    }
+    const unknownLiveSignIn = unknownLiveFiles.size > 0 || unavailableDirs.size > 0
+    const refreshBlockedIds = new Set<string>()
+    for (const [file, id] of appHeld) {
+      if (sealedFiles.has(file)
+        || unreadableFiles.has(file)
+        || unavailableDirs.has(resolve(dirname(file)))) {
+        refreshBlockedIds.add(id)
+      }
+    }
+    for (const account of this.accounts) {
+      if (sealedFiles.has(resolve(account.credential.sourcePath))
+        || unreadableFiles.has(resolve(account.credential.sourcePath))
+        || unavailableDirs.has(this.homeOf(account.credential))) {
+        refreshBlockedIds.add(account.id)
+      }
+    }
     const archived = await this.archivedCredentials(readableDirs)
-    if (signal.aborted) return this.accounts
+    if (signal.aborted || rosterRevision !== this.rosterRevision) return this.accounts
     for (const credential of archived) {
       const id = workbuddyAccountId(credential)
       if (tornDown.has(id)) continue
+      if (!this.isOwnSignInPath(credential.sourcePath)
+        && (sealedLiveIds.has(id) || sealedDirs.has(this.homeOf(credential)))) continue
       // The archive keeps the copy a renewal was written with, and that copy
       // remembers the path it was read from (the app's live file). Offering it
       // beside the file that holds the same token made the ranking pick the app's
@@ -2041,6 +2383,12 @@ export class WorkBuddyAccountPool {
       // just taken over, because the age rule only applies to its own copies.
       if (found.some(entry => workbuddyAccountId(entry) === id && entry.accessToken === credential.accessToken)) continue
       found.push(credential)
+    }
+    for (const credential of found) {
+      const home = this.homeOf(credential)
+      if (sealedDirs.has(home) || unavailableDirs.has(home)) {
+        refreshBlockedIds.add(workbuddyAccountId(credential))
+      }
     }
 
     const byId = new Map<string, WorkBuddyAccount>()
@@ -2153,7 +2501,10 @@ export class WorkBuddyAccountPool {
     // to a snapshot it left behind. The pool may renew such an account into its
     // own directory, but the app is the one holding the session, so the panel
     // must not offer to delete it: those rows are not the pool's to remove.
-    this.appHeldIds = appHeld
+    this.appHeldFiles = appHeld
+    this.unknownLiveSignIn = unknownLiveSignIn
+    this.unknownLiveFiles = unknownLiveFiles
+    this.refreshBlockedIds = refreshBlockedIds
 
     // A stable order is what makes "prefer the first account" meaningful, and it
     // is a queue order, not the freshness rule: the live sign-in leads so the next
@@ -2180,7 +2531,8 @@ export class WorkBuddyAccountPool {
     // A directory set that changed while this walk was reading is not this
     // walk's answer: `applyConfig` already emptied the pool for the new set, and
     // assigning here would put the previous directory's accounts back.
-    if (!sameDirs(this.scanDirsFor(this.authDirs), dirs)) return this.accounts
+    if (!sameDirs(this.scanDirsFor(this.authDirs), dirs)
+      || rosterRevision !== this.rosterRevision) return this.accounts
     this.accounts = ordered
     // Kept for `penalize`, which records them so a later scan can tell a new
     // sign-in from the one that was refused.
@@ -2509,6 +2861,7 @@ export class WorkBuddyAccountPool {
    */
   async ensureFresh(account: WorkBuddyAccount, forced = false): Promise<KeepAliveOutcome> {
     if (this.client === undefined) return 'fresh'
+    if (this.refreshBlockedIds.has(account.id)) return 'fresh'
     const credential = account.credential
     const issuedAt = credential.lastRefreshAtMs ?? 0
     // Age, not just the expiry margin: a token with weeks left is still renewed
@@ -2558,16 +2911,34 @@ export class WorkBuddyAccountPool {
           // rode the revoked one until it was refreshed again.
           lastRefreshAtMs: Date.now(),
         }
-        // Kept in the archive as well. For an account whose sign-in file the
-        // client already overwrote, the archive is the only copy that survives a
-        // restart: leaving the superseded token there meant the account came back
-        // dead and held out until a manual re-login.
+        let written: boolean
+        try {
+          written = await this.renewOwnSignIn(credential, account.credential)
+        } catch (error) {
+          // The upstream minted this token and retired the old one, so throwing
+          // it away loses the account: the previous refresh token is spent, and
+          // the next renewal is refused. A disk that would not take the file
+          // (ENOSPC, a sharing violation past the retry budget) is not a reason
+          // to drop a credential that is the only working copy left. The archive
+          // is a separate document from the `.info` file, so it is written here
+          // even though the file is not; the return value still reports `failed`
+          // so the caller does not treat this as persisted.
+          this.logger?.warn?.(`${LOG_PREFIX}: could not persist the renewed token for ${accountLogTag(account.label)}; keeping it in memory and the archive`, error)
+          await this.archiveCredentials([account.credential]).catch((archiveError: unknown) => {
+            this.logger?.error?.(`${LOG_PREFIX}: could not archive the renewed token for ${accountLogTag(account.label)}`, archiveError)
+          })
+          throw error
+        }
+        if (!written) {
+          // A newer sign-in reached the same file while the refresh was open.
+          // Its token wins, and the scan below replaces this process's copy.
+          account.credential = credential
+          await this.scan()
+          return 'fresh'
+        }
+        // Kept after the file commit, so a refresh superseded by a re-login
+        // cannot enter the archive as the newest copy.
         await this.archiveCredentials([account.credential])
-        // A sign-in the plugin wrote is renewed in place. Without this the
-        // refreshed token lived only in memory and in the archive, the next scan
-        // read the old file back, and the renewal was lost: the stored expiry
-        // never moved, so the keepalive looked like it did nothing.
-        await this.renewOwnSignIn(account.credential)
         this.noRefreshWarned.delete(account.id)
         // A token the upstream minted is proof the sign-in works again, so a hold
         // that said otherwise is dropped here rather than at its cap: without this
@@ -2729,12 +3100,13 @@ export class WorkBuddyAccountPool {
 
   /** Diagnostics snapshot. Account-wide cooling count (per-model cooling excluded:
    *  the account as a whole stays usable when only one model is limited). */
-  status(): { count: number; cooling: number; lastScanAtMs: number } {
+  status(): { count: number; cooling: number; lastScanAtMs: number; scanning: boolean } {
     const now = Date.now()
     return {
       count: this.accounts.length,
       cooling: this.accounts.filter(account => account.cooldownUntilMs > now).length,
       lastScanAtMs: this.lastScanAtMs,
+      scanning: this.scanInflight !== undefined,
     }
   }
 }

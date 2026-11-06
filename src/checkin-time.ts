@@ -8,11 +8,6 @@
  * decision - the configured hours, the slot id, what is due right now - without
  * a clock to fake or a settings file to write.
  *
- * The cap on the configured hours is defensive rather than load-bearing - the
- * filter below already leaves at most 24 distinct values in 0..23 - but a host
- * entry that skipped it would disagree with this one about which hours are in
- * force, so the rule lives in one place.
- *
  * @module dsh-wtq-pool/checkin-time
  */
 
@@ -65,9 +60,8 @@ export function zonedDay(offset = 0): string {
  * is on but never fires would be worse than one that picks a sane time.
  */
 export function normaliseCheckinHours(raw: readonly unknown[]): number[] {
-  // `Number('')`, `Number(null)` and `Number(false)` are all 0, so a value that
-  // carries no time at all used to normalise to midnight and fire a check-in at
-  // 00:00. Only a number, or a string with digits in it, can name an hour.
+  // `Number('')`, `Number(null)` and `Number(false)` are all 0, so only a number
+  // or a non-empty string may name an hour; anything else would fire at 00:00.
   const hours = [...new Set(raw
     .filter((value) => typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))
     .map((value) => Math.floor(Number(value))))]
@@ -84,10 +78,10 @@ export function checkinSlotId(day: string, hour: number): string {
 /**
  * The slot to collect right now, or undefined when nothing is due.
  *
- * An hour is due once its time has passed - catch-up, deliberately: a machine
- * that slept through 09:00 still collects when it wakes instead of waiting for
- * tomorrow. The earliest unconsumed hour wins, so two configured hours still
- * give two passes a day.
+ * An hour stays due until its slot is consumed, so a machine that slept through
+ * 09:00 still collects when it wakes instead of waiting for tomorrow. The
+ * earliest unconsumed hour wins, so two configured hours still give two passes
+ * a day.
  */
 export function dueCheckinSlot(
   now: Date,

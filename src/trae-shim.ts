@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto'
 import type { TraeStreamEvent } from './trae-sse'
 import { SseDecoder, decodeTraeEvent } from './trae-sse'
 import { PEEK_MAX_BYTES, PEEK_MAX_CHUNKS, openAIFinishReason, redactSecrets, replaySource, retryAfterHeader, withRelayStream } from './loopback'
+import { readErrorBody } from './upstream'
 
 /** What the gateway must answer when Trae refuses inside the stream. */
 export interface TraeFailure {
@@ -21,6 +22,15 @@ export interface TraeFailure {
 export type TraeRelayErrorKind = 'hard_credit' | 'soft_rate' | 'authentication' | 'client' | 'server'
 
 /**
+ * The failure class of a refused peek, carried on the response the peek returns.
+ *
+ * A status code alone cannot separate "this sign-in answered nothing" from "the
+ * service is down for everyone": both are 502, and only the first belongs to
+ * the account. The gateway reads the class from this header.
+ */
+export const TRAE_FAILURE_KIND_HEADER = 'x-wtq-failure-kind'
+
+/**
  * Words a Trae refusal uses for a sign-in the upstream no longer accepts.
  *
  * Trae answers a stale login inside the stream, on the same `event: error`
@@ -30,6 +40,12 @@ export type TraeRelayErrorKind = 'hard_credit' | 'soft_rate' | 'authentication' 
  * every request paid one round trip and the healthy sign-ins beside it were
  * never tried. The Qoder path in this same plugin classifies the identical
  * frame as an authentication failure.
+ *
+ * The list is English because those are the sentences this plugin has seen on
+ * the wire. A code-less refusal in any other language falls to the `server`
+ * class below: the turn is answered 502 and no account is cooled. Widening the
+ * list needs a captured frame, because a phrase that also appears in a real
+ * outage would cool healthy sign-ins.
  */
 const TRAE_SIGN_IN_PATTERN = /login expired|not logged in|unauthori[sz]ed|invalid token|token.*(expire|invalid)|\b9095\b/i
 
@@ -282,6 +298,13 @@ export interface TraeRelayOptions {
    * behind at all. This is how the gateway still records it.
    */
   onFailure?: (error: unknown) => void
+  /**
+   * How long a refusal body may take to read before the socket is dropped.
+   *
+   * The shipped bound is ten seconds; this seam exists so the check that the
+   * bound is real does not have to sit it out.
+   */
+  refusalReadMs?: number
 }
 
 /**
@@ -453,6 +476,11 @@ export function bridgeTraeStream(
             if (cancelled) return
             if (!next.done) {
               for (const event of sse.push(decoder.decode(next.value, { stream: true }))) consume(event, controller)
+              // `done` closes the answer, not the connection: a frame that
+              // shares its chunk is still consumed above. A frame that arrives
+              // in a later chunk is not waited for, because a body the server
+              // leaves open would hold the turn open with it - the terminal
+              // marker is what a client finishes on.
               if (!upstreamDone) {
                 while (!cancelled && (controller.desiredSize ?? 1) <= 0) {
                   await waitForRoom()
@@ -531,11 +559,19 @@ export async function openTraeResponse(
     // The upstream's own HTTP status is already meaningful (401 means the
     // sign-in died, 429 a rate limit) and flattening it through the in-stream
     // code classifier would throw that away.
-    const detail = (await response.text().catch(() => '')).slice(0, 1024)
+    //
+    // The body is read to a bound rather than with `text()`: an error page that
+    // is huge, or one whose socket never closes, would otherwise hold this turn
+    // (and the account's whole timeout budget) before the 1024-byte preview was
+    // even cut. Qoder's relay reads its refusals the same way.
+    const detail = await readErrorBody(response, 1024, undefined, options.refusalReadMs)
     return Response.json(
       {
         error: {
-          message: detail === '' ? `Trae SOLO returned HTTP ${response.status}` : detail,
+          // Redacted here as well as by the gateway's writer: an echoed request
+          // in this body carries the header that was sent to Trae, and this
+          // response is a value other code paths may read directly.
+          message: detail === '' ? `Trae SOLO returned HTTP ${response.status}` : redactSecrets(detail),
           type: 'upstream_error',
           code: response.status,
         },
@@ -602,7 +638,31 @@ export async function openTraeResponse(
     const wait = retryAfterHeader(retryAfterSeconds)
     return Response.json(
       { error: { message: describeTraeFailure(failure), type: 'upstream_error', code: kind === 'hard_credit' ? 402 : status } },
-      { status, ...wait === undefined ? {} : { headers: { 'Retry-After': wait } } },
+      {
+        status,
+        headers: {
+          [TRAE_FAILURE_KIND_HEADER]: kind,
+          ...wait === undefined ? {} : { 'Retry-After': wait },
+        },
+      },
+    )
+  }
+  // A 200 whose body ended before a single frame is an upstream hiccup, not an
+  // answer: WorkBuddy answers the same shape the same way. Passing it through
+  // as a stream told the client the turn succeeded with nothing in it, so the
+  // account that hiccuped stayed at the head of the queue and the healthy
+  // sign-ins were never tried. A turn that did carry frames - a model that
+  // genuinely answered nothing, a tool call with no prose - is an answer and
+  // stays one, which is why the test is on the byte count and not on content.
+  if (failure === undefined && bufferedBytes === 0 && ended) {
+    await reader.cancel().catch(() => {})
+    // The class travels on the response so the gateway can tell this apart from
+    // an upstream that is down for everyone: an empty 200 is the account's
+    // answer, so the turn belongs to the next sign-in, while a 5xx is the
+    // service's and rotating only spends the healthy accounts on it.
+    return Response.json(
+      { error: { message: 'Trae SOLO returned an empty answer stream', type: 'upstream_error', code: 502 } },
+      { status: 502, headers: { [TRAE_FAILURE_KIND_HEADER]: 'empty_stream' } },
     )
   }
   const replayed = replaySource(buffered, reader, ended)

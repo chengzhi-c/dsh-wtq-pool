@@ -36,7 +36,7 @@ export default defineConfig([
     target: 'node22',
     dts: true,
     outExtensions: () => ({ js: '.js' }),
-    clean: true,
+    clean: false,
     sourcemap: false,
     deps: { neverBundle: [...HOST_EXTERNALS] },
   },

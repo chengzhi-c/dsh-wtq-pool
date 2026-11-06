@@ -245,12 +245,32 @@ function sendFile(res: ServerResponse, file: string, type: string): void {
  * The resolved path is proved to stay under `renderer/`, so a crafted request
  * cannot read a file elsewhere in the package or on disk.
  */
-function panelAsset(pluginRoot: string, name: string): string | undefined {
+export function panelAsset(pluginRoot: string, name: string): string | undefined {
   if (!/^[A-Za-z0-9._-]+$/.test(name)) return undefined
   const dir = path.join(pluginRoot, 'renderer')
   const full = path.join(dir, name)
   if (!full.startsWith(dir + path.sep)) return undefined
-  return fs.existsSync(full) ? full : undefined
+  try {
+    // Lexical containment does not hold through a junction or symlink. Resolve
+    // both boundaries before serving the file, then enforce the same package
+    // and renderer roots on the physical paths.
+    const packageRoot = fs.realpathSync(pluginRoot)
+    const rendererRoot = fs.realpathSync(dir)
+    const rendererInsidePackage = path.relative(packageRoot, rendererRoot)
+    const rendererEscapesPackage = rendererInsidePackage === '..'
+      || rendererInsidePackage.startsWith(`..${path.sep}`)
+    if (rendererInsidePackage === '' || rendererEscapesPackage
+      || path.isAbsolute(rendererInsidePackage)) return undefined
+    const resolved = fs.realpathSync(full)
+    const insideRenderer = path.relative(rendererRoot, resolved)
+    const assetEscapesRenderer = insideRenderer === '..' || insideRenderer.startsWith(`..${path.sep}`)
+    if (insideRenderer === '' || assetEscapesRenderer
+      || path.isAbsolute(insideRenderer)) return undefined
+    if (!fs.statSync(resolved).isFile()) return undefined
+    return resolved
+  } catch {
+    return undefined
+  }
 }
 /**
  * The panel page.

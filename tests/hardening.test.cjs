@@ -216,17 +216,23 @@ test('the signature scan is handed a module path 5.1 can load', async () => {
   const handed = spawns[0].options.env
   assert.notEqual(handed, undefined, 'the child must be handed an environment of our own, not the ambient one')
   const order = handed.PSModulePath.split(';')
-  assert.equal(order[0], modules, 'the 5.1 modules directory leads the path the child is given')
-  assert.ok(order.indexOf(modules) < order.indexOf(store),
-    'the system modules directory precedes the Store PowerShell 7 one, which is the whole fix')
-  assert.equal(order.length, ambient.split(';').length + 1,
-    'nothing is dropped: a user\'s own modules still resolve behind the system one')
-  assert.equal(signatureScanEnv({ SystemRoot: 'C:\\Windows', PSModulePath: ambient, PATH: 'unchanged' }).PATH, 'unchanged',
-    'the rest of the environment is passed through untouched')
-  assert.equal(signatureScanEnv({ SystemRoot: 'C:\\Windows', PSModulePath: order.join(';') }).PSModulePath, order.join(';'),
+  assert.equal(order[0], modules, 'the 5.1 modules directory is the module path the child is given')
+  // Nothing user-controlled reaches the child. An inherited `PSModulePath` names
+  // directories a user-level process can write, and PowerShell imports the first
+  // module it finds there: pinning the list is the point, not an accident.
+  assert.equal(order.includes(store), false, 'the Store module root is not inherited')
+  assert.equal(order.length, 1, 'the system module directory is the whole list')
+  assert.equal(signatureScanEnv({ SystemRoot: 'C:\\Windows', PSModulePath: ambient, PATH: 'unchanged' }).PATH,
+    path.join('C:\\Windows', 'System32'),
+    'a user PATH is replaced rather than passed through')
+  assert.equal(signatureScanEnv({ SystemRoot: 'C:\\Windows', PSModulePath: order.join(';') }).PSModulePath,
+    path.join('C:\\Windows', 'system32', 'WindowsPowerShell', 'v1.0', 'Modules'),
     'building it twice is a no-op, so the path cannot grow on every scan')
-  assert.equal(signatureScanEnv({ PATH: 'unchanged' }).PATH, 'unchanged',
-    'with no SystemRoot to derive from the environment is left as it is rather than given an invented path')
+  // On Windows the root comes from the object manager, not from the environment,
+  // so a caller-supplied PATH never decides where the child looks.
+  assert.equal(signatureScanEnv({ PATH: 'unchanged' }).PATH,
+    path.join(fs.realpathSync.native('\\\\?\\GLOBALROOT\\SystemRoot'), 'System32'),
+    'the ambient PATH does not reach the child on Windows')
 })
 
 /**
@@ -827,6 +833,10 @@ test('the panel page carries a strict policy and refuses a cross-site asker', as
  */
 test('the attachment store is resolved per call, not captured at build time', async () => {
   const { createProvider } = await import('@earendil-works/pi-ai')
+  // The real api object, not a stand-in: `createProvider` validates that it
+  // carries a callable `stream`, so an empty object is refused before the code
+  // under test runs at all.
+  const { openAICompletionsApi } = await import('@earendil-works/pi-ai/api/openai-completions.lazy')
   const { resolveRetryPolicy } = require('@deepseek-ai/dsh-llm')
   const source = fs.readFileSync(path.join(root, 'src/index.ts'), 'utf8')
   const functions = ['toPiModel', 'buildAdapter'].map((name) => {
@@ -846,7 +856,7 @@ test('the attachment store is resolved per call, not captured at build time', as
   RecordingAdapter.prototype.stream = () => {}
   const context = vm.createContext({
     module: { exports: {} }, exports: {}, PiAiAdapter: RecordingAdapter, createProvider, resolveRetryPolicy,
-    withDelegateShape: (value) => value, openAICompletionsApi: () => ({}),
+    withDelegateShape: (value) => value, openAICompletionsApi,
     resolveImageAttachmentAccess: () => { throw new Error('this case must not touch images') },
     THINKING_LEVELS: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     NO_COST: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, STREAM_IDLE_TIMEOUT_MS: 300000,
@@ -4442,6 +4452,7 @@ test('a service stop releases the refresh slot', async () => {
   const context = vm.createContext({
     console,
     ...state,
+    core: { pool: { clear: () => stopped.push('pool') } },
     clearTimeout: () => { stopped.push('timer') },
     stopAutoCheckin: () => stopped.push('checkin'),
     stopAccountWatch: () => stopped.push('accountWatch'),
@@ -4457,6 +4468,13 @@ test('a service stop releases the refresh slot', async () => {
     gatewayStartFailures: new Map([['cn', 'listen EADDRINUSE']]),
     sourceStartFailures: new Map([['trae:cn', 'listen EADDRINUSE']]),
     stopRuntime: async () => {},
+    // The teardown walks the trackers it hands the closing runtimes to. They
+    // only have to yield something awaitable here; what each one does is the
+    // subject of its own test.
+    trackRuntimeStop: () => Promise.resolve(),
+    trackPendingRuntime: () => {},
+    trackSourceStop: () => Promise.resolve(),
+    trackPendingSource: () => {},
     log: () => {},
     safeMessage: (error) => String(error?.message ?? error),
   })
@@ -4473,6 +4491,8 @@ test('a service stop releases the refresh slot', async () => {
     'a start failure belongs to the activation that produced it')
   assert.equal(context.sourceStartFailures.size, 0,
     'the same for the Trae/Qoder regions that could not bind')
+  assert.ok(stopped.includes('pool'),
+    'the roster is dropped, so the next activation rescans instead of serving the retired one')
 })
 
 /**

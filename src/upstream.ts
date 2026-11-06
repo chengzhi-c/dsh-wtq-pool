@@ -51,10 +51,8 @@ export interface WorkBuddyUpstreamModel {
   contextWindow: number
   maxTokens: number
   creditMultiplier?: number
-  /** Upstream image-input flag. Both gateways spell it `supportsImages`; some entries
-   * also carry `disabledMultimodal`, the negative spelling. Reading anything else
-   * reported every model as text-only, which made a vision shim register a second
-   * route under the same display name and split the model picker group.
+  /** Upstream image-input flag, as both gateways spell it. Absent when the
+   * vendor did not say, in which case the model is treated as text-only.
    */
   supportsImages?: boolean
   reasoning?: { supportedEfforts?: readonly string[]; defaultEffort?: string; canDisableThinking?: boolean }

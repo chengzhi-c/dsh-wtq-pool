@@ -19,29 +19,9 @@ const { test } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { registerHooks } = require('node:module')
-const { fileURLToPath } = require('node:url')
-const ts = require('typescript')
+const { root, transpile } = require('./ts-loader.cjs')
 
-const root = path.resolve(__dirname, '..')
-const transpile = (source) => ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },
-}).outputText
-
-registerHooks({
-  resolve(specifier, context, next) {
-    const ownSource = context.parentURL?.startsWith('file:') && fileURLToPath(context.parentURL).startsWith(path.join(root, 'src') + path.sep)
-    return next(ownSource && specifier.startsWith('.') && path.extname(specifier) === '' ? specifier + '.ts' : specifier, context)
-  },
-  load(url, context, next) {
-    if (url.startsWith('file:') && url.endsWith('.ts')) return {
-      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')),
-    }
-    return next(url, context)
-  },
-})
-
-const { WorkBuddyAccountPool, ownSignInDir, writeOwnSignIn } = require('../src/accounts.ts')
+const { WorkBuddyAccountPool, ownSignInDir, parseWorkBuddyAuth, writeOwnSignIn } = require('../src/accounts.ts')
 
 const DAY = 24 * 60 * 60 * 1000
 const LIVE_NAME = 'workbuddy-desktop.info'
@@ -83,6 +63,289 @@ function machine(label, { snapshots = [], live = null, issuedAgo = 19 * DAY } = 
 }
 
 const cleanup = async (dataDir) => { await fs.promises.rm(dataDir, { recursive: true, force: true }) }
+
+test('a serialized encrypted sign-in is opened or kept sealed', async () => {
+  const atRest = require('../src/at-rest.ts')
+  const originalOpener = atRest.encryptedFieldOpener
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-serialized-'))
+  const wrap = (value) => JSON.stringify({ $wbEncrypted: 1, envelope: value })
+  const document = JSON.stringify({
+    auth: { accessToken: wrap('access'), refreshToken: wrap('refresh'), expiresAt: Date.now() + DAY },
+    account: { uin: 'fixture', nickname: wrap('name') },
+  })
+  try {
+    assert.equal(parseWorkBuddyAuth(document, 'fixture'), undefined, 'a sealed value is not a plaintext token')
+    assert.equal(parseWorkBuddyAuth(JSON.stringify({ accessToken: '{"plain":true}' }), 'fixture').accessToken, '{"plain":true}')
+    atRest.encryptedFieldOpener = async () => (field) => `opened-${field.envelope}`
+    fs.writeFileSync(path.join(dataDir, LIVE_NAME), document)
+    const pool = new WorkBuddyAccountPool({ authDirs: [dataDir] })
+    const [account] = await pool.scan()
+    assert.equal(account.credential.accessToken, 'opened-access')
+    assert.equal(account.credential.refreshToken, 'opened-refresh')
+    assert.equal(account.credential.nickname, 'opened-name')
+    atRest.encryptedFieldOpener = async () => undefined
+    assert.equal((await pool.scan())[0].credential.accessToken, 'opened-access', 'an unreadable sealed value retains the incumbent')
+  } finally {
+    atRest.encryptedFieldOpener = originalOpener
+    await cleanup(dataDir)
+  }
+})
+
+test('damaged serialized encrypted tokens cannot replace or enter the archive', async () => {
+  const atRest = require('../src/at-rest.ts')
+  const originalOpener = atRest.encryptedFieldOpener
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-damaged-sealed-'))
+  const desktop = path.join(dataDir, 'desktop')
+  const live = path.join(desktop, LIVE_NAME)
+  const now = Date.now()
+  const document = (accessToken, issued) => JSON.stringify({
+    auth: { accessToken, refreshToken: 'fixture-refresh', expiresAt: now + DAY, lastRefreshTime: issued },
+    account: { uin: 'fixture' },
+  })
+  fs.mkdirSync(desktop)
+  fs.writeFileSync(live, document('fixture-token', now - 60000))
+  atRest.encryptedFieldOpener = async () => undefined
+  try {
+    const pool = new WorkBuddyAccountPool({ authDirs: [desktop], dataPath: () => dataDir })
+    assert.equal((await pool.scan())[0].credential.accessToken, 'fixture-token')
+    for (const damaged of [
+      '{"$wbEncrypted":1,"envelope":',
+      '{"$wbEncrypted":1}',
+      '{"$wbEncrypted":1,"envelope":7}',
+      '{"$wbEncrypted":1,"envelope":"fixture","extra":true}',
+    ]) {
+      fs.writeFileSync(live, document(damaged, now))
+      assert.equal((await pool.scan())[0].credential.accessToken, 'fixture-token')
+      const archive = JSON.parse(fs.readFileSync(path.join(dataDir, 'credentials-archive.json'), 'utf8'))
+      assert.equal(archive.entries[0].accessToken, 'fixture-token')
+    }
+    const plain = '{"plain":"ordinary"}'
+    assert.equal(parseWorkBuddyAuth(document(plain, now), 'fixture').accessToken, plain)
+  } finally {
+    atRest.encryptedFieldOpener = originalOpener
+    await cleanup(dataDir)
+  }
+})
+
+test('an unreadable live sign-in stays protected from deletion across scans', async () => {
+  const atRest = require('../src/at-rest.ts')
+  const originalOpener = atRest.encryptedFieldOpener
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-sealed-owner-'))
+  const desktop = path.join(dataDir, 'desktop')
+  const live = path.join(desktop, LIVE_NAME)
+  const now = Date.now()
+  const document = (accessToken) => JSON.stringify({
+    auth: { accessToken, refreshToken: 'fixture-refresh', expiresAt: now + DAY, lastRefreshTime: now - 60000 },
+    account: { uin: 'fixture' },
+  })
+  fs.mkdirSync(desktop)
+  fs.writeFileSync(live, document('fixture-desktop'))
+  atRest.encryptedFieldOpener = async () => undefined
+  try {
+    await writeOwnSignIn(ownSignInDir(dataDir), {
+      region: 'cn', accessToken: 'fixture-owned', refreshToken: 'fixture-refresh',
+      expiresAtMs: now + DAY, lastRefreshAtMs: now, domain: 'codebuddy.cn',
+      uin: 'fixture', uid: '', enterpriseId: '', nickname: '',
+    })
+    const pool = new WorkBuddyAccountPool({ authDirs: [desktop], dataPath: () => dataDir })
+    const [account] = await pool.scan()
+    assert.equal(account.credential.accessToken, 'fixture-owned')
+    assert.equal(pool.ownsSignIn(account.id), false)
+    const wrapper = { $wbEncrypted: 1, envelope: 'fixture-envelope' }
+    for (const value of [JSON.stringify(wrapper), wrapper]) {
+      fs.writeFileSync(live, document(value))
+      for (let scan = 0; scan < 2; scan += 1) {
+        await pool.scan()
+        assert.equal(pool.ownsSignIn(account.id), false)
+        assert.equal(await pool.removeOwnSignIn(account.id), false)
+      }
+    }
+    fs.unlinkSync(live)
+    fs.writeFileSync(path.join(desktop, 'snapshot.info'), document(JSON.stringify(wrapper)))
+    await pool.scan()
+    assert.equal(pool.ownsSignIn(account.id), true, 'another sealed file does not keep a removed live file active')
+  } finally {
+    atRest.encryptedFieldOpener = originalOpener
+    await cleanup(dataDir)
+  }
+})
+
+test('a sealed live sign-in is protected on a cold scan, including when its identity is unavailable', async () => {
+  const atRest = require('../src/at-rest.ts')
+  const originalOpener = atRest.encryptedFieldOpener
+  const now = Date.now()
+  const wrapper = { $wbEncrypted: 1, envelope: 'fixture-envelope' }
+  for (const value of [JSON.stringify(wrapper), wrapper]) {
+    const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-cold-sealed-owner-'))
+    const desktop = path.join(dataDir, 'desktop')
+    const live = path.join(desktop, LIVE_NAME)
+    fs.mkdirSync(desktop)
+    fs.writeFileSync(live, JSON.stringify({
+      auth: { accessToken: value, refreshToken: 'fixture-refresh', expiresAt: now + DAY },
+      account: { uin: 'fixture' },
+    }))
+    try {
+      await writeOwnSignIn(ownSignInDir(dataDir), {
+        region: 'cn', accessToken: 'fixture-owned', refreshToken: 'fixture-refresh',
+        expiresAtMs: now + DAY, domain: 'codebuddy.cn',
+        uin: 'fixture', uid: '', enterpriseId: '', nickname: '',
+      })
+      await writeOwnSignIn(ownSignInDir(dataDir), {
+        region: 'cn', accessToken: 'other-owned', refreshToken: 'other-refresh',
+        expiresAtMs: now + DAY, domain: 'codebuddy.cn',
+        uin: 'other', uid: '', enterpriseId: '', nickname: '',
+      })
+      atRest.encryptedFieldOpener = async () => undefined
+      const pool = new WorkBuddyAccountPool({ authDirs: [desktop], dataPath: () => dataDir })
+      await pool.scan()
+      const protectedAccount = pool.list().find(account => account.credential.accessToken === 'fixture-owned')
+      const unrelatedAccount = pool.list().find(account => account.credential.accessToken === 'other-owned')
+      assert.ok(protectedAccount)
+      assert.ok(unrelatedAccount)
+      assert.equal(pool.ownsSignIn(protectedAccount.id), false)
+      assert.equal(await pool.removeOwnSignIn(protectedAccount.id), false)
+      assert.equal(pool.ownsSignIn(unrelatedAccount.id), true, 'an unrelated own account stays removable')
+
+      fs.writeFileSync(live, JSON.stringify({
+        auth: { accessToken: value, refreshToken: 'fixture-refresh', expiresAt: now + DAY },
+        account: {},
+      }))
+      await pool.scan()
+      assert.equal(pool.ownsSignIn(protectedAccount.id), false)
+      assert.equal(pool.ownsSignIn(unrelatedAccount.id), false,
+        'an unidentified live account must make deletion conservative')
+
+      const fileSystem = require('node:fs/promises')
+      const realReaddir = fileSystem.readdir
+      fileSystem.readdir = async (directory, ...args) => {
+        if (path.resolve(directory) === path.resolve(desktop)) {
+          const error = new Error('fixture directory is unavailable')
+          error.code = 'EACCES'
+          throw error
+        }
+        return realReaddir(directory, ...args)
+      }
+      try {
+        await pool.scan()
+        assert.equal(pool.ownsSignIn(unrelatedAccount.id), false,
+          'an inaccessible live directory must not release deletion protection')
+      } finally {
+        fileSystem.readdir = realReaddir
+      }
+
+      const realReadFile = fileSystem.readFile
+      fileSystem.readFile = async (file, ...args) => {
+        if (path.resolve(file) === path.resolve(live)) {
+          const error = new Error('fixture live file is unavailable')
+          error.code = 'EPERM'
+          throw error
+        }
+        return realReadFile(file, ...args)
+      }
+      try {
+        await pool.scan()
+        assert.equal(pool.ownsSignIn(unrelatedAccount.id), false,
+          'an inaccessible live file must not release deletion protection')
+        assert.ok(pool.list().some(account => account.id === unrelatedAccount.id),
+          'an inaccessible live file must not clear the accounts in its directory')
+      } finally {
+        fileSystem.readFile = realReadFile
+      }
+
+      fs.writeFileSync(live, '{')
+      await pool.scan()
+      assert.equal(pool.ownsSignIn(unrelatedAccount.id), false,
+        'a live file being rewritten must not release deletion protection')
+
+      fs.writeFileSync(live, JSON.stringify({ auth: { accessToken: '' }, account: {} }))
+      await pool.scan()
+      assert.equal(pool.ownsSignIn(protectedAccount.id), true,
+        'an explicit sign-out must release deletion protection')
+      assert.equal(pool.ownsSignIn(unrelatedAccount.id), true)
+
+      fs.unlinkSync(live)
+      await pool.scan()
+      assert.equal(pool.ownsSignIn(protectedAccount.id), true, 'removing the live file releases deletion')
+      assert.equal(pool.ownsSignIn(unrelatedAccount.id), true)
+    } finally {
+      atRest.encryptedFieldOpener = originalOpener
+      await cleanup(dataDir)
+    }
+  }
+})
+
+test('refresh cache preserves unreadable encrypted values and merges recovered values', async () => {
+  const atRest = require('../src/at-rest.ts')
+  const originalOpener = atRest.encryptedFieldOpener
+  const now = Date.now()
+  try {
+    for (const value of [
+      JSON.stringify({ $wbEncrypted: 1, envelope: 'fixture-refresh' }),
+      { $wbEncrypted: 1, envelope: 'fixture-refresh' },
+    ]) {
+      const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-refresh-cache-'))
+      const live = path.join(dataDir, LIVE_NAME)
+      fs.writeFileSync(live, JSON.stringify({
+        auth: {
+          accessToken: 'fixture-access', refreshToken: value,
+          expiresAt: now + DAY, refreshExpiresAt: now + DAY, lastRefreshTime: now - 60_000,
+        },
+        account: { uin: 'fixture' },
+      }))
+      try {
+        const pool = new WorkBuddyAccountPool({ authDirs: [dataDir], dataPath: () => dataDir })
+        atRest.encryptedFieldOpener = async () => undefined
+        assert.equal((await pool.scan())[0].credential.refreshToken, '')
+
+        atRest.encryptedFieldOpener = async () => field => `opened-${field.envelope}`
+        assert.equal((await pool.scan())[0].credential.refreshToken, 'opened-fixture-refresh')
+        let archive = JSON.parse(fs.readFileSync(path.join(dataDir, 'credentials-archive.json'), 'utf8'))
+        assert.equal(archive.entries[0].refreshToken, 'opened-fixture-refresh')
+
+        atRest.encryptedFieldOpener = async () => undefined
+        assert.equal((await pool.scan())[0].credential.refreshToken, 'opened-fixture-refresh')
+        archive = JSON.parse(fs.readFileSync(path.join(dataDir, 'credentials-archive.json'), 'utf8'))
+        assert.equal(archive.entries[0].refreshToken, 'opened-fixture-refresh')
+      } finally {
+        await cleanup(dataDir)
+      }
+    }
+  } finally {
+    atRest.encryptedFieldOpener = originalOpener
+  }
+})
+
+test('explicitly empty or expired refresh tokens clear a cached refresh token', async () => {
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-refresh-clear-'))
+  const live = path.join(dataDir, LIVE_NAME)
+  const now = Date.now()
+  const write = (refreshToken, refreshExpiresAt) => fs.writeFileSync(live, JSON.stringify({
+    auth: {
+      accessToken: 'fixture-access', refreshToken,
+      expiresAt: now + DAY, refreshExpiresAt, lastRefreshTime: now - 60_000,
+    },
+    account: { uin: 'fixture' },
+  }))
+  const pool = new WorkBuddyAccountPool({ authDirs: [dataDir], dataPath: () => dataDir })
+  try {
+    write('fixture-refresh', now + DAY)
+    assert.equal((await pool.scan())[0].credential.refreshToken, 'fixture-refresh')
+
+    write('', now + DAY)
+    assert.equal((await pool.scan())[0].credential.refreshToken, '')
+
+    write('fixture-refresh', now + DAY)
+    assert.equal((await pool.scan())[0].credential.refreshToken, 'fixture-refresh')
+    write('fixture-refresh', now - DAY)
+    const [account] = await pool.scan()
+    assert.equal(account.credential.refreshToken, '')
+    assert.equal(account.credential.refreshExpiresAtMs, undefined)
+    const archive = JSON.parse(fs.readFileSync(path.join(dataDir, 'credentials-archive.json'), 'utf8'))
+    assert.equal(archive.entries[0].refreshToken, '')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
 
 test('an identity-less snapshot is not copied again on every scan', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-noid-'))
@@ -456,6 +719,39 @@ test('a rescan after the pool renews the app sign-in still refuses the delete', 
   }
 })
 
+test('an unreadable live sign-in keeps its renewed account out of keep-alive', async () => {
+  const { pool, dataDir, desktop } = machine('unreadable-live-refresh', {
+    snapshots: [],
+    live: ['90000002044', 'Unreadable'],
+  })
+  const [account] = await pool.scan()
+  const live = path.join(desktop, LIVE_NAME)
+  const fsp = require('node:fs/promises')
+  const originalRead = fsp.readFile
+  let refreshes = 0
+  pool.client.refreshToken = async () => {
+    refreshes += 1
+    return { accessToken: `renewed-${refreshes}`, refreshToken: `refresh-${refreshes}`, expiresInSec: 28 * DAY }
+  }
+  try {
+    assert.equal(await pool.ensureFresh(account, true), 'refreshed')
+    fsp.readFile = async (file, ...rest) => {
+      if (path.resolve(String(file)) === path.resolve(live)) {
+        const denied = new Error('access denied')
+        denied.code = 'EPERM'
+        throw denied
+      }
+      return originalRead(file, ...rest)
+    }
+    const [after] = await pool.scan()
+    assert.equal(await pool.ensureFresh(after, true), 'fresh')
+    assert.equal(refreshes, 1, 'a live file the app still holds but cannot be read must block another renewal')
+  } finally {
+    fsp.readFile = originalRead
+    await cleanup(dataDir)
+  }
+})
+
 test('the international live sign-in is left where the client keeps it', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-global-'))
   const desktop = path.join(dataDir, 'desktop')
@@ -553,6 +849,110 @@ test('a failed read of the deleted sign-ins does not undo the delete', async () 
     assert.deepEqual(await pool.scan(), [], 'a read that failed leaves the delete in force')
   } finally {
     fsp.readFile = original
+    await cleanup(dataDir)
+  }
+})
+
+test('a cold pool does not restore a deleted account when its tombstone is unreadable', async () => {
+  const { pool, dataDir, desktop } = machine('tombstone-cold-busy', {
+    snapshots: [['90000002401', 'Deleted']],
+  })
+  const [account] = await pool.scan()
+  const fsp = require('node:fs/promises')
+  const original = fsp.readFile
+  try {
+    assert.equal(await pool.removeOwnSignIn(account.id), true)
+    fsp.readFile = async (file, ...rest) => {
+      if (String(file).includes('deleted-signins')) {
+        const busy = new Error('resource busy')
+        busy.code = 'EBUSY'
+        throw busy
+      }
+      return original(file, ...rest)
+    }
+    const restarted = new WorkBuddyAccountPool({
+      authDirs: [desktop, path.join(dataDir, 'signins')],
+      dataPath: () => dataDir,
+    })
+    assert.deepEqual(await restarted.scan(), [],
+      'an unknown tombstone set must keep a cold pool empty')
+  } finally {
+    fsp.readFile = original
+    await cleanup(dataDir)
+  }
+})
+
+test('an unconfirmed tombstone state cannot reuse an old empty cache', async (t) => {
+  for (const failure of ['stat', 'read']) {
+    await t.test(failure, async () => {
+      const { pool, dataDir, desktop, signins } = machine(`tombstone-stale-cache-${failure}`, {
+        snapshots: [['90000002403', 'Deleted']],
+      })
+      const [account] = await pool.scan()
+      const other = new WorkBuddyAccountPool({
+        authDirs: [desktop, signins],
+        dataPath: () => dataDir,
+      })
+      await other.scan()
+      assert.equal(await other.removeOwnSignIn(account.id), true)
+      pool.clear()
+
+      const fsp = require('node:fs/promises')
+      const fileName = path.join(dataDir, 'deleted-signins.json')
+      const original = fsp[failure]
+      fsp[failure] = async (file, ...rest) => {
+        if (path.resolve(String(file)) === path.resolve(fileName)) {
+          const error = new Error(`fixture ${failure} failed`)
+          error.code = failure === 'stat' ? 'EACCES' : 'EBUSY'
+          throw error
+        }
+        return original(file, ...rest)
+      }
+      try {
+        assert.deepEqual(await pool.scan(), [],
+          `a failed ${failure} must not make an older empty cache authoritative`)
+      } finally {
+        fsp[failure] = original
+        await cleanup(dataDir)
+      }
+    })
+  }
+})
+
+test('a scan that exceeds the delete wait cannot restore the deleted account', async () => {
+  const { pool, dataDir } = machine('delete-scan-timeout', {
+    snapshots: [['90000002402', 'Deleted']],
+  })
+  const [account] = await pool.scan()
+  let releaseArchive
+  let archiveStarted
+  const archiveGate = new Promise((resolve) => { releaseArchive = resolve })
+  const started = new Promise((resolve) => { archiveStarted = resolve })
+  const originalArchive = pool.archiveCredentials
+  pool.archiveCredentials = async (...args) => {
+    archiveStarted()
+    await archiveGate
+    return originalArchive.apply(pool, args)
+  }
+  const realSetTimeout = global.setTimeout
+  let racing
+  try {
+    global.setTimeout = (callback, delay, ...args) =>
+      realSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args)
+    racing = pool.scan()
+    await started
+    assert.equal(await pool.removeOwnSignIn(account.id), true)
+    releaseArchive()
+    await racing
+    await new Promise((resolve) => setImmediate(resolve))
+    await pool.archiveQueue.catch(() => {})
+    assert.deepEqual(pool.list(), [],
+      'a scan that passed the tombstone read before the delete must not assign afterwards')
+  } finally {
+    releaseArchive()
+    global.setTimeout = realSetTimeout
+    await racing?.catch(() => {})
+    await pool.archiveQueue.catch(() => {})
     await cleanup(dataDir)
   }
 })
@@ -781,5 +1181,417 @@ test('without a data directory nothing is taken over', async () => {
     assert.equal(fs.readdirSync(desktop).length, 1, 'and nothing was written')
   } finally {
     await fs.promises.rm(desktop, { recursive: true, force: true })
+  }
+})
+
+test('a sealed live sign-in blocks same-account snapshot takeover', async () => {
+  const atRest = require('../src/at-rest.ts')
+  const originalOpener = atRest.encryptedFieldOpener
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-sealed-snapshot-'))
+  const desktop = path.join(dataDir, 'desktop')
+  const uid = '90000006001'
+  fs.mkdirSync(desktop)
+  fs.writeFileSync(path.join(desktop, 'workbuddy-desktop-2026-10-06T10-07-06-90000006001.info'), JSON.stringify({
+    auth: {
+      accessToken: 'old-access', refreshToken: 'old-refresh', expiresAt: Date.now() + 9 * DAY,
+      domain: 'www.codebuddy.cn', lastRefreshTime: Date.now() - 9 * DAY,
+    },
+    account: { uin: uid },
+  }))
+  fs.writeFileSync(path.join(desktop, LIVE_NAME), JSON.stringify({
+    auth: {
+      accessToken: { $wbEncrypted: 1, envelope: 'sealed-access' },
+      refreshToken: { $wbEncrypted: 1, envelope: 'sealed-refresh' },
+      expiresAt: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn', lastRefreshTime: Date.now(),
+    },
+    account: { uin: uid },
+  }))
+  atRest.encryptedFieldOpener = async () => undefined
+  let refreshes = 0
+  const pool = new WorkBuddyAccountPool({
+    authDirs: [desktop],
+    dataPath: () => dataDir,
+    client: { refreshToken: async () => { refreshes += 1; return { accessToken: 'renewed' } } },
+  })
+  try {
+    assert.deepEqual(await pool.scan(), [])
+    assert.equal(fs.existsSync(ownSignInDir(dataDir)), false, 'the historical snapshot is not claimed')
+    assert.equal(refreshes, 0, 'an unreadable live session is not refreshed')
+  } finally {
+    atRest.encryptedFieldOpener = originalOpener
+    await cleanup(dataDir)
+  }
+})
+
+test('a historical sealed snapshot does not block a readable sign-in refresh', async () => {
+  const atRest = require('../src/at-rest.ts')
+  const originalOpener = atRest.encryptedFieldOpener
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-sealed-history-'))
+  const desktop = path.join(dataDir, 'desktop')
+  const signins = ownSignInDir(dataDir)
+  const uid = '90000006010'
+  fs.mkdirSync(desktop)
+  fs.writeFileSync(path.join(desktop, `workbuddy-desktop-2026-10-06T10-07-06-${uid}.info`), JSON.stringify({
+    auth: {
+      accessToken: { $wbEncrypted: 1, envelope: 'sealed-history' },
+      refreshToken: 'sealed-refresh', expiresAt: Date.now() + 9 * DAY,
+      domain: 'www.codebuddy.cn', lastRefreshTime: Date.now() - DAY,
+    },
+    account: { uin: uid },
+  }))
+  await writeOwnSignIn(signins, {
+    accessToken: 'readable-token', refreshToken: 'readable-refresh',
+    expiresAtMs: Date.now() + 1000, domain: 'www.codebuddy.cn',
+    uin: uid, uid: '', nickname: 'Readable', enterpriseId: '',
+    lastRefreshAtMs: Date.now() - DAY,
+  })
+  atRest.encryptedFieldOpener = async () => undefined
+  let refreshes = 0
+  const pool = new WorkBuddyAccountPool({
+    authDirs: [desktop, signins],
+    dataPath: () => dataDir,
+    client: {
+      refreshToken: async () => {
+        refreshes += 1
+        return { accessToken: 'refreshed-token', refreshToken: 'refreshed-refresh', expiresInSec: 3600 }
+      },
+    },
+  })
+  try {
+    const [account] = await pool.scan()
+    assert.equal(account.credential.accessToken, 'readable-token')
+    assert.equal(await pool.ensureFresh(account, true), 'refreshed')
+    assert.equal(refreshes, 1,
+      'a sealed snapshot that is not the current source must not block a readable account')
+  } finally {
+    atRest.encryptedFieldOpener = originalOpener
+    await cleanup(dataDir)
+  }
+})
+
+test('an older refresh result cannot overwrite a newer sign-in', async () => {
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-refresh-login-'))
+  const signins = ownSignInDir(dataDir)
+  const signIn = (accessToken, lastRefreshAtMs) => ({
+    accessToken, refreshToken: `refresh-${accessToken}`, expiresAtMs: Date.now() + 9 * DAY,
+    domain: 'www.codebuddy.cn', uin: '90000006002', uid: '', nickname: 'Fixture',
+    enterpriseId: '', lastRefreshAtMs,
+  })
+  let releaseRefresh
+  let refreshStarted
+  const started = new Promise(resolve => { refreshStarted = resolve })
+  const pool = new WorkBuddyAccountPool({
+    authDirs: [signins],
+    dataPath: () => dataDir,
+    client: {
+      refreshToken: async () => {
+        refreshStarted()
+        await new Promise(resolve => { releaseRefresh = resolve })
+        return { accessToken: 'old-refresh-result', refreshToken: 'rotated-refresh', expiresInSec: 3600 }
+      },
+    },
+  })
+  try {
+    const file = await writeOwnSignIn(signins, signIn('old-access', Date.now() - DAY))
+    const [account] = await pool.scan()
+    const refreshing = pool.refreshAccount(account.id)
+    await started
+    await writeOwnSignIn(signins, signIn('new-login', Date.now()))
+    releaseRefresh()
+    assert.equal(await refreshing, true)
+    const stored = parseWorkBuddyAuth(fs.readFileSync(file, 'utf8'), file)
+    assert.equal(stored.accessToken, 'new-login')
+    assert.equal(pool.list()[0].credential.accessToken, 'new-login')
+  } finally {
+    releaseRefresh?.()
+    await cleanup(dataDir)
+  }
+})
+
+test('a Windows sharing violation does not lose a renewed token', { skip: process.platform !== 'win32' }, async () => {
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-refresh-retry-'))
+  const signins = ownSignInDir(dataDir)
+  const pool = new WorkBuddyAccountPool({
+    authDirs: [signins],
+    dataPath: () => dataDir,
+    client: {
+      refreshToken: async () => ({
+        accessToken: 'retried-token',
+        refreshToken: 'retried-refresh',
+        expiresInSec: 3600,
+      }),
+    },
+  })
+  let originalRename
+  try {
+    const file = await writeOwnSignIn(signins, {
+      accessToken: 'expiring-access',
+      refreshToken: 'expiring-refresh',
+      expiresAtMs: Date.now() + 1_000,
+      domain: 'www.codebuddy.cn',
+      uin: '90000006003',
+      uid: '',
+      nickname: 'Retry',
+      enterpriseId: '',
+      lastRefreshAtMs: Date.now() - DAY,
+    })
+    const [account] = await pool.scan()
+    const fsp = require('node:fs/promises')
+    originalRename = fsp.rename
+    let failures = 2
+    fsp.rename = async (from, to, ...rest) => {
+      if (failures > 0 && path.resolve(String(to)) === path.resolve(file)) {
+        failures -= 1
+        const busy = new Error('target is temporarily open')
+        busy.code = 'EPERM'
+        throw busy
+      }
+      return originalRename(from, to, ...rest)
+    }
+
+    assert.equal(await pool.ensureFresh(account, true), 'refreshed')
+    assert.equal(failures, 0, 'the replacement used its bounded retries')
+    assert.equal(parseWorkBuddyAuth(fs.readFileSync(file, 'utf8'), file).accessToken, 'retried-token')
+    assert.equal(fs.readdirSync(signins).some(name => name.endsWith('.tmp')), false)
+  } finally {
+    if (originalRename !== undefined) require('node:fs/promises').rename = originalRename
+    await cleanup(dataDir)
+  }
+})
+
+test('two pools merge archive writes instead of losing one', async () => {
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-archive-lock-'))
+  const left = path.join(dataDir, 'left')
+  const right = path.join(dataDir, 'right')
+  fs.mkdirSync(left)
+  fs.mkdirSync(right)
+  const card = (uid, token) => JSON.stringify({
+    auth: {
+      accessToken: token, refreshToken: `refresh-${uid}`, expiresAt: Date.now() + 9 * DAY,
+      domain: 'www.codebuddy.cn', lastRefreshTime: Date.now(),
+    },
+    account: { uin: uid },
+  })
+  fs.writeFileSync(path.join(left, LIVE_NAME), card('90000006003', 'left-token'))
+  fs.writeFileSync(path.join(right, LIVE_NAME), card('90000006004', 'right-token'))
+  const make = (authDir) => new WorkBuddyAccountPool({ authDirs: [authDir], dataPath: () => dataDir })
+  const fsp = require('node:fs/promises')
+  const realRename = fsp.rename
+  let releaseRename
+  let renameStarted
+  const started = new Promise(resolve => { renameStarted = resolve })
+  let blocked = false
+  fsp.rename = async (from, to, ...rest) => {
+    if (!blocked && path.basename(String(to)) === 'credentials-archive.json') {
+      blocked = true
+      renameStarted()
+      await new Promise(resolve => { releaseRename = resolve })
+    }
+    return realRename(from, to, ...rest)
+  }
+  try {
+    const first = make(left).scan()
+    await started
+    const second = make(right).scan()
+    releaseRename()
+    await Promise.all([first, second])
+    const archive = JSON.parse(fs.readFileSync(path.join(dataDir, 'credentials-archive.json'), 'utf8'))
+    assert.equal(archive.entries.length, 2)
+  } finally {
+    fsp.rename = realRename
+    releaseRename?.()
+    await cleanup(dataDir)
+  }
+})
+
+test('a delete does not run without its file lock', async () => {
+  const { pool, dataDir } = machine('delete-lock-failure', { snapshots: [['90000006005', 'Locked']] })
+  const [account] = await pool.scan()
+  const lock = path.join(dataDir, 'deleted-signins.json.lock')
+  fs.mkdirSync(lock)
+  try {
+    await assert.rejects(pool.removeOwnSignIn(account.id))
+    assert.equal(fs.existsSync(account.credential.sourcePath), true)
+    assert.equal((await pool.scan()).some((entry) => entry.id === account.id), true,
+      'a failed lock must not hide the account from the next scan')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+test('an unreadable desktop directory blocks deletion on a cold scan', async () => {
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-cold-unreadable-'))
+  const desktop = path.join(dataDir, 'desktop')
+  const signins = ownSignInDir(dataDir)
+  fs.mkdirSync(desktop)
+  await writeOwnSignIn(signins, {
+    accessToken: 'own-token', refreshToken: 'own-refresh', expiresAtMs: Date.now() + 9 * DAY,
+    domain: 'www.codebuddy.cn', uin: '90000006007', uid: '', nickname: 'Fixture',
+    enterpriseId: '', lastRefreshAtMs: Date.now(),
+  })
+  const fsp = require('node:fs/promises')
+  const realReaddir = fsp.readdir
+  fsp.readdir = async (directory, ...rest) => {
+    if (path.resolve(String(directory)) === path.resolve(desktop)) {
+      const error = new Error('fixture directory is unavailable')
+      error.code = 'EACCES'
+      throw error
+    }
+    return realReaddir(directory, ...rest)
+  }
+  try {
+    const pool = new WorkBuddyAccountPool({ authDirs: [desktop], dataPath: () => dataDir })
+    const [account] = await pool.scan()
+    assert.equal(pool.ownsSignIn(account.id), false)
+    assert.equal(await pool.removeOwnSignIn(account.id), false)
+    assert.equal(fs.existsSync(account.credential.sourcePath), true)
+  } finally {
+    fsp.readdir = realReaddir
+    await cleanup(dataDir)
+  }
+})
+
+test('a delete keeps a live sign-in that replaced the pool copy during a scan', async () => {
+  const { pool, dataDir, desktop } = machine('delete-live-race', {
+    snapshots: [['90000006006', 'Racing']],
+  })
+  const [account] = await pool.scan()
+  const ownFile = account.credential.sourcePath
+  const liveFile = path.join(desktop, LIVE_NAME)
+  fs.writeFileSync(liveFile, JSON.stringify({
+    auth: {
+      accessToken: 'new-live-token', refreshToken: 'new-live-refresh', expiresAt: Date.now() + 9 * DAY,
+      domain: 'www.codebuddy.cn', lastRefreshTime: Date.now() + DAY,
+    },
+    account: { uin: '90000006006' },
+  }))
+  const fsp = require('node:fs/promises')
+  const realReadFile = fsp.readFile
+  let releaseRead
+  let readStarted
+  const started = new Promise(resolve => { readStarted = resolve })
+  fsp.readFile = async (file, ...rest) => {
+    if (path.resolve(String(file)) === path.resolve(liveFile)) {
+      readStarted()
+      await new Promise(resolve => { releaseRead = resolve })
+    }
+    return realReadFile(file, ...rest)
+  }
+  try {
+    const scanning = pool.scan()
+    await started
+    const removing = pool.removeOwnSignIn(account.id)
+    const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (fs.existsSync(tombstoneFile)
+        && Object.hasOwn(JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries, account.id)) break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    releaseRead()
+    await scanning
+    assert.equal(await removing, false)
+    assert.equal(fs.existsSync(liveFile), true, 'the desktop live sign-in must survive')
+    assert.equal(fs.existsSync(ownFile), true, 'the superseded pool copy is not deleted either')
+    const tombstones = JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries
+    assert.equal(Object.hasOwn(tombstones, account.id), false)
+  } finally {
+    fsp.readFile = realReadFile
+    releaseRead?.()
+    await cleanup(dataDir)
+  }
+})
+
+test('a delete keeps a re-login rewritten to the same pool path during a scan', async () => {
+  const { pool, dataDir, signins } = machine('delete-same-path-race', {
+    snapshots: [['90000006008', 'Racing']],
+  })
+  const [account] = await pool.scan()
+  const ownFile = account.credential.sourcePath
+  const fsp = require('node:fs/promises')
+  const realReadFile = fsp.readFile
+  let releaseRead
+  let readStarted
+  let held = false
+  const started = new Promise((resolve) => { readStarted = resolve })
+  fsp.readFile = async (file, ...rest) => {
+    if (!held && path.resolve(String(file)) === path.resolve(ownFile)) {
+      held = true
+      readStarted()
+      await new Promise((resolve) => { releaseRead = resolve })
+    }
+    return realReadFile(file, ...rest)
+  }
+  try {
+    const scanning = pool.scan()
+    await started
+    const removing = pool.removeOwnSignIn(account.id)
+    const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (fs.existsSync(tombstoneFile)
+        && Object.hasOwn(JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries, account.id)) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    await writeOwnSignIn(signins, {
+      accessToken: 'new-same-path-token', refreshToken: 'new-same-path-refresh',
+      expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+      uin: '90000006008', uid: '', nickname: 'Racing', enterpriseId: '',
+      lastRefreshAtMs: Date.now(),
+    })
+    releaseRead()
+    await scanning
+
+    assert.equal(await removing, false)
+    assert.equal(fs.existsSync(ownFile), true, 'the newly written sign-in must survive')
+    assert.equal(parseWorkBuddyAuth(fs.readFileSync(ownFile, 'utf8'), ownFile).accessToken,
+      'new-same-path-token')
+    const tombstones = JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries
+    assert.equal(Object.hasOwn(tombstones, account.id), false)
+  } finally {
+    fsp.readFile = realReadFile
+    releaseRead?.()
+    await cleanup(dataDir)
+  }
+})
+
+test('a failed unlink restores the roster after a concurrent scan', async () => {
+  const { pool, dataDir } = machine('delete-failure-roster', {
+    snapshots: [['90000006009', 'Kept']],
+  })
+  const [account] = await pool.scan()
+  const ownFile = account.credential.sourcePath
+  const fsp = require('node:fs/promises')
+  const realUnlink = fsp.unlink
+  let releaseUnlink
+  let unlinkStarted
+  const started = new Promise((resolve) => { unlinkStarted = resolve })
+  fsp.unlink = async (file, ...rest) => {
+    if (path.resolve(String(file)) === path.resolve(ownFile)) {
+      unlinkStarted()
+      await new Promise((resolve) => { releaseUnlink = resolve })
+      const denied = new Error('fixture delete denied')
+      denied.code = 'EACCES'
+      throw denied
+    }
+    return realUnlink(file, ...rest)
+  }
+  try {
+    const removing = pool.removeOwnSignIn(account.id)
+    await started
+    const scanning = pool.scan()
+    await scanning
+    releaseUnlink()
+    await assert.rejects(removing, { code: 'EACCES' })
+
+    assert.equal(fs.existsSync(ownFile), true)
+    assert.equal(pool.list().some((entry) => entry.id === account.id), true,
+      'a failed delete must leave the live account in the roster')
+    const document = JSON.parse(
+      fs.readFileSync(path.join(dataDir, 'deleted-signins.json'), 'utf8'),
+    )
+    assert.deepEqual(Object.keys(document.entries), [])
+  } finally {
+    fsp.unlink = realUnlink
+    releaseUnlink?.()
+    await cleanup(dataDir)
   }
 })
