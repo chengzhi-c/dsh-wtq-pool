@@ -40,6 +40,20 @@ test('a rate limit is the one reason answered as a retryable 429', () => {
   assert.match(answer.detail, /rate-limited for model m/)
 })
 
+test('an upstream outage is answered as a server error, not a rate limit', () => {
+  const answer = unavailableAnswer(
+    poolSaying('server'),
+    [account({ id: 'a', cooldownUntilMs: NOW + 60_000 })],
+    NOW,
+    'm',
+  )
+  assert.equal(answer.status, 503)
+  assert.equal(answer.code, 'server')
+  assert.match(answer.detail, /server errors/)
+  assert.match(answer.detail, /retry shortly/)
+  assert.equal(answer.retryAfterSeconds, undefined, 'an outage has no upstream window to hand out')
+})
+
 test('a hold is answered as the remedy it needs, never as a rate limit', () => {
   // Both of these also carry a future cooldown, which is exactly what made the
   // old timestamp-based test answer 429 for them.

@@ -14,9 +14,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import { tokenExpiryMs, regionOf, upstreamErrorKind, type WorkBuddyRegion } from './upstream'
+import { MAX_EXPIRY_MS, tokenExpiryMs, regionOf, upstreamErrorKind, type WorkBuddyRegion } from './upstream'
 import { encryptedFieldOpener, isEncryptedFieldWrapper } from './at-rest'
-import { replaceFile, withFileLock } from './file-lock'
+import { FileLockReleaseError, replaceFile, withFileLock } from './file-lock'
 import { LOG_PREFIX, accountLogTag } from './log'
 
 /** Minimal upstream surface the pool needs to refresh a token (no circular import). */
@@ -256,7 +256,6 @@ function defaultDesktopAuthDirs(
  * 8.64e15 `new Date(…).toISOString()` also throws, which failed the whole
  * panel document rather than the one row.
  */
-const MAX_EXPIRY_MS = 4_102_444_800_000
 /**
  * Normalize an expiry that may arrive in seconds or milliseconds.
  *
@@ -522,6 +521,24 @@ interface DeletedSignIn {
   lastRefreshAtMs: number
   /** When the user deleted it, which is what the tombstone's own age is. */
   deletedAtMs: number
+  /**
+   * Identifies the write, not the sign-in.
+   *
+   * Two deletes of one account can commit in the same millisecond. A rollback
+   * must drop only the record its own failed delete wrote, so field equality
+   * cannot be the test; this nonce can. Legacy records have none.
+   */
+  nonce?: string
+  /**
+   * Other deleted sign-ins of the same account.
+   *
+   * A stale roster can delete an older sign-in after a newer one was already
+   * deleted, and the two records cannot always be ordered by issue time. Keeping
+   * only the newer delete then let the older one stand in for it, so the newer
+   * sign-in came back as a re-login. The records that cannot be ordered are kept
+   * beside the primary one and every one of them still has to be ended.
+   */
+  alternates?: DeletedSignIn[]
 }
 
 function tokenDigest(accessToken: string): string {
@@ -560,19 +577,33 @@ async function readDeletedSignInsFile(file: string): Promise<Map<string, Deleted
   const entries = parsed?.entries
   if (entries === null || typeof entries !== 'object' || Array.isArray(entries)) return tombstones
   for (const [id, value] of Object.entries(entries as Record<string, unknown>)) {
-    const entry = value as Partial<DeletedSignIn> | null
-    if (entry === null || typeof entry !== 'object') continue
-    const digest = entry.tokenDigest
-    if (typeof digest !== 'string' || digest === '') continue
-    const issued = entry.lastRefreshAtMs
-    const deletedAt = entry.deletedAtMs
-    tombstones.set(id, {
-      tokenDigest: digest,
-      lastRefreshAtMs: typeof issued === 'number' && Number.isFinite(issued) ? issued : 0,
-      deletedAtMs: typeof deletedAt === 'number' && Number.isFinite(deletedAt) ? deletedAt : 0,
-    })
+    const record = deletedSignInFrom(value)
+    if (record !== undefined) tombstones.set(id, record)
   }
   return tombstones
+}
+
+function deletedSignInFrom(value: unknown): DeletedSignIn | undefined {
+  const entry = value as Partial<DeletedSignIn> | null
+  if (entry === null || typeof entry !== 'object') return undefined
+  const digest = entry.tokenDigest
+  if (typeof digest !== 'string' || digest === '') return undefined
+  const issued = entry.lastRefreshAtMs
+  const deletedAt = entry.deletedAtMs
+  const nonce = entry.nonce
+  const alternates = Array.isArray(entry.alternates)
+    ? entry.alternates.flatMap((alternate) => {
+      const record = deletedSignInFrom(alternate)
+      return record === undefined ? [] : [record]
+    })
+    : []
+  return {
+    tokenDigest: digest,
+    lastRefreshAtMs: typeof issued === 'number' && Number.isFinite(issued) ? issued : 0,
+    deletedAtMs: typeof deletedAt === 'number' && Number.isFinite(deletedAt) ? deletedAt : 0,
+    ...typeof nonce === 'string' && nonce !== '' ? { nonce } : {},
+    ...alternates.length > 0 ? { alternates } : {},
+  }
 }
 
 /**
@@ -608,6 +639,117 @@ function endsTombstone(tombstone: DeletedSignIn, credential: WorkBuddyCredential
 }
 
 /**
+ * The tombstone that names a credential, under either of its pool keys.
+ *
+ * A key written by 1.2.3 for an identity-less sign-in is not the key this build
+ * computes, so looking only at the current one let the client's snapshot bring
+ * the account straight back after an upgrade. The record is returned with the
+ * key it was stored under and whether that key is the current one: only a
+ * current-key record may be released, and only by removing the entry that
+ * actually holds it.
+ */
+function tombstoneOf(
+  tombstones: ReadonlyMap<string, DeletedSignIn>,
+  credential: WorkBuddyCredential,
+  currentId = workbuddyAccountId(credential),
+): { key: string; record: DeletedSignIn; current: boolean } | undefined {
+  const record = tombstones.get(currentId)
+  if (record !== undefined) return { key: currentId, record, current: true }
+  for (const previous of previousAccountIds(credential)) {
+    const old = tombstones.get(previous)
+    if (old !== undefined) return { key: previous, record: old, current: false }
+  }
+  return undefined
+}
+
+/**
+ * Which of two deletes names the newer sign-in.
+ *
+ * A delete from a stale roster can arrive after another pool already deleted a
+ * newer sign-in for the same account. The record naming the newer sign-in is
+ * the one that still has to hold, whichever delete committed last: an older
+ * record would let the newer sign-in back in as a re-login. Records that name
+ * the same (or an undated) sign-in fall back to the later delete.
+ */
+function namesNewerSignIn(candidate: DeletedSignIn, current: DeletedSignIn): boolean {
+  // A dated record can be compared with a later sign-in even when the other
+  // record carries no issue time. The undated record is not dropped: the merge
+  // keeps it as an alternate, so both sign-ins stay blocked.
+  if (candidate.lastRefreshAtMs > 0 && current.lastRefreshAtMs === 0) return true
+  if (candidate.lastRefreshAtMs === 0 && current.lastRefreshAtMs > 0) return false
+  if (candidate.lastRefreshAtMs > 0 && current.lastRefreshAtMs > 0
+    && candidate.lastRefreshAtMs !== current.lastRefreshAtMs) {
+    return candidate.lastRefreshAtMs > current.lastRefreshAtMs
+  }
+  return candidate.deletedAtMs > current.deletedAtMs
+}
+
+function recordsOf(entry: DeletedSignIn): readonly DeletedSignIn[] {
+  if (entry.alternates === undefined) return [entry]
+  return [entry, ...entry.alternates.flatMap(record => recordsOf(record))]
+}
+
+function withoutAlternates(record: DeletedSignIn): DeletedSignIn {
+  const { alternates: _ignored, ...bare } = record
+  return bare
+}
+
+function sameDeletedSignIn(left: DeletedSignIn, right: DeletedSignIn): boolean {
+  if (left.nonce !== undefined || right.nonce !== undefined) return left.nonce === right.nonce
+  return left.tokenDigest === right.tokenDigest
+    && left.lastRefreshAtMs === right.lastRefreshAtMs
+    && left.deletedAtMs === right.deletedAtMs
+}
+
+function deletedSignInFromRecords(records: readonly DeletedSignIn[]): DeletedSignIn | undefined {
+  if (records.length === 0) return undefined
+  const [primary, ...alternates] = records
+  const bare = withoutAlternates(primary!)
+  return alternates.length === 0 ? bare : { ...bare, alternates: alternates.map(withoutAlternates) }
+}
+
+function mergeDeletedSignIns(existing: DeletedSignIn | undefined, candidate: DeletedSignIn): DeletedSignIn {
+  if (existing === undefined) return withoutAlternates(candidate)
+  const records = [...recordsOf(existing)]
+  const bare = withoutAlternates(candidate)
+  if (!records.some(record => sameDeletedSignIn(record, bare))) records.push(bare)
+  let primary = 0
+  for (let index = 1; index < records.length; index += 1) {
+    if (namesNewerSignIn(records[index]!, records[primary]!)) primary = index
+  }
+  const [chosen] = records.splice(primary, 1)
+  return deletedSignInFromRecords([chosen!, ...records])!
+}
+
+function dropDeletedSignIns(
+  entry: DeletedSignIn,
+  targets: readonly DeletedSignIn[],
+): DeletedSignIn | undefined {
+  const kept = recordsOf(entry).filter(record => !targets.some(target => sameDeletedSignIn(record, target)))
+  if (kept.length === recordsOf(entry).length) return entry
+  return deletedSignInFromRecords(kept)
+}
+
+/**
+ * Whether a tombstone still keeps this credential out of the pool.
+ *
+ * A record under the current key is judged by the re-login rule. A key written
+ * by 1.2.3 cannot tell two same-nickname sign-ins apart, so it may only keep
+ * the sign-in it was written for out: the token digest is the one fact that
+ * belongs to the deleted session alone. That record is never released here,
+ * because releasing it on another account's token would resurrect the deleted
+ * row on the next scan.
+ */
+function tombstoneBlocks(
+  entry: { record: DeletedSignIn; current: boolean },
+  credential: WorkBuddyCredential,
+): boolean {
+  if (entry.current) return recordsOf(entry.record).some(record => !endsTombstone(record, credential))
+  const digest = tokenDigest(credential.accessToken)
+  return recordsOf(entry.record).some(record => digest === record.tokenDigest)
+}
+
+/**
  * Whether `sourcePath` sits inside the directory the plugin writes into.
  *
  * A walk that escapes the root is not inside it, and `..` is how a path gets
@@ -622,16 +764,126 @@ function ownSignInPath(sourcePath: string, ownDir: string): boolean {
 export function workbuddyAccountId(
   credential: Pick<WorkBuddyCredential, 'uin' | 'uid' | 'nickname' | 'sourcePath'>,
 ): string {
-  // The source path is the last resort so two sign-ins with no identity at all
-  // stay two accounts: a shared constant hashed them into one pool entry and
-  // silently dropped the second.
-  const stable = credential.uin ?? credential.uid ?? credential.nickname ?? `path:${credential.sourcePath}`
+  // A nickname is not an identity: two different sign-ins can carry the same
+  // one, and hashing it alone merged them into a single pool entry, so the
+  // second credential silently replaced the first. Without a uin/uid, the path
+  // keeps them apart. A credential with neither still falls back to the path.
+  const stable = credential.uin ?? credential.uid
+    ?? `${credential.nickname ?? ''}\u0000${credential.sourcePath}`
   return createHash('sha256').update(`workbuddy\0${stable}`).digest('hex').slice(0, 16)
+}
+
+/**
+ * The pool key a 1.2.3 build gave a credential with no vendor id.
+ *
+ * That build hashed the nickname alone, or the path when there was none. This
+ * build hashes both so two sign-ins sharing one nickname stay two accounts,
+ * which means an upgraded install still carries the old key in its settings and
+ * its deleted-sign-in file. The pool answers to either key: a switch the user
+ * turned off does not come back on, and a delete does not resurrect its row.
+ */
+export function legacyWorkBuddyAccountId(
+  credential: Pick<WorkBuddyCredential, 'uin' | 'uid' | 'nickname' | 'sourcePath'>,
+): string {
+  const stable = credential.uin ?? credential.uid
+    ?? credential.nickname ?? `path:${credential.sourcePath}`
+  return createHash('sha256').update(`workbuddy\0${stable}`).digest('hex').slice(0, 16)
+}
+
+/**
+ * The 1.2.3 key for a credential, when it differs from the current one.
+ *
+ * A vendor id hashes the same in both builds, so only a sign-in with no
+ * identity has any older key to read. The current key is not repeated.
+ */
+function previousAccountIds(
+  credential: Pick<WorkBuddyCredential, 'uin' | 'uid' | 'nickname' | 'sourcePath'>,
+): string[] {
+  if ((credential.uin ?? credential.uid) !== undefined) return []
+  const previous = legacyWorkBuddyAccountId(credential)
+  return previous === workbuddyAccountId(credential) ? [] : [previous]
 }
 
 /** Human label; the nickname alone, so the pool reads as names rather than keys. */
 function accountLabel(credential: WorkBuddyCredential): string {
   return credential.nickname ?? 'WorkBuddy'
+}
+
+/**
+ * Collapse identity-less copies of one session.
+ *
+ * A sign-in with no uin/uid is keyed by its file, and an earlier build adopted
+ * the desktop's superseded snapshot under a second path. Both copies carry one
+ * session, so renewing either spends the other's refresh token. Copies sharing
+ * a token are folded, and once the plugin owns an identity-less copy, the
+ * desktop snapshot with the same domain and nickname stays folded even after a
+ * renewal rotates the token away. That name-based half is migration-only: a
+ * newer build does not adopt identity-less snapshots, and `foldSessionCopies`
+ * only applies it where an own copy exists. The live file wins because the app
+ * renews it, then the plugin's own copy, then the freshest snapshot.
+ */
+function foldSessionCopies(
+  credentials: readonly WorkBuddyCredential[],
+  ownDir: string,
+): WorkBuddyCredential[] {
+  const isOwn = (credential: WorkBuddyCredential): boolean => ownSignInPath(credential.sourcePath, ownDir)
+  const identityLess = (credential: WorkBuddyCredential): boolean =>
+    (credential.uin ?? credential.uid ?? '') === ''
+  const tokenKey = (credential: WorkBuddyCredential): string => {
+    if (!identityLess(credential)) return ''
+    const token = credential.refreshToken || credential.accessToken
+    return token === '' ? '' : credential.domain + '\u0000' + token
+  }
+  const nameKey = (credential: WorkBuddyCredential): string => {
+    if (!identityLess(credential) || (credential.nickname ?? '') === '') return ''
+    return credential.domain + '\u0000' + credential.nickname
+  }
+  // Only a token the plugin has copied can be a migration duplicate. Two files
+  // the desktop owns stay two accounts: the path is the only identity they have.
+  const copiedTokens = new Set<string>()
+  for (const credential of credentials) {
+    const key = tokenKey(credential)
+    if (key !== '' && isOwn(credential)) copiedTokens.add(key)
+  }
+  const rankOf = (credential: WorkBuddyCredential): number => isLiveAuthFile(credential.sourcePath)
+    ? 3
+    : ownSignInPath(credential.sourcePath, ownDir) ? 2 : 1
+  const best = new Map<string, WorkBuddyCredential>()
+  for (const credential of credentials) {
+    const key = tokenKey(credential)
+    if (key === '' || !copiedTokens.has(key)) continue
+    const current = best.get(key)
+    if (current === undefined
+      || rankOf(credential) > rankOf(current)
+      || (rankOf(credential) === rankOf(current) && isFresher(credential, current, ownDir))) {
+      best.set(key, credential)
+    }
+  }
+  // A renewal rotates the own copy's token, so the token half alone would let
+  // the old desktop snapshot back in as a second account. The name keeps it
+  // folded, but only because an own copy of that name exists.
+  const ownedNames = new Set<string>()
+  for (const credential of credentials) {
+    const key = nameKey(credential)
+    if (key !== '' && isOwn(credential)) ownedNames.add(key)
+  }
+  const bestOwned = new Map<string, WorkBuddyCredential>()
+  for (const credential of credentials) {
+    const key = nameKey(credential)
+    if (key === '' || !ownedNames.has(key) || !isOwn(credential)) continue
+    const current = bestOwned.get(key)
+    if (current === undefined || isFresher(credential, current, ownDir)) bestOwned.set(key, credential)
+  }
+  return credentials.filter((credential) => {
+    const key = tokenKey(credential)
+    if (key !== '' && copiedTokens.has(key) && best.get(key) !== credential) return false
+    const name = nameKey(credential)
+    if (name === '' || !ownedNames.has(name)) return true
+    // The live sign-in is the app's own and is never the stale copy.
+    if (isLiveAuthFile(credential.sourcePath)) return true
+    if (isOwn(credential)) return bestOwned.get(name) === credential
+    return false
+  })
 }
 
 /**
@@ -951,8 +1203,9 @@ function ownSignInFile(directory: string, signIn: OwnSignIn): string {
 
 async function writeOwnSignInDocument(file: string, signIn: OwnSignIn, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted()
-  await mkdir(dirname(file), { recursive: true })
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 })
   signal?.throwIfAborted()
+  await removeAbandonedTemps(file)
   const temporary = `${file}.${randomUUID()}.tmp`
   try {
     await writeFile(temporary, JSON.stringify({
@@ -996,6 +1249,7 @@ export async function renewOwnSignInFile(
   beforeCommit?: () => Promise<boolean>,
 ): Promise<boolean> {
   return await withSignInWriteLock(file, async () => {
+    await removeAbandonedTemps(file)
     let text: string
     try {
       text = await readFile(file, 'utf8')
@@ -1003,6 +1257,12 @@ export async function renewOwnSignInFile(
       if (!createIfMissing || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       if (beforeCommit !== undefined && !await beforeCommit()) return false
       await writeOwnSignInDocument(file, ownSignInOf(credential))
+      // The write above is the widest window: a delete can land between the
+      // check and the new file. The same post-commit rule as the rewrite path.
+      if (beforeCommit !== undefined && !await beforeCommit()) {
+        await unlink(file).catch(() => {})
+        return false
+      }
       return true
     }
     const document = JSON.parse(text) as { auth?: Record<string, unknown> }
@@ -1156,7 +1416,10 @@ async function readArchivedCredentials(file: string): Promise<Map<string, WorkBu
   return stored
 }
 
-async function removeAbandonedArchiveTemps(file: string): Promise<void> {
+/** How old a leftover write temp must be before another writer removes it. */
+const ABANDONED_TEMP_MAX_AGE_MS = 10 * 60 * 1000
+
+async function removeAbandonedTemps(file: string, minAgeMs = ABANDONED_TEMP_MAX_AGE_MS): Promise<void> {
   const prefix = `${basename(file)}.`
   let names: string[]
   try {
@@ -1168,7 +1431,40 @@ async function removeAbandonedArchiveTemps(file: string): Promise<void> {
     if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue
     const id = name.slice(prefix.length, -4)
     if (!/^[a-f\d]{8}-(?:[a-f\d]{4}-){3}[a-f\d]{12}$/iu.test(id)) continue
-    await unlink(join(dirname(file), name)).catch(() => {})
+    const candidate = join(dirname(file), name)
+    // A temp the caller's own write just created, or one another process is
+    // still renaming, must not be removed under it: the writer would lose the
+    // token it had already put on disk. Only leftovers older than any write
+    // can take are abandoned.
+    if (minAgeMs > 0) {
+      const info = await stat(candidate).catch(() => undefined)
+      if (info === undefined || Date.now() - info.mtimeMs < minAgeMs) continue
+    }
+    await unlink(candidate).catch(() => {})
+  }
+}
+
+/**
+ * Remove sign-in temps a crashed write left in the plugin's own directory.
+ *
+ * A private file is written as `<name>.info.<uuid>.tmp` and renamed into place.
+ * A process killed between the two leaves a full token in that temp, and no
+ * later write of the same account necessarily happens. The age floor keeps a
+ * scan from removing a write another process is still preparing.
+ */
+async function removeAbandonedSignInTemps(directory: string): Promise<void> {
+  let names: string[]
+  try {
+    names = await readdir(directory)
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (!/^workbuddy-panel-.*\.info\.[a-f\d]{8}-(?:[a-f\d]{4}-){3}[a-f\d]{12}\.tmp$/iu.test(name)) continue
+    const file = join(directory, name)
+    const info = await stat(file).catch(() => undefined)
+    if (info === undefined || Date.now() - info.mtimeMs < ABANDONED_TEMP_MAX_AGE_MS) continue
+    await unlink(file).catch(() => {})
   }
 }
 
@@ -1185,8 +1481,9 @@ async function writeArchivedCredentials(
   signal?: AbortSignal,
 ): Promise<void> {
   signal?.throwIfAborted()
-  await mkdir(dirname(file), { recursive: true })
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 })
   signal?.throwIfAborted()
+  await removeAbandonedTemps(file)
   const body = JSON.stringify({
     version: 1,
     entries: [...entries].map(([id, credential]) => ({
@@ -1240,6 +1537,7 @@ export type IneligibleReason =
   | 'restricted by the upstream'
   | 'on hold'
   | 'plan'
+  | 'server'
   | 'rate-limited'
 
 /**
@@ -1332,6 +1630,15 @@ export class WorkBuddyAccountPool {
   private cursor = 0
   /** Sticky mode: conversation key → account id. Content stays out of memory. */
   private sticky = new Map<string, string>()
+  /**
+   * Account id → the order in which it last served. A readout only: the composer
+   * shows the account a sticky conversation is on, and that account is the one
+   * that just answered. A counter rather than a clock, because two acquires can
+   * land in the same millisecond. Not persisted; after a restart the cursor
+   * stands in.
+   */
+  private servedOrder = new Map<string, number>()
+  private servedCount = 0
   private lastScanAtMs = 0
   private preferredIds = new Map<WorkBuddyRegion | undefined, string>()
   /**
@@ -1404,6 +1711,14 @@ export class WorkBuddyAccountPool {
    * account went back to the head of the queue on every probe cycle.
    */
   private heldIds = new Map<string, PoolHold>()
+  /**
+   * Account id → when an upstream 5xx cooldown ends.
+   *
+   * A 5xx is not a frequency wall, and reporting it as one on the next request
+   * sent the user looking for a limit that never existed. Kept beside the
+   * cooldown so `ineligible` can name the cause while the account is out.
+   */
+  private serverCooldowns = new Map<string, number>()
   /**
    * Accounts the desktop client is signed into right now.
    *
@@ -1543,16 +1858,75 @@ export class WorkBuddyAccountPool {
   }
 
   /** True when a known balance has reached the floor set for this account. */
-  private reserveHolds(accountId: string): boolean {
-    const floor = this.creditReserves.get(accountId)
+  private reserveHolds(account: WorkBuddyAccount): boolean {
+    const floor = this.storedValue(this.creditReserves, account)
     if (floor === undefined || floor <= 0) return false
-    const balance = this.creditBalances.get(accountId)
+    const balance = this.creditBalances.get(account.id)
     return balance !== undefined && balance <= floor
   }
 
   /** Whether this account was switched off on the panel. */
   isDisabled(accountId: string): boolean {
-    return this.disabledIds.has(accountId)
+    const account = this.accounts.find(item => item.id === accountId)
+    return account === undefined
+      ? this.disabledIds.has(accountId)
+      : this.storedIdMatches(this.disabledIds, account)
+  }
+
+  /** The credit floor in force for one account. */
+  creditReserve(accountId: string): number | undefined {
+    const account = this.accounts.find(item => item.id === accountId)
+    return account === undefined
+      ? this.creditReserves.get(accountId)
+      : this.storedValue(this.creditReserves, account)
+  }
+
+  /**
+   * Every key this account may still be recorded under in persisted settings.
+   *
+   * The panel writes by current id, so a toggle has to clear the older keys
+   * too; otherwise an old entry stays behind and takes effect again the moment
+   * the current one is removed. An old key shared with another row is not a key
+   * for this account: settings already ignore it, and purging its archive entry
+   * on delete would take the other row's copy with it.
+   */
+  storedIds(accountId: string): string[] {
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined) return [accountId]
+    return [accountId, ...previousAccountIds(account.credential)
+      .filter(id => this.legacyKeyUnique(account, id))]
+  }
+
+  /** Whether a stored id set names this account under any of its keys. */
+  private storedIdMatches(stored: ReadonlySet<string>, account: WorkBuddyAccount): boolean {
+    if (stored.has(account.id)) return true
+    return previousAccountIds(account.credential)
+      .some(id => stored.has(id) && this.legacyKeyUnique(account, id))
+  }
+
+  /** A value stored under any of this account's keys; current wins. */
+  private storedValue<T>(stored: ReadonlyMap<string, T>, account: WorkBuddyAccount): T | undefined {
+    const current = stored.get(account.id)
+    if (current !== undefined) return current
+    for (const id of previousAccountIds(account.credential)) {
+      if (!this.legacyKeyUnique(account, id)) continue
+      const value = stored.get(id)
+      if (value !== undefined) return value
+    }
+    return undefined
+  }
+
+  /**
+   * Whether a 1.2.3 key names this row and no other one.
+   *
+   * That key hashed a nickname alone, so two identity-less sign-ins can share
+   * it. Applying it to both would switch off or remove an account the user
+   * never touched; an ambiguous key is therefore ignored rather than guessed.
+   */
+  private legacyKeyUnique(account: WorkBuddyAccount, key: string): boolean {
+    const claimants = this.accounts.filter(item =>
+      item.id === key || previousAccountIds(item.credential).includes(key))
+    return claimants.length === 1 && claimants[0]?.id === account.id
   }
 
   /**
@@ -1622,15 +1996,33 @@ export class WorkBuddyAccountPool {
     // still in the archive and its snapshot still in the client's directory, and a
     // walk that got past the tombstone check before this point would put the
     // account straight back on assignment.
-    const knownTombstones = await this.loadDeletedSignIns()
-    if (knownTombstones === undefined) throw new Error('could not read the deleted sign-ins')
-    const known = knownTombstones.has(account.id)
     // A delete whose tombstone could not be recorded is not a delete: the file is
     // about to go, and the only thing that keeps the client's copy from taking the
     // account back is that record. Reporting success would leave a row that
     // returns after the next restart.
-    if (!await this.rememberDeletedSignIn(account.id, account.credential)) {
-      throw new Error('could not record the deleted sign-in')
+    const recorded = await this.rememberDeletedSignIn(account.id, account.credential)
+    if (recorded === undefined) throw new Error('could not record the deleted sign-in')
+    // A failed delete must leave the tombstone exactly as it found it. Restoring
+    // through `knownTombstones` alone was not enough: a concurrent writer can
+    // replace `this.deletedSignIns` between the read and the rollback, and the
+    // write then persisted the record this delete had just added.
+    const rollbackTombstone = async (): Promise<boolean> => {
+      const drop = async (): Promise<boolean> => await this.updateDeletedSignIns((tombstones) => {
+        const current = tombstones.get(account.id)
+        if (current === undefined) return true
+        const kept = dropDeletedSignIns(current, [recorded.written])
+        if (kept === undefined) tombstones.delete(account.id)
+        else if (kept !== current) tombstones.set(account.id, kept)
+        return true
+      }) === true
+      // One transient sharing violation must not leave the failed delete's
+      // tombstone behind, where a fresh process would hide a live account.
+      return await drop() || await drop()
+    }
+    const fail = async (): Promise<void> => {
+      if (!await rollbackTombstone()) {
+        this.logger?.error?.(`${LOG_PREFIX}: could not remove the tombstone of a failed delete for ${accountLogTag(account.label)}; the account stays hidden until the deleted sign-ins can be written again`)
+      }
     }
     const settled = running === undefined
       ? true
@@ -1647,7 +2039,7 @@ export class WorkBuddyAccountPool {
       // must survive.
       const tombstone = (await this.loadDeletedSignIns())?.get(account.id)
       replaced = tombstone === undefined
-        || (tombstone !== undefined && endsTombstone(tombstone, deletingCredential))
+        || !tombstoneBlocks({ record: tombstone, current: true }, deletingCredential)
     }
     const onDisk = await readCredential(ownedPath)
     if (!replaced) {
@@ -1658,10 +2050,7 @@ export class WorkBuddyAccountPool {
             || !sameCredential(onDisk.credential)))
     }
     if (replaced) {
-      if (!known) {
-        knownTombstones.delete(account.id)
-        await this.writeDeletedSignIns([account.id])
-      }
+      await fail()
       return false
     }
     // Already gone is success: the point is that no sign-in is left, and a
@@ -1676,15 +2065,15 @@ export class WorkBuddyAccountPool {
       else await withFileLock(`${tombstoneFile}.lock`, async () => { await unlink(ownedPath) })
     } catch (error: unknown) {
       const code = (error as NodeJS.ErrnoException).code
-      if (code !== 'ENOENT') {
+      // The unlink itself ran and only the lock file could not be removed.
+      // Rolling the tombstone back here treated a successful delete as a
+      // failure, and the archive then brought the account back.
+      if (!(error instanceof FileLockReleaseError) && code !== 'ENOENT') {
         // The file is still there, so the delete failed and the row has to stay.
         // Keeping the tombstone wrote it anyway: the next scan would hide the
         // account while the panel had just reported the delete as failed, and the
         // file left behind would bring it back once the tombstone was gone.
-        if (!known) {
-          knownTombstones.delete(account.id)
-          await this.writeDeletedSignIns([account.id])
-        }
+        await fail()
         this.rosterRevision += 1
         await this.rescan().catch((rescanError: unknown) => {
           this.logger?.warn?.(`${LOG_PREFIX}: could not restore the roster after a failed delete: ${String(rescanError)}`)
@@ -1692,13 +2081,22 @@ export class WorkBuddyAccountPool {
         throw error
       }
     }
+    // A renewal interrupted between write and rename leaves a full token in a
+    // temp file beside the sign-in; deleting the sign-in has to take it too.
+    // No age floor here: the account is going away, so even a write still in
+    // flight must not leave its token on disk.
+    await removeAbandonedTemps(ownedPath, 0)
     // Any scan that passed the tombstone read before the unlink still holds the
     // account being removed. Retire it at the successful commit boundary.
     this.rosterRevision += 1
+    // Captured before the account leaves the roster: an identity-less sign-in
+    // can still have an archive entry under its 1.2.3 key, and a later lookup
+    // would no longer know that key.
+    const archivedIds = this.storedIds(account.id)
     if (!settled) {
-      void running!.catch(() => {}).then(() => this.forgetArchived(account.id))
+      void running!.catch(() => {}).then(() => this.forgetArchived(archivedIds))
     }
-    await this.forgetArchived(account.id)
+    await this.forgetArchived(archivedIds)
     // Dropped from the pool here, not on the next walk. The credential in memory
     // is one whose file is gone, and until a walk replaces the list it outranks
     // every copy a walk finds: the row came straight back after a delete, serving
@@ -1726,6 +2124,7 @@ export class WorkBuddyAccountPool {
     this.heldIds.delete(accountId)
     this.signInTokens.delete(accountId)
     this.refusedSignIns.delete(accountId)
+    this.serverCooldowns.delete(accountId)
   }
 
   /**
@@ -1733,24 +2132,23 @@ export class WorkBuddyAccountPool {
    *
    * The file is written before the delete is reported: a tombstone that only
    * lived in memory would be gone after a restart, and the snapshot it has to
-   * hold off is still sitting in the client's directory.
+   * hold off is still sitting in the client's directory. Answers undefined when
+   * the record could not be written, so the delete can refuse to report success.
    */
-  private async rememberDeletedSignIn(id: string, credential: WorkBuddyCredential): Promise<boolean> {
-    const tombstones = await this.loadDeletedSignIns()
-    if (tombstones === undefined) return false
-    const previous = tombstones.get(id)
-    tombstones.set(id, {
+  private async rememberDeletedSignIn(
+    id: string,
+    credential: WorkBuddyCredential,
+  ): Promise<{ written: DeletedSignIn } | undefined> {
+    const written: DeletedSignIn = {
       tokenDigest: tokenDigest(credential.accessToken),
       lastRefreshAtMs: credential.lastRefreshAtMs ?? 0,
       deletedAtMs: Date.now(),
+      nonce: randomUUID(),
+    }
+    return await this.updateDeletedSignIns((tombstones) => {
+      tombstones.set(id, mergeDeletedSignIns(tombstones.get(id), written))
+      return { written }
     })
-    if (await this.writeDeletedSignIns()) return true
-    // The write failed, so the delete is not going to happen. Leaving the entry in
-    // the set would hide the account on the next scan anyway, while the panel had
-    // just reported the delete as failed.
-    if (previous === undefined) tombstones.delete(id)
-    else tombstones.set(id, previous)
-    return false
   }
 
   /**
@@ -1781,10 +2179,11 @@ export class WorkBuddyAccountPool {
       return tombstones
     } catch (error: unknown) {
       if (signal?.aborted) return this.deletedSignIns ?? new Map()
-      // A file that is there but unreadable is not "no deleted sign-ins": keeping
-      // the set we already have is what stops the next scan from adopting every
-      // account the user deleted, and stops the next write from persisting an
-      // empty set over theirs. The stamp is left unrecorded so the read is retried.
+      // A file that is there but unreadable is not "no deleted sign-ins". The
+      // cached set may be from before another pool wrote a delete, so returning
+      // it would let a renewal or an archive write treat that delete as absent.
+      // The cache stays for a later successful read; callers get "unknown" and
+      // must not write. The stamp is left unrecorded so the read is retried.
       const code = (error as NodeJS.ErrnoException).code
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         this.deletedSignInsStamp = MISSING_FILE_STAMP
@@ -1792,27 +2191,32 @@ export class WorkBuddyAccountPool {
         return this.deletedSignIns
       }
       this.logger?.warn?.(`${LOG_PREFIX}: could not read the deleted sign-ins: ${String(error)}`)
-      return this.deletedSignIns
+      return undefined
     }
   }
 
   /**
-   * Persist the tombstone set; the caller has already updated the map.
+   * Read-modify-write the tombstone document under its file lock.
    *
-   * What is on disk is merged in first, except for the ids this call is removing:
-   * a second pool over the same data directory writes this same file, and writing
-   * our map verbatim dropped a delete it had already recorded. The removals are the
-   * other half of that: a re-login ends a tombstone and a failed delete rolls one
-   * back, and a pure union put both straight back.
-   *
-   * Answers false when the file could not be written, so a delete can refuse to
-   * report success on a state it could not record.
+   * The change starts from what is on disk, never from the in-memory copy: a
+   * second pool may have released a record this process still holds, and writing
+   * the cached map back put that release in force again. `mutate` gets the current
+   * records and answers whatever the caller needs; undefined means the document
+   * could not be read or written, and nothing was persisted.
    */
-  private async writeDeletedSignIns(removed: readonly string[] = [], signal?: AbortSignal): Promise<boolean> {
-    const tombstones = this.deletedSignIns
+  private async updateDeletedSignIns<T>(
+    mutate: (tombstones: Map<string, DeletedSignIn>) => T,
+    signal?: AbortSignal,
+  ): Promise<T | undefined> {
     const file = this.deletedSignInsFile()
-    if (tombstones === undefined) return false
-    if (file === undefined) return true
+    if (file === undefined) {
+      const tombstones = this.deletedSignIns ?? new Map()
+      const answer = mutate(tombstones)
+      this.deletedSignIns = tombstones
+      this.deletedSignInsStamp = MISSING_FILE_STAMP
+      return answer
+    }
+    let answer: T | undefined
     let written = false
     try {
       await withFileLock(`${file}.lock`, async () => {
@@ -1823,29 +2227,31 @@ export class WorkBuddyAccountPool {
         } catch (error: unknown) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
             if (!signal?.aborted) {
-              this.logger?.warn?.(`${LOG_PREFIX}: could not merge the deleted sign-ins: ${String(error)}`)
+              this.logger?.warn?.(`${LOG_PREFIX}: could not read the deleted sign-ins to update them: ${String(error)}`)
             }
             return
           }
           onDisk = new Map()
         }
         if (signal?.aborted) return
-        for (const [id, entry] of onDisk) {
-          if (removed.includes(id)) continue
-          const ours = tombstones.get(id)
-          if (ours === undefined || entry.deletedAtMs > ours.deletedAtMs) tombstones.set(id, entry)
-        }
+        const result = mutate(onDisk)
+        if (signal?.aborted) return
         const temporary = `${file}.${randomUUID()}.tmp`
         try {
           signal?.throwIfAborted()
-          await mkdir(dirname(file), { recursive: true })
+          await mkdir(dirname(file), { recursive: true, mode: 0o700 })
           signal?.throwIfAborted()
-          await writeFile(temporary, JSON.stringify({ version: 1, entries: Object.fromEntries(tombstones) }, null, 2), { mode: 0o600 })
+          await removeAbandonedTemps(file)
+          await writeFile(temporary, JSON.stringify({ version: 1, entries: Object.fromEntries(onDisk) }, null, 2), { mode: 0o600 })
           signal?.throwIfAborted()
           await replaceFile(temporary, file)
           const stamp = await signInFileStamp(file)
-          if (!signal?.aborted && this.deletedSignIns === tombstones) this.deletedSignInsStamp = stamp
+          answer = result
           written = true
+          if (!signal?.aborted) {
+            this.deletedSignIns = onDisk
+            this.deletedSignInsStamp = stamp
+          }
         } catch (error: unknown) {
           await unlink(temporary).catch(() => {})
           if (!signal?.aborted) this.logger?.warn?.(`${LOG_PREFIX}: could not record the deleted sign-ins: ${String(error)}`)
@@ -1858,7 +2264,7 @@ export class WorkBuddyAccountPool {
           : `${LOG_PREFIX}: could not lock the deleted sign-ins: ${String(error)}`)
       }
     }
-    return written
+    return answer
   }
 
   private deletedSignInsFile(): string | undefined {
@@ -1921,6 +2327,11 @@ export class WorkBuddyAccountPool {
   ): Promise<WorkBuddyCredential[]> {
     const directory = ownSignInDir(this.dataPath?.() ?? '')
     if (directory === '') return []
+    // Another pool can delete a snapshot while this scan is in its archive
+    // phase. Adopting it would write the deleted token into the plugin's own
+    // directory after the delete; check the document again before copying.
+    const latest = await this.loadDeletedSignIns(signal)
+    if (latest === undefined) return []
     const liveIds = new Set<string>(sealedLiveIds)
     const ownedIds = new Set<string>()
     for (const credential of found) {
@@ -1937,10 +2348,12 @@ export class WorkBuddyAccountPool {
       // The client is signed into this account, the plugin already holds a copy of
       // it, or the user deleted it: either way there is nothing to take over.
       if (unknownLiveDirs.has(this.homeOf(credential)) || liveIds.has(id) || ownedIds.has(id) || tornDown.has(id)) continue
+      const entry = tombstoneOf(latest, credential, id)
+      if (entry !== undefined && tombstoneBlocks(entry, credential)) continue
       // Without an identity the pool key falls back to the source path, so the
       // copy would be a different account on every scan and the pool would grow
       // without bound. Such a snapshot keeps serving from where it lies.
-      if ((credential.uin ?? credential.uid ?? credential.nickname ?? '') === '') continue
+      if ((credential.uin ?? credential.uid ?? '') === '') continue
       let file: string
       try {
         // The document said nothing about when this token was issued, and this
@@ -1955,8 +2368,17 @@ export class WorkBuddyAccountPool {
         this.logger?.warn?.(`${LOG_PREFIX}: could not take over ${accountLogTag(accountLabel(credential))}: ${String(error)}`)
         continue
       }
+      const adoptedCredential: WorkBuddyCredential = { ...credential, sourcePath: file }
+      // The copy has a path of its own, so the delete's unlink cannot reach it.
+      // If a tombstone appeared during the copy, the copy has to go back out.
+      const after = await this.loadDeletedSignIns(signal)
+      const afterEntry = after === undefined ? undefined : tombstoneOf(after, adoptedCredential, id)
+      if (after === undefined || (afterEntry !== undefined && tombstoneBlocks(afterEntry, adoptedCredential))) {
+        await unlink(file).catch(() => {})
+        continue
+      }
       ownedIds.add(id)
-      adopted.push({ ...credential, sourcePath: file })
+      adopted.push(adoptedCredential)
     }
     return adopted
   }
@@ -1969,11 +2391,10 @@ export class WorkBuddyAccountPool {
    * directory is left alone - the desktop app owns its files.
    */
   private async renewOwnSignIn(previous: WorkBuddyCredential, credential: WorkBuddyCredential): Promise<boolean> {
-    // A tombstone recorded after this rotation began is the user deleting an
-    // account that was still there: writing it back would resurrect it with a
-    // token newer than the delete, which `endsTombstone` reads as a re-login.
-    const sinceMs = Date.now()
-    const guard = async (): Promise<boolean> => await this.deleteDidNotTake(credential, sinceMs)
+    // A tombstone naming this account is the user deleting a sign-in that was
+    // still there: writing the rotation back would resurrect it with a token
+    // newer than the delete, which `endsTombstone` reads as a re-login.
+    const guard = async (): Promise<boolean> => await this.deleteDidNotTake(credential)
     if (this.isOwnSignInPath(previous.sourcePath)) {
       return await renewOwnSignInFile(previous.sourcePath, credential, previous, false, guard)
     }
@@ -1983,7 +2404,7 @@ export class WorkBuddyAccountPool {
     // rotation is then refused and the account gets a session hold while a
     // working token sits right next to it. The adoption path already refuses to
     // copy such a snapshot for this reason; renewal must hold the same line.
-    if ((credential.uin ?? credential.uid ?? credential.nickname ?? '') === '') return true
+    if ((credential.uin ?? credential.uid ?? '') === '') return true
     // The rotation was just spent on a copy the plugin does not own: a desktop
     // sign-in it read, or one the archive handed back. Keeping the result in the
     // archive alone left the plugin's own copy of that account one rotation
@@ -2000,28 +2421,26 @@ export class WorkBuddyAccountPool {
   }
 
   /**
-   * Whether a delete recorded elsewhere still stands against this sign-in.
+   * Whether a delete still stands against this sign-in.
    *
    * A delete records a tombstone, unlinks the file, and reports success. A
-   * renewal in another pool over the same data directory used to race that: its
-   * rename landed after the unlink, the file came back with a token issued
-   * *after* the tombstone, and `endsTombstone` read the recreation as a
-   * re-login and cleared the record - a deleted account came back.
+   * renewal over the same sign-in used to race that: its rename landed after
+   * the unlink, the file came back with a token issued after the tombstone, and
+   * `endsTombstone` read the recreation as a re-login and cleared the record -
+   * a deleted account came back.
    *
-   * The test here is not `endsTombstone`, which asks whether the token is newer
-   * than the delete and would call this very rotation a re-login. What matters
-   * is the order of the two acts: a tombstone recorded after this renewal began
-   * is the user deleting an account that was still there, so the write must not
-   * land. `sinceMs` is when this renewal's token was minted - earlier than the
-   * delete, which is exactly the case that used to resurrect the account.
+   * The token's issue time cannot order the two acts. A rotation that started
+   * after the delete, from an account still held in memory, also mints a token
+   * newer than the record. What is known instead is which sign-in a record
+   * names: a current-key record names this exact account, and only a scan
+   * releases it for a sign-in the user made after the delete - before that
+   * account can be refreshed again. So the presence of the record is enough.
+   * A 1.2.3 record cannot tell two sign-ins apart and stays digest-matched.
    *
    * The set is read under the lock a delete writes it with, so a delete that
    * committed a moment ago is visible. Nothing blocking runs under that lock.
    */
-  private async deleteDidNotTake(
-    credential: WorkBuddyCredential,
-    sinceMs: number,
-  ): Promise<boolean> {
+  private async deleteDidNotTake(credential: WorkBuddyCredential): Promise<boolean> {
     const file = this.deletedSignInsFile()
     if (file === undefined) return true
     // No tombstone file means nothing was ever deleted: reading it under the
@@ -2032,11 +2451,25 @@ export class WorkBuddyAccountPool {
       (error as NodeJS.ErrnoException).code !== 'ENOENT')
     if (!present) return true
     let alive = true
-    await withFileLock(`${file}.lock`, async () => {
-      const tombstones = await this.loadDeletedSignIns()
-      const tombstone = tombstones?.get(workbuddyAccountId(credential))
-      if (tombstone !== undefined && tombstone.deletedAtMs >= sinceMs) alive = false
-    })
+    try {
+      await withFileLock(`${file}.lock`, async () => {
+        const tombstones = await this.loadDeletedSignIns()
+        // Unknown is not "nothing was deleted": another pool may have recorded a
+        // delete this process cannot read yet. A renewal against a deleted
+        // sign-in resurrects it, while skipping one only costs this rotation.
+        if (tombstones === undefined) {
+          alive = false
+          return
+        }
+        const entry = tombstoneOf(tombstones, credential)
+        if (entry !== undefined && (entry.current || tombstoneBlocks(entry, credential))) alive = false
+      })
+    } catch (error: unknown) {
+      // The read already answered. Only the lock file is left behind, and the
+      // next acquisition recovers it; failing the renewal here would spend the
+      // upstream rotation for nothing.
+      if (!(error instanceof FileLockReleaseError)) throw error
+    }
     return alive
   }
 
@@ -2047,13 +2480,15 @@ export class WorkBuddyAccountPool {
    * of one document, and a delete that raced a scan's write would otherwise be
    * overwritten by it.
    */
-  private async forgetArchived(id: string): Promise<void> {
+  private async forgetArchived(ids: readonly string[]): Promise<void> {
     const file = this.archiveFile()
     if (file === undefined) return
     const run = this.archiveQueue.then(async () => {
       await withFileLock(`${file}.lock`, async () => {
         const stored = await readArchivedCredentials(file)
-        if (!stored.delete(id)) return
+        let dropped = false
+        for (const id of ids) dropped = stored.delete(id) || dropped
+        if (!dropped) return
         await writeArchivedCredentials(file, stored)
       })
     })
@@ -2080,6 +2515,13 @@ export class WorkBuddyAccountPool {
     this.unknownLiveSignIn = false
     this.unknownLiveFiles = new Set()
     this.refreshBlockedIds = new Set()
+    this.serverCooldowns.clear()
+    // A refresh started by the retired activation is not this pool's answer:
+    // a new scan can rebuild the same account id, and sharing that promise
+    // would report a token the new account object never received. The held
+    // cooldowns and credit reads stay: they are facts about the account, not
+    // about the activation, and dropping them would retry a limited account.
+    this.refreshInflight.clear()
   }
 
   /** Read after any scan already running, so a manual request gets a fresh snapshot. */
@@ -2140,6 +2582,8 @@ export class WorkBuddyAccountPool {
     const file = this.archiveFile()
     if (file === undefined || credentials.length === 0) return
     const ownDir = ownSignInDir(this.dataPath?.() ?? '')
+    let committed = false
+    let wrote = false
     // Serialized: this is a read-modify-write of one document, and two scans can
     // overlap when the auth directories are repointed mid-walk. Interleaved
     // writers overwrite each other's entries, and a half-written archive reads
@@ -2149,15 +2593,31 @@ export class WorkBuddyAccountPool {
         if (signal?.aborted) return
         const stored = await readArchivedCredentials(file)
         if (signal?.aborted) return
+        // A scan that read the pool before a delete can reach this write after
+        // it. The delete's tombstone is already on disk by then, so re-read it
+        // under the archive lock: writing the found copy back would restore the
+        // tokens the user just asked to remove. A current-key record names this
+        // exact sign-in even after a refresh issued a newer token; only a scan
+        // releases it, and only for a sign-in the user made after the delete.
+        const tombstones = await this.loadDeletedSignIns(signal)
+        // Unknown is not empty: an unreadable tombstone may name this
+        // credential, so skip the write rather than risk a resurrection.
+        if (tombstones === undefined) return
         let changed = false
         for (const credential of credentials) {
           const id = workbuddyAccountId(credential)
+          const entry = tombstoneOf(tombstones, credential, id)
+          if (entry !== undefined && (entry.current || tombstoneBlocks(entry, credential))) continue
           const previous = stored.get(id)
           if (previous !== undefined && !isFresher(credential, previous, ownDir)) continue
           stored.set(id, credential)
           changed = true
         }
-        if (changed) await writeArchivedCredentials(file, stored, signal)
+        if (changed) {
+          await writeArchivedCredentials(file, stored, signal)
+          wrote = true
+        }
+        committed = true
       })
     })
     // The queue must survive a failed write, or every later archive write would
@@ -2166,7 +2626,14 @@ export class WorkBuddyAccountPool {
     try {
       await run
     } catch (error: unknown) {
-      if (!signal?.aborted) this.logger?.warn?.(`${LOG_PREFIX}: could not update the credential archive: ${String(error)}`)
+      if (!signal?.aborted) {
+        const message = !committed
+          ? 'could not update the credential archive'
+          : wrote
+            ? 'the credential archive was saved but its lock was not released'
+            : 'the credential archive is current but its lock was not released'
+        this.logger?.warn?.(`${LOG_PREFIX}: ${message}: ${String(error)}`)
+      }
     }
   }
 
@@ -2177,7 +2644,7 @@ export class WorkBuddyAccountPool {
     try {
       let stored = new Map<string, WorkBuddyCredential>()
       await withFileLock(`${file}.lock`, async () => {
-        await removeAbandonedArchiveTemps(file)
+        await removeAbandonedTemps(file)
         stored = await readArchivedCredentials(file)
       })
       return [...stored.values()].filter(credential => homes.has(this.homeOf(credential)))
@@ -2210,8 +2677,10 @@ export class WorkBuddyAccountPool {
     const sealedFileIds = new Map<string, string>()
     const unreadableFiles = new Set<string>()
     const unavailableDirs = new Set<string>()
+    const ownDir = ownSignInDir(this.dataPath?.() ?? '')
     for (const dir of dirs) {
       if (signal.aborted) return this.accounts
+      if (ownDir !== '' && resolve(dir) === resolve(ownDir)) await removeAbandonedSignInTemps(dir)
       const read = await authFilesIn(dir)
       if (signal.aborted) return this.accounts
       if (read.files === undefined) {
@@ -2250,21 +2719,25 @@ export class WorkBuddyAccountPool {
       return this.accounts
     }
     const tornDown = new Set<string>()
-    const releasedIds: string[] = []
+    const released = new Map<string, DeletedSignIn>()
     const held: WorkBuddyCredential[] = []
     for (const credential of found) {
       const id = workbuddyAccountId(credential)
-      const tombstone = tombstones.get(id)
-      if (tombstone === undefined) {
+      const entry = tombstoneOf(tombstones, credential, id)
+      if (entry === undefined) {
         held.push(credential)
         continue
       }
-      if (!endsTombstone(tombstone, credential)) {
+      if (tombstoneBlocks(entry, credential)) {
         tornDown.add(id)
         continue
       }
-      tombstones.delete(id)
-      releasedIds.push(id)
+      if (entry.current) {
+        // Only a record under the current key describes this exact account, so
+        // only that one may be released by a re-login. A 1.2.3 key stays put:
+        // it may still name another sign-in with the same nickname.
+        released.set(entry.key, entry.record)
+      }
       held.push(credential)
     }
     found.length = 0
@@ -2273,9 +2746,45 @@ export class WorkBuddyAccountPool {
     // cannot see either: the archive keeps the token the delete purged, and a
     // purge that raced a scan or lost its write would otherwise put the row back
     // on a scan where no file exists to carry the tombstone check.
-    for (const id of tombstones.keys()) tornDown.add(id)
-    if (releasedIds.length > 0) await this.writeDeletedSignIns(releasedIds, signal)
+    for (const id of tombstones.keys()) {
+      if (!released.has(id)) tornDown.add(id)
+    }
+    if (released.size > 0) {
+      await this.updateDeletedSignIns((entries) => {
+        for (const [id, record] of released) {
+          const current = entries.get(id)
+          if (current === undefined) continue
+          const kept = dropDeletedSignIns(current, recordsOf(record))
+          if (kept === undefined) entries.delete(id)
+          else if (kept !== current) entries.set(id, kept)
+        }
+      }, signal)
+    }
     if (signal.aborted || rosterRevision !== this.rosterRevision) return this.accounts
+    // A delete from another pool can land during the walk, after the set above
+    // was read. Re-read before committing a roster or an adoption that would
+    // serve the deleted sign-in; the release may also have merged one that
+    // committed while this scan was writing.
+    const latest = await this.loadDeletedSignIns(signal)
+    if (signal.aborted || rosterRevision !== this.rosterRevision) return this.accounts
+    if (latest === undefined) {
+      // Unreadable is unknown, never "nothing was deleted".
+      this.lastScanAtMs = Date.now()
+      return this.accounts
+    }
+    const walkedIds = new Set(found.map(credential => workbuddyAccountId(credential)))
+    for (const id of latest.keys()) {
+      if (!walkedIds.has(id)) tornDown.add(id)
+    }
+    for (let index = found.length - 1; index >= 0; index -= 1) {
+      const credential = found[index]!
+      const id = workbuddyAccountId(credential)
+      const entry = tombstoneOf(latest, credential, id)
+      if (entry !== undefined && tombstoneBlocks(entry, credential)) {
+        tornDown.add(id)
+        found.splice(index, 1)
+      }
+    }
 
     const sealedLiveIds = new Set(sealedFileIds.values())
     for (let index = found.length - 1; index >= 0; index -= 1) {
@@ -2374,6 +2883,10 @@ export class WorkBuddyAccountPool {
     for (const credential of archived) {
       const id = workbuddyAccountId(credential)
       if (tornDown.has(id)) continue
+      // A delete must also keep the archive copy out. Its path can be gone, so
+      // no file carries the tombstone check for it.
+      const entry = tombstoneOf(latest, credential, id)
+      if (entry !== undefined && tombstoneBlocks(entry, credential)) continue
       if (!this.isOwnSignInPath(credential.sourcePath)
         && (sealedLiveIds.has(id) || sealedDirs.has(this.homeOf(credential)))) continue
       // The archive keeps the copy a renewal was written with, and that copy
@@ -2390,6 +2903,9 @@ export class WorkBuddyAccountPool {
         refreshBlockedIds.add(workbuddyAccountId(credential))
       }
     }
+    const folded = foldSessionCopies(found, ownSignInDir(this.dataPath?.() ?? ''))
+    found.length = 0
+    found.push(...folded)
 
     const byId = new Map<string, WorkBuddyAccount>()
     // Seed with existing accounts so cooldown state survives a rescan.
@@ -2403,7 +2919,11 @@ export class WorkBuddyAccountPool {
           id,
           label: accountLabel(credential),
           credential,
-          cooldownUntilMs: 0,
+          // A hold outlives `clear()`, which is how a source switch keeps a
+          // cooling account cooling. The rebuilt row has to carry the hold's
+          // deadline too, or it becomes eligible while `activeHold` still
+          // reports it held.
+          cooldownUntilMs: Math.max(0, this.heldIds.get(id)?.until ?? 0),
           modelCooldowns: Object.create(null) as Record<string, number>,
           modelBlocks: Object.create(null) as Record<string, number>,
           rateLimitHits: 0,
@@ -2533,17 +3053,63 @@ export class WorkBuddyAccountPool {
     // assigning here would put the previous directory's accounts back.
     if (!sameDirs(this.scanDirsFor(this.authDirs), dirs)
       || rosterRevision !== this.rosterRevision) return this.accounts
-    this.accounts = ordered
-    // Kept for `penalize`, which records them so a later scan can tell a new
-    // sign-in from the one that was refused.
-    this.signInTokens = signInTokens
-    this.lastScanAtMs = Date.now()
+    // The archive and adoption phases above can take long enough for another
+    // pool to delete an account after the earlier re-read. Check the document
+    // once more and commit the roster under the same lock a delete records its
+    // tombstone with: a delete either lands before this check, where the filter
+    // sees it, or after the commit, where it is not this scan's answer to serve.
+    const tombstoneFile = this.deletedSignInsFile()
+    const commit = (): void => {
+      this.accounts = ordered
+      // Kept for `penalize`, which records them so a later scan can tell a new
+      // sign-in from the one that was refused.
+      this.signInTokens = signInTokens
+      this.lastScanAtMs = Date.now()
+    }
+    if (tombstoneFile === undefined) {
+      commit()
+      return this.accounts
+    }
+    let committed = false
+    try {
+      await withFileLock(`${tombstoneFile}.lock`, async () => {
+        const finalTombstones = await this.loadDeletedSignIns(signal)
+        if (signal.aborted
+          || !sameDirs(this.scanDirsFor(this.authDirs), dirs)
+          || rosterRevision !== this.rosterRevision) return
+        if (finalTombstones === undefined) {
+          // Unknown is not "nothing was deleted". Committing here could serve
+          // the account another pool removed while this walk was in its archive
+          // phase; the previous roster stands until the document can be read.
+          return
+        }
+        // The lock is the contract, but a writer that ignores it (an older
+        // build, a repair tool) must not slip a record in between the read and
+        // this commit. The stamp names the file the map came from.
+        if (await signInFileStamp(tombstoneFile) !== this.deletedSignInsStamp) return
+        for (let index = ordered.length - 1; index >= 0; index -= 1) {
+          const account = ordered[index]!
+          const entry = tombstoneOf(finalTombstones, account.credential, account.id)
+          if (entry !== undefined && tombstoneBlocks(entry, account.credential)) {
+            ordered.splice(index, 1)
+            this.forgetAccount(account.id)
+          }
+        }
+        commit()
+        committed = true
+      })
+    } catch (error: unknown) {
+      if (!signal.aborted) {
+        this.logger?.warn?.(`${LOG_PREFIX}: could not lock the deleted sign-ins for the final roster check: ${String(error)}`)
+      }
+    }
+    if (!committed && !signal.aborted) this.lastScanAtMs = Date.now()
     return this.accounts
   }
 
   /** All accounts, cooldown state included. */
   list(region?: WorkBuddyRegion): readonly WorkBuddyAccount[] {
-    const kept = this.accounts.filter(account => !this.removedIds.has(account.id))
+    const kept = this.accounts.filter(account => !this.storedIdMatches(this.removedIds, account))
     if (region === undefined) return kept
     return kept.filter(account => regionOf(account.credential.domain) === region)
   }
@@ -2564,10 +3130,10 @@ export class WorkBuddyAccountPool {
   ): IneligibleReason | null {
     // Removed for good, or switched off: neither may serve a request. Switched
     // off is still listed, so the panel can switch it back on.
-    if (this.removedIds.has(account.id)) return 'removed'
-    if (this.disabledIds.has(account.id)) return 'switched off'
+    if (this.storedIdMatches(this.removedIds, account)) return 'removed'
+    if (this.storedIdMatches(this.disabledIds, account)) return 'switched off'
     // Reserved credits: stop at the floor the user set for this account.
-    if (this.reserveHolds(account.id)) return 'under its credit reserve'
+    if (this.reserveHolds(account)) return 'under its credit reserve'
     // An archived account is judged by its credential like any other, below.
     // The switch that overwrote its sign-in file does not revoke its token, and
     // the global token lasts a year, so treating it as unusable threw away the
@@ -2581,6 +3147,7 @@ export class WorkBuddyAccountPool {
     // A region-scoped caller (one of the two providers) must never pick an
     // account that talks to the other region gateway.
     if (region !== undefined && regionOf(account.credential.domain) !== region) return 'other region'
+    if ((this.serverCooldowns.get(account.id) ?? 0) > now) return 'server'
     if (account.cooldownUntilMs > now) {
       // The three holds need different remedies, and the caller prints this
       // string as the advice: a balance read clears `spent`, only a fresh
@@ -2681,7 +3248,7 @@ export class WorkBuddyAccountPool {
     if (pool.length === 0) return undefined
 
     // A manual choice overrides automatic distribution, but never cooldowns.
-    const preferredId = this.preferredIds.get(region)
+    const preferredId = this.preferredIdFor(region)
     const remaining = new Set(pool.map(account => account.id))
     while (remaining.size > 0) {
       const account = pool.find(item => item.id === preferredId) ?? this.pick(pool, conversationKey)
@@ -2691,7 +3258,10 @@ export class WorkBuddyAccountPool {
       if (signal.aborted) return undefined
       // Every refresh can race a disable, removal or cooldown, including a fallback's.
       const eligible = eligibleNow()
-      if (eligible.includes(account)) return account
+      if (eligible.includes(account)) {
+        this.servedOrder.set(account.id, ++this.servedCount)
+        return account
+      }
       pool = eligible.filter(item => remaining.has(item.id))
     }
     return undefined
@@ -2726,12 +3296,41 @@ export class WorkBuddyAccountPool {
     return pickSoonestExpiry(pool, this.creditExpiries, Date.now())
   }
 
-  /** Next account the card may name. Rotating modes have none. Does not move the cursor. */
+  /**
+   * Next account the panel may name as "next up". Does not move the cursor.
+   *
+   * Sticky has no single next account - it is per conversation - so it names
+   * nothing rather than pointing at a guess. The composer readout uses
+   * `readoutPreview`, which can name the account that served last instead.
+   */
   preview(eligible: readonly WorkBuddyAccount[]): WorkBuddyAccount | undefined {
     if (eligible.length === 0) return undefined
     if (this.distribution === 'expiry') return this.pickByExpiry(eligible)
     if (this.distribution === 'priority') return eligible[0]
+    if (this.distribution === 'round-robin') return eligible[this.cursor % eligible.length]
     return undefined
+  }
+
+  /**
+   * The account the composer readout names. Does not move the cursor.
+   *
+   * Round-robin names the account the next request takes. Sticky names the one
+   * that served most recently, because the current conversation is most likely
+   * on it; before the first turn the cursor stands in.
+   */
+  readoutPreview(eligible: readonly WorkBuddyAccount[]): WorkBuddyAccount | undefined {
+    if (eligible.length === 0) return undefined
+    if (this.distribution !== 'sticky') return this.preview(eligible)
+    let latest: WorkBuddyAccount | undefined
+    let latestAt = -1
+    for (const account of eligible) {
+      const servedAt = this.servedOrder.get(account.id) ?? -1
+      if (servedAt > latestAt) {
+        latest = account
+        latestAt = servedAt
+      }
+    }
+    return latest ?? eligible[this.cursor % eligible.length]
   }
 
 
@@ -2739,6 +3338,38 @@ export class WorkBuddyAccountPool {
   prefer(accountId: string | undefined, region?: WorkBuddyRegion): void {
     if (accountId === undefined) this.preferredIds.delete(region)
     else this.preferredIds.set(region, accountId)
+  }
+
+  /**
+   * The stored preference for one region, translated from an older key.
+   *
+   * A preference saved before an identity change names a row that no rescan
+   * produces any more. Leaving it untranslated meant the panel kept a selection
+   * that could never be handed out, so automatic distribution silently served
+   * another account while the panel named the old one.
+   */
+  private preferredIdFor(region?: WorkBuddyRegion): string | undefined {
+    const stored = this.preferredIds.get(region)
+    if (stored === undefined) return undefined
+    if (this.accounts.some(account => account.id === stored)) return stored
+    const claimants = this.accounts.filter(item =>
+      (region === undefined || regionOf(item.credential.domain) === region)
+      && previousAccountIds(item.credential).includes(stored))
+    // An old nickname-only key can name more than one identity-less sign-in;
+    // picking the first would silently pin the wrong account.
+    return claimants.length === 1 && claimants[0] !== undefined ? claimants[0].id : stored
+  }
+
+  /**
+   * The current id a stored preference resolves to.
+   *
+   * The panel and the composer show this rather than the raw settings value:
+   * after an upgrade that value can still be a 1.2.3 key, and showing it made
+   * the row read as "unavailable" while `acquire` had already translated it and
+   * served another account.
+   */
+  resolvedPreferredId(region?: WorkBuddyRegion): string | undefined {
+    return this.preferredIdFor(region)
   }
 
   /**
@@ -2849,15 +3480,73 @@ export class WorkBuddyAccountPool {
   }
 
   /**
+   * Whether a refresh's rotated token still belongs to a sign-in on disk.
+   *
+   * The pool running the refresh need not be the one that deleted the sign-in,
+   * so its roster cannot answer this. The file can: it holds the token the
+   * refresh started from, the one it just minted, or something else (a re-login,
+   * or nothing after the delete). Only the first two are still this pool's to
+   * archive; anything else belongs to a session the user replaced or removed.
+   */
+  private async refreshedSignInIsOnDisk(
+    previous: WorkBuddyCredential,
+    refreshed: WorkBuddyCredential,
+  ): Promise<boolean> {
+    const read = await readCredential(refreshed.sourcePath)
+    if (read.kind !== 'credential') return false
+    return read.credential.accessToken === previous.accessToken
+      || read.credential.accessToken === refreshed.accessToken
+      // A desktop-owned file is not rewritten by a refresh, and a rotation that
+      // could not be persisted leaves the older token there. The refresh token
+      // still names the same session; a re-login brings a different one.
+      || (read.credential.refreshToken !== ''
+        && read.credential.refreshToken === refreshed.refreshToken)
+  }
+
+  /**
+   * Archive a rotated token only while its sign-in is still on disk.
+   *
+   * Checked under the tombstone lock so a delete cannot commit between the
+   * check and the archive write: before the lock, its record blocks the write;
+   * after it, the re-login has already replaced the file the check sees.
+   * Answers whether the rotated token still belongs to a live sign-in; false
+   * means the caller must not keep serving it.
+   */
+  private async archiveRefreshedCredential(
+    previous: WorkBuddyCredential,
+    refreshed: WorkBuddyCredential,
+  ): Promise<boolean> {
+    let kept = false
+    const archive = async (): Promise<void> => {
+      if (await this.refreshedSignInIsOnDisk(previous, refreshed)) {
+        await this.archiveCredentials([refreshed])
+        kept = true
+      }
+    }
+    const file = this.deletedSignInsFile()
+    if (file === undefined) {
+      await archive()
+      return kept
+    }
+    try {
+      await withFileLock(`${file}.lock`, archive)
+    } catch (error: unknown) {
+      this.logger?.warn?.(`${LOG_PREFIX}: could not lock the deleted sign-ins to archive a renewed token: ${String(error)}`)
+      return false
+    }
+    return kept
+  }
+
+  /**
    * Refresh the account's access token when it is within the margin (or already
    * expired), in-flight de-duped per account. A failed refresh keeps the
    * existing token when it has not yet expired, so an unreachable refresh
    * endpoint never takes down a working session.
    *
    * Reports what it did, so a caller walking the pool for keep-alive can tell a
-   * pass that refreshed something from one that had nothing to do. The answer
-   * describes this call, not the account: an in-flight refresh another call
-   * started is reported as `fresh` because this one spent no upstream call.
+   * pass that refreshed something from one that had nothing to do. An in-flight
+   * refresh another call started is awaited and its result is shared: this call
+   * spent no upstream call of its own, but the account's outcome is the same.
    */
   async ensureFresh(account: WorkBuddyAccount, forced = false): Promise<KeepAliveOutcome> {
     if (this.client === undefined) return 'fresh'
@@ -2889,8 +3578,12 @@ export class WorkBuddyAccountPool {
       }
       try {
         const outcome = await this.client!.refreshToken(credential)
-        // A desktop re-login during the refresh supersedes this response.
-        if (account.credential !== credential) return 'fresh'
+        // A desktop re-login during the refresh supersedes this response; so
+        // does a delete, which drops the account object from the roster. The
+        // token this call minted belongs to a session the pool no longer
+        // serves, and archiving it after the re-login released the tombstone
+        // let the old session outrank the new sign-in.
+        if (account.credential !== credential || !this.accounts.includes(account)) return 'failed'
         account.credential = {
           ...credential,
           accessToken: outcome.accessToken,
@@ -2920,13 +3613,19 @@ export class WorkBuddyAccountPool {
           // the next renewal is refused. A disk that would not take the file
           // (ENOSPC, a sharing violation past the retry budget) is not a reason
           // to drop a credential that is the only working copy left. The archive
-          // is a separate document from the `.info` file, so it is written here
-          // even though the file is not; the return value still reports `failed`
-          // so the caller does not treat this as persisted.
-          this.logger?.warn?.(`${LOG_PREFIX}: could not persist the renewed token for ${accountLogTag(account.label)}; keeping it in memory and the archive`, error)
-          await this.archiveCredentials([account.credential]).catch((archiveError: unknown) => {
-            this.logger?.error?.(`${LOG_PREFIX}: could not archive the renewed token for ${accountLogTag(account.label)}`, archiveError)
-          })
+          // is a separate document from the `.info` file, so the rotation is
+          // kept there while its sign-in is still on disk; the return value
+          // still reports `failed` so the caller does not treat this as
+          // persisted.
+          this.logger?.warn?.(`${LOG_PREFIX}: could not persist the renewed token for ${accountLogTag(account.label)}`, error)
+          if (!await this.archiveRefreshedCredential(credential, account.credential)) {
+            // Another pool deleted the sign-in or replaced it with a re-login.
+            // The rotation belongs to that dead session; keeping it (or the
+            // previous token) in the roster would serve a deleted sign-in until
+            // the next scan.
+            account.credential = credential
+            this.forgetAccount(account.id)
+          }
           throw error
         }
         if (!written) {
@@ -2937,8 +3636,16 @@ export class WorkBuddyAccountPool {
           return 'fresh'
         }
         // Kept after the file commit, so a refresh superseded by a re-login
-        // cannot enter the archive as the newest copy.
-        await this.archiveCredentials([account.credential])
+        // cannot enter the archive as the newest copy. The check also catches a
+        // delete by another pool, whose file is already gone.
+        if (!await this.archiveRefreshedCredential(credential, account.credential)) {
+          // The file this rotation was written to is gone or now holds another
+          // sign-in. Drop the row so the pool stops offering the deleted
+          // session; the next scan rebuilds it from disk, including a re-login.
+          account.credential = credential
+          this.forgetAccount(account.id)
+          return 'failed'
+        }
         this.noRefreshWarned.delete(account.id)
         // A token the upstream minted is proof the sign-in works again, so a hold
         // that said otherwise is dropped here rather than at its cap: without this
@@ -2970,7 +3677,9 @@ export class WorkBuddyAccountPool {
     try {
       return await run
     } finally {
-      this.refreshInflight.delete(account.id)
+      // The map may hold a newer run for the same id after a clear and a
+      // rescan; this one must not delete it when it settles.
+      if (this.refreshInflight.get(account.id) === run) this.refreshInflight.delete(account.id)
     }
   }
 
@@ -2993,13 +3702,16 @@ export class WorkBuddyAccountPool {
     resetAtMs?: number,
     modelId?: string,
     hold: false | PoolHoldReason = false,
+    failure: 'limit' | 'server' = 'limit',
   ): void {
     const account = this.accounts.find(item => item.id === accountId)
     if (account === undefined) return
-    // The row's "rate-limit hits" counts actual limits, not holds: a spent
-    // balance or a refused sign-in never saw a 429, and counting it there told
-    // the user to wait out a window that was never the problem.
-    if (hold === false) account.rateLimitHits += 1
+    // The row's "rate-limit hits" counts actual limits, not holds or server
+    // faults: a spent balance, a refused sign-in or a 5xx never saw a 429, and
+    // counting it there told the user to wait out a window that was never the
+    // problem.
+    const countsAsLimit = hold === false && failure === 'limit'
+    if (countsAsLimit) account.rateLimitHits += 1
     // Cap even a caller-supplied reset: the parse layer already caps, but a
     // raw timestamp passed straight in must not sleep an account all day. The
     // configured window is the user's own choice and is not capped.
@@ -3011,7 +3723,7 @@ export class WorkBuddyAccountPool {
     // spent credits and a refused sign-in are facts about the credential, not a
     // frequency wall the next attempt would clear. Counting them stretched the
     // window for the limit that came after.
-    if (hold === false && !stated) {
+    if (countsAsLimit && !stated) {
       const sinceLast = now - (account.rateLimitStreakAtMs ?? 0)
       account.rateLimitStreak = sinceLast > RATE_LIMIT_STREAK_WINDOW_MS ? 1 : (account.rateLimitStreak ?? 0) + 1
       account.rateLimitStreakAtMs = now
@@ -3022,7 +3734,9 @@ export class WorkBuddyAccountPool {
     // how often this account has failed in a row, so a persistently limited account
     // stops returning to the queue every configured minute to fail again.
     const streak = Math.min(Math.max((account.rateLimitStreak ?? 1) - 1, 0), RATE_LIMIT_STREAK_STEPS)
-    const backoff = Math.min(this.cooldownMs * 2 ** streak, Math.max(this.cooldownMs, RATE_LIMIT_STREAK_CAP))
+    const backoff = countsAsLimit
+      ? Math.min(this.cooldownMs * 2 ** streak, Math.max(this.cooldownMs, RATE_LIMIT_STREAK_CAP))
+      : this.cooldownMs
     const until = stated ? Math.min(resetAtMs, now + cap) : holdReason !== undefined ? now + cap : now + backoff
     if (modelId !== undefined && modelId !== '') {
       pruneModelCooldowns(account, now)
@@ -3034,6 +3748,10 @@ export class WorkBuddyAccountPool {
       return
     }
     account.cooldownUntilMs = Math.max(account.cooldownUntilMs, until)
+    // The server window, not the merged deadline: a longer balance hold must not
+    // turn this mark into a reason that outlives the server fault by hours.
+    if (failure === 'server' && hold === false) this.serverCooldowns.set(account.id, until)
+    else this.serverCooldowns.delete(account.id)
     // Recorded only for the account-wide hold, which is the only shape a balance
     // read can release: a per-model cooldown belongs to the upstream's window.
     // A live `session` hold keeps both its reason and the sign-in that caused it
@@ -3096,6 +3814,7 @@ export class WorkBuddyAccountPool {
     }
     this.heldIds.clear()
     this.refusedSignIns.clear()
+    this.serverCooldowns.clear()
   }
 
   /** Diagnostics snapshot. Account-wide cooling count (per-model cooling excluded:

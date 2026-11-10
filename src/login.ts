@@ -82,6 +82,13 @@ function originFor(realm: WorkBuddyRegion): string {
  * upstream answer that named `javascript:` or `file:` would otherwise be handed
  * straight to the desktop shell.
  */
+const LOGIN_AUTH_HOSTS = new Set([
+  'copilot.tencent.com',
+  'www.codebuddy.cn',
+  'www.codebuddy.ai',
+  'www.workbuddy.ai',
+])
+
 function checkedAuthUrl(value: string): string {
   let parsed: URL
   try {
@@ -91,6 +98,12 @@ function checkedAuthUrl(value: string): string {
   }
   if (parsed.protocol !== 'https:') {
     throw new Error('workbuddy login start returned a non-https url')
+  }
+  // The panel hands this URL to the desktop shell without looking at it. A
+  // vendor answer that names any other host would open an attacker's page in
+  // the user's browser, so only the hosts this vendor itself uses are allowed.
+  if (parsed.username !== '' || parsed.password !== '' || !LOGIN_AUTH_HOSTS.has(parsed.hostname)) {
+    throw new Error('workbuddy login start returned an unexpected host')
   }
   return value
 }

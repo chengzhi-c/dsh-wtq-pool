@@ -149,9 +149,9 @@
         label: 'qi.cn@example.com',
         region: 'cn',
         // A sign-in the upstream refused. Its own expiry still reads as weeks
-        // away, which is why the refusal used to stay invisible until a read
-        // spent an upstream call on it: the upstream revokes the session the
-        // sign-in belongs to without rewriting the token's expiry.
+        // away: the upstream revokes the session without rewriting the token's
+        // expiry, so the refusal stays invisible until a read spends an upstream
+        // call on it.
         expiresAt: iso(12),
         cooling: true,
         cooldownUntil: new Date(Date.now() + 6 * 3600 * 1000).toISOString(),

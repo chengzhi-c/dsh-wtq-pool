@@ -113,12 +113,12 @@ test('the host settings card, a rescan and a new login all drop the read', () =>
   // A neighbouring branch must not satisfy this block's assertion.
   assert.match(bodyOf('async function onHostSettingsChanged(next)'), /await applySettingsEverywhere\(toggled\)/,
     'a host settings change must reach the shared reconciliation')
-  assert.match(bodyOf('async function applySettingsEverywhere(toggled)'), /if \(toggled\)[\s\S]*?growthRead = null/,
+  assert.match(bodyOf('async function applySettingsEverywhere(toggled)'), /if \(toggled\)[\s\S]*?invalidateGrowthRead\(\)/,
     'a source or region switched in the host settings must drop the read')
-  assert.match(bodyOf('case "xd.rescan": {'), /growthRead = null/,
+  assert.match(bodyOf('case "xd.rescan": {'), /invalidateGrowthRead\(\)/,
     'a rescan can add or retire accounts, so it must drop the read')
   assert.match(bodyOf('case "xd.rescan": {'), /core\.pool\.rescan\(\)/,
     'a manual rescan must not reuse a snapshot started before the click')
-  assert.match(bodyOf('case "xd.pollLogin": {'), /growthRead = null/,
+  assert.match(bodyOf('case "xd.pollLogin": {'), /invalidateGrowthRead\(\)/,
     'an account that just landed is not in a read taken before it')
 })

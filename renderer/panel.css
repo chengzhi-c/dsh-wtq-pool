@@ -805,8 +805,8 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
 .auto-hours .search { width: 6em; padding-left: 9px; background-image: none; }
 
 /* A switch the user has to find on their own: its own card, a real heading, and
-   a click row wide enough to hit. It used to sit under the check-in card as a
-   line of 12.5px muted text, which read as a caption for the block above it. */
+   a click row wide enough to hit. A line of 12.5px muted text under the check-in
+   card reads as a caption for the block above it. */
 .switch-row { display: flex; align-items: flex-start; gap: 10px; margin-top: 10px; }
 /* The composer readout switch. Rounded like the other controls inside a card —
    the pill shape belongs to the outer category tabs, and a second pill one level

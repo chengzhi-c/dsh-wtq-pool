@@ -256,6 +256,13 @@ test('two sign-ins with no identity at all stay two accounts', async () => {
       'the source path is the only identity these carry, so it must key them apart')
     assert.equal(idOf(dirs[0]), workbuddyAccountId({ sourcePath: path.join(dirs[0], 'workbuddy-desktop.info') }),
       'the same file must still key to the same account')
+    // A nickname is not an identity: two accounts can share one, and hashing it
+    // alone made the second credential overwrite the first.
+    assert.notEqual(
+      workbuddyAccountId({ nickname: 'Alice', sourcePath: path.join(dirs[0], 'a.info') }),
+      workbuddyAccountId({ nickname: 'Alice', sourcePath: path.join(dirs[1], 'b.info') }),
+      'two sign-ins with the same nickname but no uin/uid stay two accounts',
+    )
   } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
 })
 
@@ -1103,6 +1110,7 @@ test('a second Qoder read in one process still opens the sealed session', async 
     // The unwrap writes the blob on stdin and reads the key on stdout; both
     // listeners are attached by the time stdin is ended.
     fake.stdin = {
+      on: () => {},
       end: () => {
         fake.stdout.emit('data', key.toString('base64'))
         fake.emit('close', 0)
@@ -2505,11 +2513,14 @@ test('a forced refresh holds the pass slot until the background pass has finishe
     loadGeneration: 1,
     refreshInflight: null,
     refreshTimer: null,
+    refreshPending: false,
+    scheduleRefresh: () => {},
     REFRESH_PASS_BUDGET_MS: 18000,
     activeRegions: () => [],
     runtimes: new Map(), traeGateways: new Map(), qoderGateways: new Map(),
     poolNeedsScan: false, pendingRuntimeStops: [],
     core: { pool: { scan: async () => {} } },
+    settings: { enabled: true },
     stillLoaded: () => true,
     stalePass: () => ({ stale: true }),
     adoptHostSettings: async () => {},
@@ -3061,6 +3072,35 @@ test('a sticky conversation keeps the account it started on', async () => {
     'the same conversation must keep its account, or the upstream prompt cache is discarded mid-conversation')
   assert.notEqual(other?.id, first?.id,
     'and a different conversation takes a different one, which is what spreads the spend')
+  assert.equal(pool.readoutPreview(pool.available(Date.now()))?.id, other?.id,
+    'the composer readout names the account the latest turn ran on instead of a dash')
+  assert.equal(pool.preview(pool.available(Date.now())), undefined,
+    'the panel still marks no next account: sticky has no single next one')
+})
+
+test('a rotating mode names the account the composer readout will show', async () => {
+  const dir = scratch('round-robin-preview')
+  for (const name of ['one', 'two', 'three']) {
+    fs.writeFileSync(path.join(dir, name + '.info'), JSON.stringify({
+      auth: { accessToken: 'token-' + name, refreshToken: 'r', expiresAt: 0, domain: 'www.workbuddy.cn' },
+      account: { uin: 'uin-' + name, nickname: name },
+    }))
+  }
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const pool = new WorkBuddyAccountPool({ authDirs: [dir], cooldownMs: 60_000, distribution: 'round-robin' })
+  const first = await pool.acquire()
+  const order = pool.list().map((account) => account.id)
+  const next = pool.preview(pool.available(Date.now()))
+  assert.equal(next?.id, order[1 % order.length],
+    'the readout names the account the next request takes, without advancing the cursor')
+  assert.equal(pool.preview(pool.available(Date.now()))?.id, next?.id,
+    'a read does not move the rotation')
+  const second = await pool.acquire()
+  assert.equal(second?.id, next?.id, 'the request follows the account the readout named')
+  assert.equal(pool.preview(pool.available(Date.now()))?.id, order[2 % order.length])
+  assert.equal(pool.readoutPreview(pool.available(Date.now()))?.id, order[2 % order.length],
+    'the composer readout and the panel next-up agree in round-robin')
+  assert.equal(first?.id, order[0], 'the first request takes the head of the rotation')
 })
 
 /**
@@ -3805,10 +3845,10 @@ test('the panel keeps polling while every account is cooling', () => {
   const disabled = new Set()
   const regionsOff = new Set()
   const core = { pool: { list: () => accounts, isDisabled: (id) => disabled.has(id) } }
-  new Function('module', 'exports', 'require', 'core', 'regionEnabled', 'regionOf', 'probeCache', 'PROBE_TTL_MS',
+  new Function('module', 'exports', 'require', 'core', 'regionEnabled', 'regionOf', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS',
     grab('cooldownPending') + '\n' + grab('probesStale') + '\nmodule.exports = { cooldownPending, probesStale };',
   )(mod, mod.exports, require, core, (source, region) => !regionsOff.has(source + ':' + region),
-    () => 'cn', new Map(), 60000)
+    () => 'cn', new Map(), 60000, 15000)
   const accounts = [{ id: 'a', credential: { domain: 'www.codebuddy.cn' }, cooldownUntilMs: Date.now() + 60000 }]
   assert.equal(mod.exports.probesStale(accounts), false, 'a cooling account is never probed')
   assert.equal(mod.exports.cooldownPending(accounts), true,
@@ -3857,9 +3897,9 @@ test('a check-in-only probe keeps the cached balance and cannot satisfy a full r
       fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false }),
     },
   }
-  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'signInRefused', 'safeMessage',
+  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS', 'signInRefused', 'safeMessage',
     balanced(source, start) + '\nmodule.exports = { accountProbe }',
-  )(mod, mod.exports, core, probeCache, 60000, () => false, (error) => String(error?.message ?? error))
+  )(mod, mod.exports, core, probeCache, 60000, 15000, () => false, (error) => String(error?.message ?? error))
 
   try {
     const full = await mod.exports.accountProbe(account, true, false)
@@ -3883,6 +3923,65 @@ test('a check-in-only probe keeps the cached balance and cannot satisfy a full r
   } finally {
     probeCache.clear()
   }
+})
+
+/**
+ * A transient balance failure must not hold the composer on "—" for the full
+ * cache window.
+ */
+test('a failed balance read is retried before its cache window ends', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'host.ts'), 'utf8')
+  const grab = (name) => {
+    const start = source.indexOf('function ' + name + '(')
+    assert.ok(start > 0, name + ' is where it is expected')
+    return balanced(source, start)
+  }
+  const mod = { exports: {} }
+  const account = { id: 'a', credential: { domain: 'www.codebuddy.cn' } }
+  const probeCache = new Map()
+  let creditReads = 0
+  const core = {
+    pool: {
+      list: () => [account],
+      isDisabled: () => false,
+      readAfterRefresh: async (_id, read) => read({}),
+      setCreditBalance: () => {},
+    },
+    client: {
+      fetchCredits: async () => {
+        creditReads += 1
+        return { total: 11, packages: [] }
+      },
+      fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false }),
+    },
+  }
+  const probeStart = source.indexOf('async function accountProbe(')
+  assert.ok(probeStart > 0, 'accountProbe is where it is expected')
+  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS',
+    'signInRefused', 'safeMessage', 'regionEnabled', 'regionOf',
+    balanced(source, probeStart) + '\n' + grab('probesStale') + '\nmodule.exports = { accountProbe, probesStale }',
+  )(mod, mod.exports, core, probeCache, 60000, 15000, () => false,
+    (error) => String(error?.message ?? error), () => true, () => 'cn')
+
+  const failed = { creditsError: 'upstream unavailable' }
+  probeCache.set(account.id, { atMs: Date.now() - 20000, value: failed })
+  assert.equal(mod.exports.probesStale(), true, 'an old failed read is stale before the success TTL')
+  const recovered = await mod.exports.accountProbe(account, true, false)
+  assert.equal(recovered.credits.total, 11, 'the retry replaces the failure with the balance')
+  assert.equal(creditReads, 1)
+
+  probeCache.set(account.id, { atMs: Date.now(), value: failed })
+  assert.equal(mod.exports.probesStale(), false, 'a fresh failure is not retried on every poll')
+  creditReads = 0
+  const held = await mod.exports.accountProbe(account, true, false)
+  assert.equal(held.creditsError, 'upstream unavailable', 'and the cached failure is served meanwhile')
+  assert.equal(creditReads, 0)
+
+  probeCache.set(account.id, {
+    atMs: Date.now() - 20000,
+    value: { credits: { total: 7, packages: [] }, checkin: { active: true } },
+  })
+  assert.equal(mod.exports.probesStale(), false, 'a good read keeps the full cache window')
 })
 
 /**
@@ -4622,4 +4721,79 @@ test('a Qoder business refusal is redacted before the single-account answer', as
   assert.equal(answer.outcome, 'failed')
   assert.equal(answer.retry, false)
   assert.equal(answer.reason, 'Claim refused: Bearer [redacted]; contact [account]')
+})
+
+/**
+ * Two sign-ins can share a display name.
+ *
+ * The picked account, a failure hold and a check-in row are keyed by that
+ * label. A duplicate let one account's failure hide the other, so a repeated
+ * name gets the vendor's own user id appended; a unique name is untouched.
+ */
+test('two source accounts with one display name get distinct labels', () => {
+  const { uniqueSourceLabels } = require('../src/source-pool.ts')
+  const rows = [
+    { name: 'Alice', id: 'user-1' },
+    { name: 'Alice', id: 'user-2' },
+    { name: 'Bob', id: 'user-3' },
+  ]
+  assert.deepEqual(uniqueSourceLabels(rows, (row) => row.name, (row) => row.id),
+    ['Alice#user1', 'Alice#user2', 'Bob'],
+    'only the repeated name carries a suffix, and the suffix is the vendor id')
+  assert.deepEqual(uniqueSourceLabels(rows.slice(2), (row) => row.name, (row) => row.id), ['Bob'],
+    'a name used once stays exactly as the vendor publishes it')
+  const noId = [{ name: 'Twin' }, { name: 'Twin' }]
+  assert.deepEqual(uniqueSourceLabels(noId, (row) => row.name, () => ''),
+    ['Twin', 'Twin'],
+    'without an id there is nothing stable to append; the pool must not invent one')
+  const sequential = [
+    { name: 'Twin', id: '22733912345' },
+    { name: 'Twin', id: '22733912346' },
+  ]
+  assert.deepEqual(uniqueSourceLabels(sequential, (row) => row.name, (row) => row.id),
+    ['Twin#33912345', 'Twin#33912346'],
+    'ids sharing a prefix must still produce distinct labels')
+})
+
+/**
+ * A retired activation's refresh is not this pool's answer.
+ *
+ * A source switch clears the roster and rebuilds it from disk; the same account
+ * id can return. The in-flight map survived that clear, so the new account
+ * awaited a refresh that had updated the old object and received a verdict for
+ * a token it never held.
+ */
+test('a pool clear drops in-flight refreshes', () => {
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const pool = new WorkBuddyAccountPool({ authDirs: [] })
+  pool.refreshInflight.set('old-account', Promise.resolve('refreshed'))
+  pool.clear()
+  assert.equal(pool.refreshInflight.size, 0, 'the next scan must start its own refresh')
+})
+
+/**
+ * A nickname is not a billing identity.
+ *
+ * The account id now includes the source path when there is no uin/uid, so the
+ * adoption guard must use the same rule. Treating a nickname as enough let the
+ * plugin copy the same snapshot into a new file on every scan, each copy a new
+ * account spending the same refresh token.
+ */
+test('a nickname-only sign-in is not adopted into a new copy on every scan', async () => {
+  const dir = scratch('nickname-only-')
+  const data = path.join(dir, 'plugin-data')
+  fs.mkdirSync(data, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'workbuddy-desktop.info'), JSON.stringify({
+    auth: { accessToken: 'token-nick', refreshToken: 'refresh-nick', expiresAt: Date.now() + 3600_000, domain: 'www.workbuddy.cn' },
+    account: { nickname: 'OnlyName' },
+  }))
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const pool = new WorkBuddyAccountPool({ authDirs: [dir], dataPath: () => data, cooldownMs: 60_000 })
+  try {
+    assert.equal((await pool.scan()).length, 1)
+    assert.equal((await pool.scan()).length, 1,
+      'a snapshot with no uin/uid keeps serving from where it lies; it must not spawn a copy per scan')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })

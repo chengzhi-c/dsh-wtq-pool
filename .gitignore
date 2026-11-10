@@ -39,6 +39,8 @@ credentials-archive.json.*.tmp
 checkin-slots.json.tmp
 deleted-signins.json.*.tmp
 deleted-signins.json.lock
+credentials-archive.json.lock
+settings.json.lock
 # Written next to the plugin when the host rewrites its manifest, and the pack
 # outputs put beside the repo by a build. Neither belongs in a commit.
 manifest.json.tmp

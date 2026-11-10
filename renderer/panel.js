@@ -1571,11 +1571,10 @@ function claimSourceCheckins(source) {
     var counts = payload ? payload[source] : null;
     var claimed = counts && typeof counts.claimed === "number" ? counts.claimed : 0;
     var failed = counts && typeof counts.failed === "number" ? counts.failed : 0;
-    // A round that failed used to read as "every account is already checked in
-    // today": the counts carry `failed` (and the reason), a source whose round
-    // threw carries none of its own, and the panel read the missing number as
-    // "nothing to collect". The user was told the day was done while nothing
-    // had been collected. The same answer has to be visible, not only announced.
+    // A failed round must not read as "every account is already checked in
+    // today": the counts carry `failed` (and the reason), but a source whose
+    // round threw carries none of its own. The missing number is a failure, not
+    // "nothing to collect". The same answer has to be visible, not only announced.
     if (failed > 0) note(checkinFailureText(claimed, failed, counts && counts.reason), "warn");
     else if (claimed === 0) note(t("pool.checkinAllNone"));
     else announce(t("pool.checkinAllDone", { count: claimed }));
@@ -1701,9 +1700,9 @@ function claimSourceCheckin(source, account) {
       note(null);
       var result = payload && payload.result ? payload.result : {};
       // A skipped claim can carry the upstream's own reason (Trae answers 9095
-      // "this device already checked in today"), which is worth reading. A
-      // skipped claim used to reach the screen reader only, so the button looked
-      // inert; the banner now says why on the visible page.
+      // "this device already checked in today"), which is worth reading. It is
+      // shown on the visible page, not only announced to the screen reader, so
+      // the button does not look inert.
       //
       // A click can also land on a row the automatic pass has already collected:
       // the host answers `skipped` with `todayCheckedIn`. The account is in the
@@ -2420,9 +2419,9 @@ function accountCard(account) {
   // "Not right now" and "not mine any more" are different decisions, so they
   // stay separate controls: a switch the user flips, and a plain remove button.
   var controls = el("div", "acct-controls");
-  // Greys only while an action is actually touching an account. These used to
-  // follow the whole-panel `busy`, so a refresh or a doctor pass greyed every
-  // row and dropped the labels to a contrast the muted text could not carry.
+  // Greys only while an action is actually touching an account. Following the
+  // whole-panel `busy` would grey every row during a refresh or a doctor pass
+  // and drop the labels to a contrast the muted text could not carry.
   // Any action in flight, not just the account ones: `setAccountState` answers a
   // press made while another control is busy with "nothing" - it returns without
   // even raising the busy banner - so a row that stayed enabled was a press that
@@ -3356,9 +3355,9 @@ var THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"
  * The host sizes its budget from what the declaration says, and `src/host.ts`
  * clamps an override to the catalog's figure before publishing — so an override
  * stored above it (the catalog shrank after it was saved) is not what the model
- * runs at. Showing it verbatim put a number in the field that the field's own
- * `max` then refused to accept, and the panel read as if the model had more room
- * than it has.
+ * runs at. Showing it verbatim puts a number in the field that the field's own
+ * `max` then refuses to accept, and the panel reads as if the model has more
+ * room than it has.
  */
 function withinCeiling(saved, ceiling) {
   if (typeof saved !== "number") return null;
@@ -3424,10 +3423,10 @@ function reclampEntry(entry, model) {
   // the ceiling. Handing the ceiling over would clamp the output to the Max tier's
   // smaller budget while the field is still showing the default window.
   //
-  // Through `clampOutput` rather than a bare `withinCeiling`, so the output is held
-  // the same way: a refresh that lowers the ceiling used to cut the draft's budget
-  // with no user action, which then read as an unsaved edit against the stored
-  // figure and let one unrelated save write the smaller number down.
+  // Through `clampOutput` rather than a bare `withinCeiling`, so the output is
+  // held the same way: a refresh that lowers the ceiling must not cut the draft's
+  // budget with no user action, which would read as an unsaved edit against the
+  // stored figure and let one unrelated save write the smaller number down.
   clampOutput(model, entry);
   // Half-typed text does not survive a ceiling that no longer admits it. Left in
   // place it became the field's value beside a `max` that now refuses it - the one
@@ -3825,9 +3824,9 @@ function numberInput(value, onChange, ceiling, onRefused, onText, committed) {
   input.value = String(value);
   // The whole sheet is rebuilt on every repaint, and a repaint really does land
   // between two keystrokes: the panel polls every 1.2 s while a refresh runs and
-  // every 2 s for the check-in log. Only the committed value used to survive, so
-  // a half-typed number was replaced mid-entry and the edit was silently lost.
-  // Holding the raw text lets the rebuilt field show what the user is typing.
+  // every 2 s for the check-in log. Holding the committed value replaces a
+  // half-typed number mid-entry and loses the edit; holding the raw text lets the
+  // rebuilt field show what the user is typing.
   input.addEventListener("input", function () {
     if (typeof onText === "function") onText(input.value);
   });
@@ -4078,10 +4077,10 @@ function adopt(next) {
 }
 
 function runBusy(id, work) {
-  // A second action while one is running used to reject here and nowhere else:
-  // every caller answers with its own `.catch(function () {})`, so the click did
-  // nothing and said nothing. The banner is raised here, once, so a busy panel
-  // answers every control the same way.
+  // A second action while one is running must answer here, once: every caller
+  // answers with its own `.catch(function () {})`, so rejecting only here would
+  // make the click do nothing and say nothing. The banner is raised here so a
+  // busy panel answers every control the same way.
   if (busy !== null) {
     note(t("err.busy"), "warn");
     return Promise.reject(new Error("panel is busy"));

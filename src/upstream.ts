@@ -229,7 +229,7 @@ const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000
 const ASSUMED_TOKEN_LIFETIME_MS = 60 * 60 * 1000
 
 /** Longest expiry `Date` can represent; anything past it is not a date. */
-const MAX_EXPIRY_MS = 4_102_444_800_000
+export const MAX_EXPIRY_MS = 4_102_444_800_000
 
 /**
  * Absolute expiry for a token the vendor issued, from its `expiresIn`.
@@ -778,8 +778,14 @@ export async function readErrorBody(
   return text.length > limitBytes ? text.slice(0, limitBytes) : text
 }
 
-async function readEnvelope(response: Response): Promise<Envelope> {
-  const text = await response.text()
+async function readEnvelope(response: Response, signal?: AbortSignal): Promise<Envelope> {
+  // An error page declares no useful size and used to be read whole before the
+  // caller sliced it to 160 characters; a large HTML page could stall the
+  // process. An error status is bounded here, while a success document is the
+  // answer itself and is parsed in full.
+  const text = response.ok
+    ? await response.text()
+    : await readErrorBody(response, ERROR_BODY_LIMIT, signal)
   if (isGatewayHtmlRejection(response.status, text)) {
     // The status is interpolated rather than written: this branch accepts 401
     // and 403, and naming 401 for a 403 sends the reader looking for a

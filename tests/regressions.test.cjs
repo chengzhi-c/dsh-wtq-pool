@@ -1611,6 +1611,29 @@ test('a credential echoed by an upstream never survives into the client body', (
   // disclosure for an undiagnosable error.
   assert.equal(redactSecrets('POST /v1/chat/completions returned 4001'), 'POST /v1/chat/completions returned 4001')
   assert.equal(redactSecrets('the request took 1/2 a second and/or failed'), 'the request took 1/2 a second and/or failed')
+  // Bare account identifiers and cookies are credentials too: an upstream echo
+  // that prints them identifies the account even when no token is present.
+  assert.equal(redactSecrets('{"uin":123456789,"uid":"u_987654321"}').includes('123456789'), false)
+  assert.equal(redactSecrets('{"uin":123456789,"uid":"u_987654321"}').includes('u_987654321'), false)
+  assert.equal(redactSecrets('Cookie: SESSION=abcdef0123456789; uid=123456789').includes('abcdef0123456789'), false)
+  assert.equal(redactSecrets('Cookie: SESSION=abcdef0123456789; uid=123456789').includes('123456789'), false)
+  // A cookie header is a set, not one value: every cookie after the first `;`
+  // is a credential too, and a quoted Set-Cookie carries one as well.
+  for (const cookie of [
+    'Cookie: a=1; session=SECRETVALUE123',
+    'Cookie: SESSION=abcdef0123456789; other=SECRETVALUE123',
+    'Set-Cookie: session="SECRETVALUE123"; Path=/',
+    '{"Cookie":"session=\"SECRETVALUE123\""}',
+    '{"Set-Cookie":"session=\"SECRETVALUE123\"; Path=/","code":6004}',
+    '{"Cookie":"session="SECRETVALUE123""}',
+    '{"Cookie":"a=1, session=SECRETVALUE123","code":6004}',
+  ]) {
+    assert.equal(redactSecrets(cookie).includes('SECRETVALUE123'), false, `a cookie leaked from: ${cookie}`)
+  }
+  const cookieJson = redactSecrets('{"Cookie":"a=1; session=SECRETVALUE123","code":6004}')
+  assert.equal(cookieJson.includes('SECRETVALUE123'), false, 'a JSON cookie leaked')
+  assert.equal(cookieJson.includes('"code":6004'), true, 'the field after a cookie stays readable')
+  assert.equal(redactSecrets('User-Id: abcdef123456').includes('abcdef123456'), false)
 })
 
 /**

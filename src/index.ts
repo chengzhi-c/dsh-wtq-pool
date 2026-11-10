@@ -600,7 +600,7 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
       // `onLoad` makes that can carry a logger.
       reportSchemaDegradation(ctx.logger)
       const dir = path.join(dshHome(), 'dsh-wtq-pool')
-      await fs.mkdir(dir, { recursive: true })
+      await fs.mkdir(dir, { recursive: true, mode: 0o700 })
       return dir
     },
     onSettingsChanged: (handler) => {
@@ -749,7 +749,9 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
       // re-runs this callback, and its effect has to be released with the fiber
       // that owns the routes.
       effect: (callback) => webCtx.effect(callback, 'dsh-wtq-pool: panel routes'),
-      logger: ctx.logger,
+      // The panel reads files and answers thrown errors, so its logger needs the
+      // same redaction the gateways apply: an fs error carries the install path.
+      logger: { warn: (...args: unknown[]) => ctx.logger.warn(...args.map(safeMessage)) },
     })
   })
 
@@ -772,6 +774,9 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
     // is still closing the old ones would have the old continuation clear the
     // new activation's entries.
     await stopRegisteredService()
+    // A newer activation can start while the stop above is awaited. Its
+    // gateways belong to it, so the old teardown must not run onUnload now.
+    if (token !== activationToken) return
     await onUnload()
   })
 
@@ -780,7 +785,8 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
       // Checked here as well as in the catch: a teardown that lands while
       // `onLoad` is still pending must not be followed by this activation
       // starting its gateways back up.
-      if (!stopped) return startRegisteredService()
+      // A newer activation owns the service table now; its own load starts it.
+      if (!stopped && token === activationToken) return startRegisteredService()
       return undefined
     })
     .catch((error: unknown) => {

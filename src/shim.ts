@@ -438,6 +438,13 @@ export function unavailableAnswer(
       detail: `no WorkBuddy account has model ${modelId} in its plan; pick another model, or add an account whose plan includes it`,
     }
   }
+  if (only === 'server') {
+    return {
+      status: 503,
+      code: 'server',
+      detail: `every WorkBuddy account is cooling after upstream server errors for model ${modelId}; retry shortly`,
+    }
+  }
   if (only === 'restricted by the upstream') {
     return {
       status: 403,
@@ -613,7 +620,9 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                       ? (emptyStreams > 0 && transportAttempts === 0
                         ? `every WorkBuddy account answered${model} with an empty stream`
                         : `the upstream host could not be reached on any account${model}`)
-                      : `every account is rate-limited${model}`
+                      : last.kind === 'server'
+                        ? `every WorkBuddy account answered${model} with an upstream server error`
+                        : `every account is rate-limited${model}`
           const advice = last.kind === 'soft_rate'
             ? 'resets at the upstream window'
             : last.kind === 'model_tier'
@@ -626,9 +635,11 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                     ? (emptyStreams > 0 && transportAttempts === 0
                       ? 'the upstream answered and then produced no content; retry the request'
                       : 'check the connection to the upstream host')
-                    : last.kind === 'hard_credit'
-                      ? 'top up the account, or add another account'
-                      : 'sign in again in the desktop app'
+                    : last.kind === 'server'
+                      ? 'retry shortly; the upstream service is down'
+                      : last.kind === 'hard_credit'
+                        ? 'top up the account, or add another account'
+                        : 'sign in again in the desktop app'
           // A client that reads `Retry-After` should not have to guess the
           // window from prose. Every account is cooling by now, so the pool can
           // name the soonest one that comes back.
@@ -1013,7 +1024,10 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
        * 402 back at the head of the queue every minute. A WAF page is the
        * gateway's own and clears on its own within minutes, so it takes the
        * configured window rather than a hold that would park a healthy account
-       * for hours over a transient block.
+       * for hours over a transient block. A 5xx is the upstream's own fault, but
+       * it is still served per account: one broken deployment must not lead
+       * every turn, so it takes the configured window and the next account gets
+       * the request.
        *
        * A `transport` failure is the network path's. A global pool need not
        * share a host: `codebuddy.ai` and `workbuddy.ai` logins can be served by
@@ -1038,7 +1052,8 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       if (result.kind !== 'soft_rate' && result.kind !== 'waf_block'
         && result.kind !== 'hard_credit' && result.kind !== 'session_dead'
         && result.kind !== 'model_tier'
-        && result.kind !== 'account_restricted') break
+        && result.kind !== 'account_restricted'
+        && result.kind !== 'server') break
 
       accountSkipped = true
       if (result.kind === 'soft_rate') {
@@ -1091,7 +1106,16 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           result.kind === 'hard_credit' ? 'spent' : 'session',
         )
       } else {
-        pool.penalize(account.id)
+        // A 5xx or a WAF page is not a frequency wall: it takes the configured
+        // window on this account without inflating the limit-hit count or
+        // stretching the next rate limit's backoff.
+        pool.penalize(
+          account.id,
+          undefined,
+          undefined,
+          false,
+          result.kind === 'server' || result.kind === 'waf_block' ? 'server' : 'limit',
+        )
       }
       logger?.warn(
         `${LOG_PREFIX}: ${accountLogTag(account.label)} ${result.kind} on ${modelId} ` +

@@ -149,7 +149,8 @@ export function writeOpenAIError(res: ServerResponse, status: number, kind: stri
  * on text the array scan has already cleared.
  */
 const BARE_CREDENTIAL_KEYS =
-  'access_?token|refresh_?token|id_?token|auth_?token|oauth_?token|api_?key|secret|token'
+  'access_?token|refresh_?token|id_?token|auth_?token|oauth_?token|api_?key|secret|token|' +
+  'uid|uin|user[-_]?id|cookie|set-cookie'
 
 /**
  * Every name whose value is a credential, in any of the shapes it takes.
@@ -164,7 +165,7 @@ const CREDENTIAL_KEYS =
   'x-user-id|x-device-id|x-machine-id|x-uid'
 
 /** The key, its separator and the optional JSON escaping a quoted echo adds. */
-const CREDENTIAL_KEY_PREFIX = `(?:\\\\{0,2}["']?)(?:${CREDENTIAL_KEYS})(?:\\\\{0,2}["']?\\s*[:=]\\s*)`
+const CREDENTIAL_KEY_PREFIX = `(?:\\\\{0,2}["']?)\\b(?:${CREDENTIAL_KEYS})(?:\\\\{0,2}["']?\\s*[:=]\\s*)`
 
 /** Where a credential value begins, when that value is an array. */
 const CREDENTIAL_ARRAY_OPEN = new RegExp(`(${CREDENTIAL_KEY_PREFIX})\\\\?\\[`, 'gi')
@@ -185,7 +186,7 @@ const CREDENTIAL_ARRAY_OPEN = new RegExp(`(${CREDENTIAL_KEY_PREFIX})\\\\?\\[`, '
  * deliberately absent from the key list.
  */
 const BARE_CREDENTIAL = new RegExp(
-  `((?:\\\\{0,2}["']?)(?:${BARE_CREDENTIAL_KEYS})(?:\\\\{0,2}["']?\\s*[:=]\\s*\\\\{0,2}["']?))[A-Za-z0-9_+/.=-]{6,}`,
+  `((?:\\\\{0,2}["']?)\\b(?:${BARE_CREDENTIAL_KEYS})(?:\\\\{0,2}["']?\\s*[:=]\\s*\\\\{0,2}["']?))[A-Za-z0-9_+/.=-]{6,}`,
   'gi',
 )
 
@@ -246,6 +247,13 @@ const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\beyJ[A-Za-z0-9_+/.=-]+(?:\.[A-Za-z0-9_+/.=-]+){0,2}/g, '[redacted token]'],
   [/\b(qoder-oauth-token-)[A-Za-z0-9_+/.=-]+/g, '$1[redacted]'],
   [/\b(rt_)[A-Za-z0-9_+/.=-]+/g, '$1[redacted]'],
+  // A cookie header carries a whole credential set, not one value: the generic
+  // rule stops at the first `;` and would leave every cookie after it. A quoted
+  // field value ends at its closing quote when that quote ends the value;
+  // anything else consumes the rest of the line, because a malformed quote
+  // cannot be trusted to mark the end of a credential.
+  [/\b((?:set-)?cookie\s*:\s*)[^\r\n]+/gi, '$1[redacted]'],
+  [/\b((?:set-)?cookie)\b((?:\\{0,2}["']?\s*[:=]\s*\\{0,2}))("(?:\\.|[^"\\])*"(?=\s*[,}]|$)|[^\r\n]+)/gi, '$1$2[redacted]'],
   [BARE_CREDENTIAL, '$1[redacted]'],
   // An address names an account as surely as its label does, and this text
   // reaches logs and client-facing errors. Mask it before the path rules below.
@@ -405,8 +413,14 @@ function redactCredentialArrays(text: string): string {
  * Applied at the one place every gateway error passes through, so a new caller
  * cannot introduce a second unredacted path.
  */
+const REDACT_MAX_CHARS = 16_384
+
 export function redactSecrets(text: string): string {
-  let out = typeof text === 'string' ? text : String(text)
+  const raw = typeof text === 'string' ? text : String(text)
+  // Every caller shows at most a few hundred characters of this. Bounding the
+  // input keeps a hostile or broken error page from driving the path rules into
+  // quadratic backtracking while the whole plugin waits.
+  let out = raw.length > REDACT_MAX_CHARS ? raw.slice(0, REDACT_MAX_CHARS) : raw
   out = redactCredentialArrays(out)
   for (const [pattern, replacement] of REDACTIONS) out = out.replace(pattern, replacement)
   return out

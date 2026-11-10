@@ -14,12 +14,13 @@
  */
 const assert = require('node:assert/strict')
 const { test } = require('node:test')
+const { createHash, randomUUID } = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { root, transpile } = require('./ts-loader.cjs')
 
-const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+const { WorkBuddyAccountPool, workbuddyAccountId, renewOwnSignInFile } = require('../src/accounts.ts')
 
 const DAY = 24 * 60 * 60 * 1000
 const scratch = (label) => fs.mkdtempSync(path.join(os.tmpdir(), `dsh-renewal-${label}-`))
@@ -154,5 +155,140 @@ test('an expired sign-in the plugin wrote is still renewed on the expiry margin'
     assert.equal(await pool.ensureFresh(account), 'refreshed', 'the expiry margin still renews on its own')
   } finally {
     await cleanup(dataDir)
+  }
+})
+
+/**
+ * A delete that commits while the upstream is minting a rotation.
+ *
+ * The tombstone is older than the minted token, so ordering the two by issue
+ * time reads this rotation as the user signing in again - exactly the record
+ * `endsTombstone` would then clear. What the record names is this account, and
+ * no scan has released it, so the rotation must not land in either copy.
+ */
+test('a delete that lands during a refresh is not undone by the rotated token', async () => {
+  const issuedAt = Date.now() - 7 * 60 * 60 * 1000
+  const { pool, file, dataDir } = poolOver('delete-race', { issuedAgo: 7 * 60 * 60 * 1000 })
+  const [account] = await pool.scan()
+  assert.ok(account !== undefined)
+  try {
+    const id = workbuddyAccountId(account.credential)
+    fs.writeFileSync(path.join(dataDir, 'deleted-signins.json'), JSON.stringify({
+      version: 1,
+      entries: {
+        [id]: {
+          tokenDigest: createHash('sha256').update('workbuddy\0deleted\0old-token').digest('hex').slice(0, 32),
+          lastRefreshAtMs: issuedAt,
+          deletedAtMs: Date.now() - 1_000,
+        },
+      },
+    }, null, 2))
+    assert.equal(await pool.ensureFresh(account, true), 'fresh',
+      'a delete that committed first outranks the rotation')
+    assert.equal(readSignIn(file).auth.accessToken, 'old-token',
+      'the rotated token must not be written back into a deleted sign-in')
+    const archiveFile = path.join(dataDir, 'credentials-archive.json')
+    const archive = fs.existsSync(archiveFile) ? fs.readFileSync(archiveFile, 'utf8') : ''
+    assert.equal(archive.includes('renewed-token'), false,
+      'and must not reach the archive the next scan reads from')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A tombstone that cannot be read is not a tombstone that is absent.
+ *
+ * The cache may be from before another pool recorded the delete. Returning it
+ * as the answer let a rotation write the account back, and the next scan then
+ * read the newer token as a re-login and cleared the record.
+ */
+test('an unreadable delete record blocks the rotation instead of allowing it', async () => {
+  const issuedAt = Date.now() - 7 * 60 * 60 * 1000
+  const { pool, file, dataDir } = poolOver('delete-unreadable', { issuedAgo: 7 * 60 * 60 * 1000 })
+  const [account] = await pool.scan()
+  assert.ok(account !== undefined)
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  try {
+    const id = workbuddyAccountId(account.credential)
+    fs.writeFileSync(tombstoneFile, JSON.stringify({
+      version: 1,
+      entries: {
+        [id]: {
+          tokenDigest: createHash('sha256').update('workbuddy\0deleted\0old-token').digest('hex').slice(0, 32),
+          lastRefreshAtMs: issuedAt,
+          deletedAtMs: Date.now() - 1_000,
+        },
+      },
+    }, null, 2))
+    const fsp = require('node:fs/promises')
+    const realReadFile = fsp.readFile
+    fsp.readFile = async (candidate, ...rest) => {
+      if (path.resolve(String(candidate)) === path.resolve(tombstoneFile)) {
+        const busy = new Error('fixture tombstone is held without sharing reads')
+        busy.code = 'EBUSY'
+        throw busy
+      }
+      return realReadFile(candidate, ...rest)
+    }
+    try {
+      assert.equal(await pool.ensureFresh(account, true), 'fresh',
+        'a delete that cannot be ruled out must block the rotation')
+      assert.equal(readSignIn(file).auth.accessToken, 'old-token',
+        'the rotated token must not be written back')
+      const archiveFile = path.join(dataDir, 'credentials-archive.json')
+      const archive = fs.existsSync(archiveFile) ? fs.readFileSync(archiveFile, 'utf8') : ''
+      assert.equal(archive.includes('renewed-token'), false,
+        'and must not reach the archive the next scan reads from')
+    } finally {
+      fsp.readFile = realReadFile
+    }
+    assert.equal((await pool.scan()).length, 0, 'once readable, the delete record still holds the account out')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A write's temporary file is not another writer's to remove while it is young.
+ * The rename would fail after the upstream already retired the previous token,
+ * and the caller would keep that token only in memory or the archive.
+ */
+test('a young sign-in temp is left for the write that created it', async () => {
+  const directory = scratch('temp-age')
+  const file = path.join(directory, 'workbuddy-panel-temp-uin.info')
+  const document = {
+    auth: {
+      accessToken: 'temp-old-token', refreshToken: 'temp-old-refresh',
+      expiresAt: Date.now() + DAY, domain: 'www.codebuddy.cn', lastRefreshTime: Date.now() - DAY,
+    },
+    account: { uin: 'temp-uin', nickname: 'Temp' },
+  }
+  fs.writeFileSync(file, JSON.stringify(document, null, 2))
+  const temporary = `${file}.${randomUUID()}.tmp`
+  fs.writeFileSync(temporary, '{"auth":{"accessToken":"in-flight"}}')
+  const previous = {
+    accessToken: 'temp-old-token', refreshToken: 'temp-old-refresh',
+    expiresAtMs: document.auth.expiresAt, domain: document.auth.domain,
+    sourcePath: file, uin: 'temp-uin', nickname: 'Temp',
+  }
+  const next = {
+    ...previous, accessToken: 'temp-new-token', refreshToken: 'temp-new-refresh',
+    lastRefreshAtMs: Date.now(),
+  }
+  try {
+    assert.equal(await renewOwnSignInFile(file, next, previous), true)
+    assert.equal(fs.existsSync(temporary), true, 'a young temp belongs to the write still preparing it')
+
+    const old = new Date(Date.now() - 11 * 60 * 1000)
+    fs.utimesSync(temporary, old, old)
+    const newer = {
+      ...next, accessToken: 'temp-newer-token', refreshToken: 'temp-newer-refresh',
+      lastRefreshAtMs: Date.now() + 1,
+    }
+    assert.equal(await renewOwnSignInFile(file, newer, next), true)
+    assert.equal(fs.existsSync(temporary), false, 'an old temp with no writer left is cleaned')
+  } finally {
+    await cleanup(directory)
   }
 })

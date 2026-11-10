@@ -57,6 +57,35 @@ export interface SourcePool {
   ): T[]
 }
 
+/**
+ * One label per credential, unique inside a source region.
+ *
+ * Trae and Qoder list an account by its display name, and two accounts can
+ * share one. Every per-account decision - the picked account, a failure hold,
+ * a check-in row - is keyed by that label, so a duplicate let one account's
+ * failure hide the other and put a balance under the wrong name. A repeated
+ * name gets the vendor's own user id appended; a name used once is unchanged.
+ */
+export function uniqueSourceLabels<T>(
+  items: readonly T[],
+  labelOf: (item: T) => string,
+  idOf: (item: T) => string,
+): string[] {
+  const labels = items.map(item => labelOf(item))
+  const counts = new Map<string, number>()
+  for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1)
+  return labels.map((label, index) => {
+    if ((counts.get(label) ?? 0) < 2) return label
+    // The id is a vendor key, not display text: keep a short alphanumeric
+    // suffix so the row reads as a name and the suffix still tells two apart.
+    // The tail distinguishes sequential ids, whose shared prefix made the
+    // suffix itself collide.
+    const item = items[index]
+    const id = item === undefined ? '' : idOf(item).replace(/[^A-Za-z0-9]/gu, '').slice(-8)
+    return id === '' ? label : `${label}#${id}`
+  })
+}
+
 /** Build the pool the Trae and Qoder gateways share, wired to the host's readers. */
 export function createSourcePool(host: SourcePoolHost): SourcePool {
   /**

@@ -43,7 +43,7 @@ function loginStub(options = {}) {
       ua: init?.headers?.['User-Agent'],
     })
     if (address.includes('/v2/plugin/auth/state')) {
-      return envelope({ state: options.state ?? 'st-1', authUrl: options.authUrl ?? 'https://example.invalid/login?state=st-1' })
+      return envelope({ state: options.state ?? 'st-1', authUrl: options.authUrl ?? 'https://copilot.tencent.com/login?state=st-1' })
     }
     if (address.includes('/v2/plugin/auth/token')) {
       if (options.token === 'pending') return envelope({}, 11217, '11217:login ing...')
@@ -59,7 +59,7 @@ test('a panel login asks the CLI endpoints of its own realm', async () => {
   const { fetchImpl, seen } = loginStub()
   const start = await startDeviceLogin('cn', fetchImpl)
   assert.equal(start.state, 'st-1')
-  assert.equal(start.authUrl, 'https://example.invalid/login?state=st-1')
+  assert.equal(start.authUrl, 'https://copilot.tencent.com/login?state=st-1')
   assert.equal(seen.length, 1)
   assert.equal(seen[0].method, 'POST')
   assert.match(seen[0].url, /^https:\/\/copilot\.tencent\.com\/v2\/plugin\/auth\/state\?platform=CLI$/)
@@ -81,6 +81,9 @@ test('a login start refuses a url the desktop shell must not open', async () => 
   const { startDeviceLogin } = require('../src/login.ts')
   const { fetchImpl } = loginStub({ authUrl: 'javascript:alert(1)' })
   await assert.rejects(startDeviceLogin('cn', fetchImpl), /https/i)
+  const phishing = loginStub({ authUrl: 'https://workbuddy.example/login' })
+  await assert.rejects(startDeviceLogin('cn', phishing.fetchImpl), /unexpected host/i,
+    'a vendor answer naming any other host must not reach the desktop shell')
 })
 
 test('a business error while the browser has not finished reads as pending', async () => {
@@ -281,6 +284,64 @@ test('a scan already in flight cannot archive a deleted sign-in back', async () 
   }
 })
 
+/**
+ * A delete whose lock release fails has already removed the sign-in.
+ *
+ * The tombstone write and the unlink both committed; only the lock file could
+ * not be removed. Reading that as a failed delete rolled the tombstone back,
+ * and the archive put the account straight back on the next scan.
+ */
+test('a delete whose lock release fails is not rolled back', async () => {
+  const { writeOwnSignIn, ownSignInDir, WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const temporary = scratch('delete-release-')
+  const dataPath = path.join(temporary, 'data')
+  const target = ownSignInDir(dataPath)
+  await writeOwnSignIn(target, {
+    region: 'cn', accessToken: 'at-release', refreshToken: 'rt-release',
+    expiresAtMs: Date.now() + 3600_000, domain: 'www.codebuddy.cn',
+    uid: 'u-release', uin: '90000000030', enterpriseId: '', nickname: 'Release',
+  })
+  const pool = new WorkBuddyAccountPool({ authDirs: [target], dataPath: () => dataPath, cooldownMs: 60000 })
+  const [account] = await pool.scan()
+  assert.ok(account !== undefined)
+  const signInFile = account.credential.sourcePath
+  const fsp = require('node:fs/promises')
+  const realUnlink = fsp.unlink
+  const realSetTimeout = global.setTimeout
+  const realNow = Date.now
+  let clock = realNow()
+  Date.now = () => clock
+  global.setTimeout = (callback, _delay, ...args) => {
+    clock += 6_000
+    return realSetTimeout(callback, 0, ...args)
+  }
+  fsp.unlink = async (file, ...rest) => {
+    const name = String(file)
+    if (name.endsWith('.lock')) {
+      // A live claim is the only holder the recovery path needs to delete the
+      // lock itself; every ordinary release is denied.
+      const hasClaim = fs.readdirSync(path.dirname(name)).some((entry) => entry.includes('.reclaim.'))
+      if (!hasClaim) {
+        const denied = new Error('fixture lock release denied')
+        denied.code = 'EBUSY'
+        throw denied
+      }
+    }
+    return realUnlink(file, ...rest)
+  }
+  try {
+    assert.equal(await pool.removeOwnSignIn(account.id), true,
+      'the sign-in is gone, so the delete is a success even when the lock file stays')
+    assert.equal(fs.existsSync(signInFile), false)
+    assert.equal((await pool.scan()).length, 0, 'and the archive must not bring the account back')
+  } finally {
+    fsp.unlink = realUnlink
+    global.setTimeout = realSetTimeout
+    Date.now = realNow
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
 test('a desktop sign-in is never deletable', async () => {
   const { WorkBuddyAccountPool } = require('../src/accounts.ts')
   const dir = scratch('delete-desktop')
@@ -368,7 +429,7 @@ test('only the current login writes credentials and returns the panel document',
   let finishOld
   const loginStub = {
     startDeviceLogin: async (realm) => ({
-      state: 'st-' + ++starts, authUrl: `https://example.invalid/${realm}/login`,
+      state: 'st-' + ++starts, authUrl: 'https://copilot.tencent.com/login',
     }),
     pollDeviceLogin: async (_realm, state) => ({
       status: 'ok',

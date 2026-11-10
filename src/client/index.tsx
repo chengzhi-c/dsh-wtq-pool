@@ -43,7 +43,6 @@ const zh: Record<string, string> = {
   'row.title': 'WTQ Pool',
   'row.desc': '把本机 WorkBuddy、Trae、Qoder 的桌面登录合并成一个会自动换号的模型池。',
   'card.title': '账号池',
-  'card.hint': '下方是完整面板：账号、模型选择、签到与连接检查都在这一页里。',
   'card.open': '重新载入面板',
   'card.frameTitle': '账号池面板',
   'card.missing': '面板资源没有装好，重新安装这个插件即可。',
@@ -55,7 +54,6 @@ const en: Record<string, string> = {
   'row.title': 'WTQ Pool',
   'row.desc': 'Merges this machine’s WorkBuddy, Trae and Qoder desktop sign-ins into one model pool that fails over on its own.',
   'card.title': 'Account pool',
-  'card.hint': 'The full panel sits below: accounts, model selection, check-in and the connection check are all on this page.',
   'card.open': 'Reload panel',
   'card.frameTitle': 'Account pool panel',
   'card.missing': 'The panel assets are missing; reinstalling this plugin restores them.',
@@ -198,7 +196,6 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
     React.createElement('header', { style: HEAD_STYLE },
       React.createElement('div', null,
         React.createElement('strong', null, t('card.title')),
-        React.createElement('p', { style: HINT_STYLE }, t('card.hint')),
       ),
       React.createElement('button', {
         type: 'button',
@@ -243,12 +240,6 @@ const HEAD_STYLE: React.CSSProperties = {
   alignItems: 'flex-start',
   justifyContent: 'space-between',
   gap: 12,
-}
-
-const HINT_STYLE: React.CSSProperties = {
-  margin: '4px 0 0',
-  opacity: 0.7,
-  fontSize: 12,
 }
 
 const BUTTON_STYLE: React.CSSProperties = {

@@ -1127,3 +1127,97 @@ test('the account row ships one box for the remove and delete buttons', () => {
   assert.match(shared[1], /padding:\s*4px 10px/, 'and that rule must set the row padding both of them share')
   assert.match(shared[1], /font-size:\s*12\.5px/, 'with the row font size, so their heights match')
 })
+
+/**
+ * A source label does not depend on which other regions are switched on.
+ *
+ * Labels are the row key for holds, pack expiry and the panel's account state.
+ * Computing them after the region filter renamed the surviving account whenever
+ * another region was disabled: the duplicate suffix appeared or vanished with a
+ * setting that says nothing about this account.
+ */
+test('Discovering source labels ignores the enabled-region filter', async () => {
+  const source = fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')
+  const match = source.match(/^async function refreshSourceAccounts\([^]*?^}$/m)
+  assert.ok(match, 'refreshSourceAccounts must exist')
+  const fn = transpile(match[0])
+  const { uniqueSourceLabels } = require('../src/source-pool.ts')
+  const { traeRegionOfCredential } = require('../src/trae-discovery.ts')
+  const credentials = [
+    { userId: 'user-cn', accountName: 'Same Name', edition: 'cn', source: 'desktop', expiresAtMs: 0 },
+    { userId: 'user-ai', accountName: 'Same Name', edition: 'sg', source: 'desktop', expiresAtMs: 0 },
+  ]
+  const run = async (regions) => {
+    const context = vm.createContext({
+      activeTraeRegions: () => regions,
+      activeQoderRegions: () => [],
+      discoverTraeCredentials: async () => ({ credentials: credentials.map((item) => ({ ...item })), failures: [] }),
+      discoverQoderCredentials: async () => ({ credentials: [], failures: [] }),
+      uniqueSourceLabels,
+      traeRegionOfCredential,
+      traeBaseLabel: (credential) => credential.accountName ?? credential.userId,
+      traeLabelKey: (credential) => traeRegionOfCredential(credential) + '\n' + credential.userId,
+      traeAppLabelOf: () => 'Trae',
+      traeRowProbe: async () => undefined,
+      noteSourceExpiry() {},
+      sourceCredentialExpired: () => false,
+      regionEnabled: () => true,
+      log() {},
+      safeMessage: (error) => String(error),
+      loadGeneration: 1,
+      traeAccountRows: [],
+      traeLabelOverrides: new Map(),
+      qoderAccountRows: [],
+      qoderLabelOverrides: new Map(),
+      pruneSourceState() {},
+    })
+    vm.runInContext(fn, context)
+    await context.refreshSourceAccounts(1)
+    return context.traeAccountRows.filter((row) => row.region === 'cn')
+  }
+  const both = (await run(['cn', 'ai'])).find((row) => row.region === 'cn')
+  const cnOnly = await run(['cn'])
+  assert.ok(both)
+  assert.equal(cnOnly.length, 1)
+  assert.equal(cnOnly[0].label, both.label,
+    'switching the other region off must not rename this account')
+  assert.match(cnOnly[0].label, /#usercn$/u, 'the duplicate suffix is what keeps the two rows apart')
+})
+
+/**
+ * A failing model roster is retried a bounded number of times per gateway.
+ *
+ * The previous chain re-armed itself every retry, and each retry triggered a
+ * refresh pass whose failures started the chain from attempt one again. A
+ * gateway stuck on a bad sign-in therefore retried without end.
+ */
+test('A failing model roster retries per gateway and stops at the attempt cap', () => {
+  const source = fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')
+  const body = transpile(sourceFunction(source, 'scheduleModelRetries') + '\n' + sourceFunction(source, 'clearModelRetries'))
+  const timers = []
+  let refreshes = 0
+  const runtime = { retired: false, catalogRetryAttempt: 0, catalogRetryTimer: null }
+  const context = vm.createContext({
+    serviceStopped: false,
+    MODEL_RETRY_ATTEMPTS: 4,
+    CATALOG_RETRY_MS: 15,
+    runtimes: new Map([['cn', runtime]]),
+    modelRetryTimers: new Set(),
+    scheduleRefresh: () => { refreshes += 1 },
+    setTimeout: (callback) => { const timer = { callback }; timers.push(timer); return timer },
+    clearTimeout() {},
+  })
+  vm.runInContext(body, context)
+  context.scheduleModelRetries(runtime)
+  context.scheduleModelRetries(runtime)
+  assert.equal(timers.length, 1, 'a second failing pass must not arm a second timer for the same gateway')
+  let fired = 0
+  while (timers.length > 0 && fired < 10) {
+    timers.shift().callback()
+    fired += 1
+    // The pass this retry triggered fails the same way and asks again.
+    context.scheduleModelRetries(runtime)
+  }
+  assert.equal(fired, 4, 'the initial read plus three retries, then the gateway stops retrying')
+  assert.equal(refreshes, 4, 'every retry runs exactly one pass')
+})

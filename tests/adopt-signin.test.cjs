@@ -19,9 +19,13 @@ const { test } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { createHash } = require('node:crypto')
 const { root, transpile } = require('./ts-loader.cjs')
 
-const { WorkBuddyAccountPool, ownSignInDir, parseWorkBuddyAuth, writeOwnSignIn } = require('../src/accounts.ts')
+const {
+  WorkBuddyAccountPool, legacyWorkBuddyAccountId, ownSignInDir, parseWorkBuddyAuth, renewOwnSignInFile,
+  workbuddyAccountId, writeOwnSignIn,
+} = require('../src/accounts.ts')
 
 const DAY = 24 * 60 * 60 * 1000
 const LIVE_NAME = 'workbuddy-desktop.info'
@@ -62,7 +66,9 @@ function machine(label, { snapshots = [], live = null, issuedAgo = 19 * DAY } = 
   return { pool, dataDir, desktop, signins: path.join(dataDir, 'signins') }
 }
 
-const cleanup = async (dataDir) => { await fs.promises.rm(dataDir, { recursive: true, force: true }) }
+const cleanup = async (dataDir) => {
+  await fs.promises.rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
+}
 
 test('a serialized encrypted sign-in is opened or kept sealed', async () => {
   const atRest = require('../src/at-rest.ts')
@@ -599,6 +605,89 @@ test('a renewal the archive holds outranks the plugin older copy, and ends its h
     const picked = await pool.acquire()
     assert.equal(picked?.credential.accessToken, 'archived-fresh-token',
       'and the hold is released, so the account can serve again without a re-login')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+test('a 1.2.3 tombstone also holds off its archive copy', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-legacy-archive-'))
+  const desktop = path.join(dataDir, 'desktop')
+  fs.mkdirSync(desktop, { recursive: true })
+  const sourcePath = path.join(desktop, 'workbuddy-desktop-old.info')
+  const previous = legacyWorkBuddyAccountId({ nickname: 'Archive delete', sourcePath })
+  fs.writeFileSync(path.join(dataDir, 'credentials-archive.json'), JSON.stringify({
+    version: 1,
+    entries: [{
+      id: previous,
+      accessToken: 'legacy-archive-token',
+      refreshToken: 'legacy-archive-refresh',
+      expiresAtMs: Date.now() + 28 * DAY,
+      nickname: 'Archive delete',
+      domain: 'www.codebuddy.cn',
+      sourcePath,
+    }],
+  }))
+  fs.writeFileSync(path.join(dataDir, 'deleted-signins.json'), JSON.stringify({
+    entries: {
+      [previous]: {
+        tokenDigest: createHash('sha256')
+          .update('workbuddy\0deleted\0legacy-archive-token')
+          .digest('hex').slice(0, 32),
+        lastRefreshAtMs: 0,
+        deletedAtMs: Date.now() - 1000,
+      },
+    },
+  }))
+  const pool = new WorkBuddyAccountPool({ authDirs: [desktop], dataPath: () => dataDir })
+  try {
+    assert.equal((await pool.scan()).length, 0,
+      'the archive copy of the deleted sign-in must not be served')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+test('deleting one legacy-key claimant keeps the archive copy of the other', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-legacy-shared-'))
+  const signins = path.join(dataDir, 'signins')
+  const desktop = path.join(dataDir, 'desktop')
+  fs.mkdirSync(signins, { recursive: true })
+  fs.mkdirSync(desktop, { recursive: true })
+  const otherPath = path.join(desktop, 'workbuddy-desktop-old.info')
+  try {
+    const mine = await writeOwnSignIn(signins, {
+      region: 'cn', accessToken: 'own-token', refreshToken: 'own-refresh',
+      expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+      uid: '', uin: '', enterpriseId: '', nickname: 'Twin',
+    })
+    const legacy = legacyWorkBuddyAccountId({ nickname: 'Twin', sourcePath: mine })
+    fs.writeFileSync(path.join(dataDir, 'credentials-archive.json'), JSON.stringify({
+      version: 1,
+      entries: [{
+        id: legacy,
+        accessToken: 'other-token',
+        refreshToken: 'other-refresh',
+        expiresAtMs: Date.now() + 9 * DAY,
+        nickname: 'Twin',
+        domain: 'www.workbuddy.ai',
+        sourcePath: otherPath,
+      }],
+    }))
+    const pool = new WorkBuddyAccountPool({
+      authDirs: [signins, desktop],
+      dataPath: () => dataDir,
+    })
+    const before = await pool.scan()
+    assert.equal(before.length, 2, 'the shared key names both identity-less rows')
+    const own = before.find(account => account.credential.sourcePath === mine)
+    assert.ok(own, 'the plugin-owned sign-in is listed')
+    assert.equal(await pool.removeOwnSignIn(own.id), true)
+    const after = await pool.scan()
+    assert.equal(after.length, 1, 'the other row survives the delete')
+    assert.equal(after[0].credential.sourcePath, otherPath)
+    const archive = JSON.parse(fs.readFileSync(path.join(dataDir, 'credentials-archive.json'), 'utf8'))
+    assert.equal(archive.entries.length, 1, 'a shared 1.2.3 archive entry is not purged')
   } finally {
     await cleanup(dataDir)
   }
@@ -1592,6 +1681,1208 @@ test('a failed unlink restores the roster after a concurrent scan', async () => 
   } finally {
     fsp.unlink = realUnlink
     releaseUnlink?.()
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A sign-in with no vendor id is keyed by its file, and an earlier build adopted
+ * the desktop's snapshot under a second path. Both files carry one session, so
+ * renewing either spends the other's refresh token.
+ */
+test('an identity-less snapshot and the plugin copy of one session are one account', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-same-session-'))
+  const desktop = path.join(dataDir, 'desktop')
+  const signins = ownSignInDir(dataDir)
+  fs.mkdirSync(desktop, { recursive: true })
+  fs.mkdirSync(signins, { recursive: true })
+  const auth = {
+    accessToken: 'token-same-session',
+    refreshToken: 'refresh-same-session',
+    expiresAt: Date.now() + DAY,
+    domain: 'www.codebuddy.cn',
+  }
+  fs.writeFileSync(path.join(desktop, 'workbuddy-desktop-old.info'), JSON.stringify({
+    auth,
+    account: { nickname: 'Same name' },
+  }))
+  const ownFile = await writeOwnSignIn(signins, {
+    region: 'cn',
+    accessToken: auth.accessToken,
+    refreshToken: auth.refreshToken,
+    expiresAtMs: auth.expiresAt,
+    domain: auth.domain,
+    nickname: 'Same name',
+    uid: '',
+    uin: '',
+    enterpriseId: '',
+  })
+  const pool = new WorkBuddyAccountPool({
+    authDirs: [desktop],
+    dataPath: () => dataDir,
+    client: {
+      refreshToken: async () => ({
+        accessToken: 'token-same-session-renewed',
+        refreshToken: 'refresh-same-session-renewed',
+        expiresInSec: 28 * DAY,
+      }),
+    },
+  })
+  try {
+    const accounts = await pool.scan()
+    assert.equal(accounts.length, 1, 'one session is one account, whatever file it was read from')
+    assert.equal(accounts[0].credential.sourcePath, ownFile,
+      'the plugin-owned copy wins because it is the one the pool renews')
+
+    const outcome = await pool.ensureFresh(accounts[0], true)
+    assert.equal(outcome, 'refreshed', 'the own copy is renewed in place')
+    const after = await pool.scan()
+    assert.equal(after.length, 1,
+      'the rotated token must not let the old desktop snapshot back in as a second account')
+    assert.equal(after[0].credential.sourcePath, ownFile)
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A tombstone written before the identity change still hides its sign-in.
+ *
+ * 1.2.3 keyed an identity-less sign-in by its nickname alone; this build adds
+ * the source path so two sign-ins sharing a name stay apart. The tombstone file
+ * was not migrated, and looking only at the new key let the client's snapshot
+ * bring the deleted account back after an upgrade.
+ */
+test('a 1.2.3 tombstone still hides the sign-in it was written for', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-legacy-tombstone-'))
+  const desktop = path.join(dataDir, 'desktop')
+  fs.mkdirSync(desktop, { recursive: true })
+  const auth = {
+    accessToken: 'token-legacy-delete',
+    refreshToken: 'refresh-legacy-delete',
+    expiresAt: Date.now() + DAY,
+    domain: 'www.codebuddy.cn',
+  }
+  const file = path.join(desktop, 'workbuddy-desktop-old.info')
+  fs.writeFileSync(file, JSON.stringify({ auth, account: { nickname: 'Legacy delete' } }))
+  const previous = legacyWorkBuddyAccountId({
+    nickname: 'Legacy delete', sourcePath: file,
+  })
+  assert.notEqual(previous, workbuddyAccountId({ nickname: 'Legacy delete', sourcePath: file }),
+    'the fixture must exercise the key the upgrade changed')
+  fs.writeFileSync(path.join(dataDir, 'deleted-signins.json'), JSON.stringify({
+    entries: {
+      [previous]: {
+        tokenDigest: createHash('sha256')
+          .update(`workbuddy\0deleted\0${auth.accessToken}`)
+          .digest('hex').slice(0, 32),
+        lastRefreshAtMs: 0,
+        deletedAtMs: Date.now() - 1000,
+      },
+    },
+  }))
+  const pool = new WorkBuddyAccountPool({ authDirs: [desktop], dataPath: () => dataDir })
+  try {
+    const accounts = await pool.scan()
+    assert.equal(accounts.length, 0,
+      'the row the user deleted must not come back under the new key')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * Settings saved under a 1.2.3 key still name the upgraded account.
+ *
+ * A deleted account that was switched off, reserved or chosen as preferred kept
+ * those decisions in the settings file under the old key. Reading only the new
+ * key made the account serve again, ignore its floor, or silently stay behind a
+ * preference the panel still showed.
+ */
+test('settings stored under a 1.2.3 key still apply to the upgraded account', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-legacy-settings-'))
+  const desktop = path.join(dataDir, 'desktop')
+  fs.mkdirSync(desktop, { recursive: true })
+  const file = path.join(desktop, 'workbuddy-desktop-old.info')
+  fs.writeFileSync(file, JSON.stringify({
+    auth: {
+      accessToken: 'token-legacy-settings',
+      refreshToken: 'refresh-legacy-settings',
+      expiresAt: Date.now() + DAY,
+      domain: 'www.codebuddy.cn',
+    },
+    account: { nickname: 'Legacy settings' },
+  }))
+  const previous = legacyWorkBuddyAccountId({
+    nickname: 'Legacy settings', sourcePath: file,
+  })
+  const pool = new WorkBuddyAccountPool({ authDirs: [desktop], dataPath: () => dataDir })
+  try {
+    pool.applyConfig({ disabledAccountIds: [previous], creditReserves: { [previous]: 100 } })
+    const accounts = await pool.scan()
+    assert.equal(accounts.length, 1)
+    const id = accounts[0].id
+    assert.notEqual(id, previous, 'the fixture must exercise the key the upgrade changed')
+    assert.equal(pool.isDisabled(id), true, 'a switch saved under the old key still holds')
+    assert.equal(pool.creditReserve(id), 100, 'a floor saved under the old key is still in force')
+
+    pool.applyConfig({ disabledAccountIds: [] })
+    pool.setCreditBalance(id, 50)
+    assert.equal(pool.available(Date.now(), undefined, 'cn').length, 0,
+      'the old floor still keeps the account out of rotation')
+
+    pool.setCreditBalance(id, 500)
+    assert.equal(pool.available(Date.now(), undefined, 'cn').length, 1)
+    pool.applyRemoved([previous])
+    assert.equal(pool.list('cn').length, 0, 'a removal saved under the old key still hides the row')
+    pool.applyRemoved([])
+    pool.prefer(previous, 'cn')
+    assert.equal((await pool.acquire(undefined, 'cn'))?.id, id,
+      'a preference saved under the old key still picks this account')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A 1.2.3 tombstone blocks its own sign-in without being released.
+ *
+ * The old key hashed a nickname alone, so two identity-less sign-ins can share
+ * it. Releasing the record on a newer token would resurrect the deleted row on
+ * the next scan; hiding every same-nickname sign-in would take an unrelated
+ * account out of the pool.
+ */
+test('a 1.2.3 tombstone blocks only the token it was written for', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-legacy-token-'))
+  const desktop = path.join(dataDir, 'desktop')
+  fs.mkdirSync(desktop, { recursive: true })
+  const write = (name, token) => fs.writeFileSync(path.join(desktop, name), JSON.stringify({
+    auth: {
+      accessToken: token,
+      refreshToken: `refresh-${token}`,
+      expiresAt: Date.now() + DAY,
+      domain: 'www.codebuddy.cn',
+    },
+    account: { nickname: 'Same nickname' },
+  }))
+  write('workbuddy-desktop-old.info', 'token-deleted')
+  write('workbuddy-desktop-live.info', 'token-live')
+  const previous = legacyWorkBuddyAccountId({
+    nickname: 'Same nickname', sourcePath: path.join(desktop, 'workbuddy-desktop-old.info'),
+  })
+  const file = path.join(dataDir, 'deleted-signins.json')
+  fs.writeFileSync(file, JSON.stringify({
+    entries: {
+      [previous]: {
+        tokenDigest: createHash('sha256')
+          .update('workbuddy\0deleted\0token-deleted')
+          .digest('hex').slice(0, 32),
+        lastRefreshAtMs: 0,
+        deletedAtMs: Date.now() - 1000,
+      },
+    },
+  }))
+  const pool = new WorkBuddyAccountPool({ authDirs: [desktop], dataPath: () => dataDir })
+  try {
+    for (const pass of [1, 2]) {
+      const accounts = await pool.scan()
+      assert.equal(accounts.length, 1, `pass ${pass}: only the live sign-in remains`)
+      assert.equal(accounts[0].credential.accessToken, 'token-live')
+      const tombstones = JSON.parse(fs.readFileSync(file, 'utf8')).entries
+      assert.ok(tombstones[previous], `pass ${pass}: the 1.2.3 record must stay for its own token`)
+    }
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+test('a write clears the credential copy an interrupted write left behind', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-temp-'))
+  const signins = path.join(dataDir, 'signins')
+  const signIn = {
+    region: 'cn', accessToken: 'first-token', refreshToken: 'first-refresh',
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin: '90000009999', enterpriseId: '', nickname: 'Temp',
+  }
+  try {
+    const file = await writeOwnSignIn(signins, signIn)
+    const abandoned = `${file}.00000000-0000-4000-8000-000000000000.tmp`
+    fs.writeFileSync(abandoned, JSON.stringify({ auth: { accessToken: 'stale-token' } }))
+    // Young enough to belong to a write another process is still preparing.
+    const old = new Date(Date.now() - 11 * 60 * 1000)
+    fs.utimesSync(abandoned, old, old)
+    await writeOwnSignIn(signins, { ...signIn, accessToken: 'second-token' })
+    assert.equal(fs.existsSync(abandoned), false,
+      'a temp file between write and rename holds a full token and must not survive')
+    const previous = parseWorkBuddyAuth(fs.readFileSync(file, 'utf8'), file)
+    assert.ok(previous, 'the rewritten sign-in parses')
+    const abandonedRenewal = `${file}.11111111-1111-4111-8111-111111111111.tmp`
+    fs.writeFileSync(abandonedRenewal, JSON.stringify({ auth: { accessToken: 'stale-renewal-token' } }))
+    fs.utimesSync(abandonedRenewal, old, old)
+    await renewOwnSignInFile(file, {
+      ...previous, accessToken: 'third-token', refreshToken: 'third-refresh',
+    }, previous)
+    assert.equal(fs.existsSync(abandonedRenewal), false,
+      'a renewal that was interrupted must not leave its token copy behind')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+test('a scan clears an old interrupted sign-in temp and keeps one in flight', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wtq-scan-temp-'))
+  const signins = path.join(dataDir, 'signins')
+  try {
+    const file = await writeOwnSignIn(signins, {
+      region: 'cn', accessToken: 'scan-token', refreshToken: 'scan-refresh',
+      expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+      uid: '', uin: '90000009998', enterpriseId: '', nickname: 'ScanTemp',
+    })
+    const old = `${file}.00000000-0000-4000-8000-000000000001.tmp`
+    const young = `${file}.00000000-0000-4000-8000-000000000002.tmp`
+    fs.writeFileSync(old, JSON.stringify({ auth: { accessToken: 'stale-scan-token' } }))
+    fs.writeFileSync(young, JSON.stringify({ auth: { accessToken: 'in-flight-token' } }))
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000)
+    fs.utimesSync(old, hourAgo, hourAgo)
+    const pool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir })
+    await pool.scan()
+    assert.equal(fs.existsSync(old), false, 'a crashed write leaves a full token and must be swept')
+    assert.equal(fs.existsSync(young), true, 'a temp another writer is preparing is left alone')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+/**
+ * A stale roster can hold a delete for a sign-in older than one another pool
+ * already deleted. When neither record's issue time can order them, dropping
+ * one let the other stand in for it and the newer snapshot came back.
+ */
+test('a stale delete cannot replace an undated newer tombstone', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-undated-delete-'))
+  const signins = path.join(dataDir, 'signins')
+  const copies = path.join(dataDir, 'copies')
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  fs.mkdirSync(copies)
+  const uin = '90000009985'
+  const olderIssued = Date.now() - 60 * 60 * 1000
+  const newerIssued = Date.now() - 10 * 60 * 1000
+  const digest = (token) => createHash('sha256')
+    .update('workbuddy\0deleted\0' + token).digest('hex').slice(0, 32)
+  const signIn = (token, issued) => ({
+    region: 'cn', accessToken: token, refreshToken: `rt-${token}`,
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin, enterpriseId: '', nickname: 'UndatedDelete', lastRefreshAtMs: issued,
+  })
+  try {
+    await writeOwnSignIn(signins, signIn('at-undated-old', olderIssued))
+    const stalePool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const staleRoster = await stalePool.scan()
+    assert.equal(staleRoster.length, 1)
+
+    // The newer sign-in's file carries no issue time, so its delete cannot be
+    // ordered against the stale pool's older dated record. The archive would
+    // still offer the older copy, so it is not part of this fixture.
+    fs.rmSync(path.join(dataDir, 'credentials-archive.json'), { force: true })
+    await writeOwnSignIn(signins, signIn('at-undated-new', 0))
+    const currentPool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const currentRoster = await currentPool.scan()
+    const current = currentRoster.find(account => account.credential.uin === uin)
+    assert.ok(current !== undefined)
+    assert.equal(current.credential.lastRefreshAtMs, 0, 'the newer sign-in is undated')
+    assert.equal(await currentPool.removeOwnSignIn(current.id), true)
+
+    // The stale pool still holds the previous sign-in and deletes it now.
+    assert.equal(await stalePool.removeOwnSignIn(staleRoster[0].id), true)
+    const entries = JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries ?? {}
+    const kept = entries[current.id]
+    assert.ok(kept !== undefined)
+    const digests = [kept.tokenDigest, ...(kept.alternates ?? []).map(record => record.tokenDigest)]
+    assert.ok(digests.includes(digest('at-undated-new')),
+      'the newer delete must survive beside the stale one')
+
+    // A dated copy of the newer sign-in, issued before the delete, shows up.
+    fs.writeFileSync(path.join(copies, 'workbuddy-desktop-old.info'), JSON.stringify({
+      auth: {
+        accessToken: 'at-undated-new', refreshToken: 'rt-at-undated-new',
+        expiresAt: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn', lastRefreshTime: newerIssued,
+      },
+      account: { uin, nickname: 'UndatedDelete' },
+    }), 'utf8')
+    const scanningPool = new WorkBuddyAccountPool({ authDirs: [copies, signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    assert.equal((await scanningPool.scan()).length, 0,
+      'neither delete may be dropped just because the other one is older')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A failed delete writes its rollback from the set it last saw. If another
+ * pool released a tombstone in the meantime, that rollback must not put the
+ * release back in force.
+ */
+test('a failed delete does not resurrect a tombstone released meanwhile', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-release-rollback-'))
+  const signins = path.join(dataDir, 'signins')
+  const failingDir = path.join(dataDir, 'failing')
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  fs.mkdirSync(failingDir)
+  const releasedUin = '90000009986'
+  const failingUin = '90000009987'
+  const digest = (token) => createHash('sha256')
+    .update('workbuddy\0deleted\0' + token).digest('hex').slice(0, 32)
+  const id = (uin) => workbuddyAccountId({ uin, nickname: 'ReleaseRollback', sourcePath: '' })
+  const signIn = (uin, token) => ({
+    region: 'cn', accessToken: token, refreshToken: `rt-${token}`,
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin, enterpriseId: '', nickname: 'ReleaseRollback', lastRefreshAtMs: Date.now(),
+  })
+  const released = {
+    tokenDigest: digest('at-released'),
+    lastRefreshAtMs: Date.now() - DAY,
+    deletedAtMs: Date.now() - DAY,
+    nonce: 'released-nonce',
+  }
+  try {
+    fs.writeFileSync(tombstoneFile, JSON.stringify({
+      version: 1, entries: { [id(releasedUin)]: released },
+    }, null, 2))
+    await writeOwnSignIn(failingDir, signIn(failingUin, 'at-failing'))
+    const failingPool = new WorkBuddyAccountPool({ authDirs: [failingDir], dataPath: () => dataDir, cooldownMs: 60000 })
+    const roster = await failingPool.scan()
+    const failing = roster.find(account => account.credential.uin === failingUin)
+    assert.ok(failing !== undefined)
+
+    const fsp = require('node:fs/promises')
+    const realReadFile = fsp.readFile
+    const realUnlink = fsp.unlink
+    let releaseRead
+    let readStarted
+    let readHeld = false
+    const started = new Promise((resolve) => { readStarted = resolve })
+    fsp.readFile = async (file, ...rest) => {
+      if (!readHeld && path.resolve(String(file)) === path.resolve(failing.credential.sourcePath)) {
+        readHeld = true
+        readStarted()
+        await new Promise((resolve) => { releaseRead = resolve })
+      }
+      return realReadFile(file, ...rest)
+    }
+    fsp.unlink = async (file, ...rest) => {
+      if (path.resolve(String(file)) === path.resolve(failing.credential.sourcePath)) {
+        const denied = new Error('fixture unlink denied')
+        denied.code = 'EACCES'
+        throw denied
+      }
+      return realUnlink(file, ...rest)
+    }
+    try {
+      const removing = failingPool.removeOwnSignIn(failing.id)
+      removing.catch(() => {})
+      // The delete has written its tombstone and is now reading the file it
+      // would remove; the tombstone lock is free.
+      await started
+      // Another pool signs the released account back in and scans it.
+      const reLoginFile = await writeOwnSignIn(signins, signIn(releasedUin, 'at-released-again'))
+      const releasingPool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+      const releasedRoster = await releasingPool.scan()
+      assert.equal(releasedRoster.some(account => account.credential.uin === releasedUin), true,
+        `roster: ${releasedRoster.map(account => `${account.credential.uin}:${account.credential.accessToken}`).join(',')} files: ${fs.readdirSync(signins).join(',')} tombstones: ${fs.readFileSync(tombstoneFile, 'utf8')}`)
+      assert.equal(
+        Object.hasOwn(JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries ?? {}, id(releasedUin)),
+        false,
+        'the re-login releases the tombstone',
+      )
+      // The sign-in file is gone again by the time the failed delete rolls
+      // back; its own rescan must not release the tombstone the rollback
+      // restores.
+      fs.rmSync(reLoginFile, { force: true })
+      releaseRead()
+      await assert.rejects(removing, { code: 'EACCES' })
+    } finally {
+      releaseRead?.()
+      fsp.readFile = realReadFile
+      fsp.unlink = realUnlink
+    }
+    const entries = JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries ?? {}
+    assert.equal(Object.hasOwn(entries, id(releasedUin)), false,
+      `the failed delete must not put the released tombstone back: ${JSON.stringify(entries)}`)
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * The archive and adoption phases can take long enough for another pool to
+ * delete the account. If the final re-read cannot see the document, the scan
+ * cannot tell whether that delete landed, so it must not commit its roster.
+ */
+test('an unreadable final tombstone check does not commit the roster', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-final-unreadable-'))
+  const signins = path.join(dataDir, 'signins')
+  const archive = path.join(dataDir, 'credentials-archive.json')
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  const uin = '90000009988'
+  const signIn = {
+    region: 'cn', accessToken: 'at-final-unreadable', refreshToken: 'rt-final-unreadable',
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin, enterpriseId: '', nickname: 'FinalUnreadable', lastRefreshAtMs: Date.now() - DAY,
+  }
+  try {
+    await writeOwnSignIn(signins, signIn)
+    const deletingPool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const roster = await deletingPool.scan()
+    const doomed = roster.find(account => account.credential.uin === uin)
+    assert.ok(doomed !== undefined)
+    assert.equal(fs.existsSync(archive), true)
+
+    const scanningPool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const fsp = require('node:fs/promises')
+    const realReadFile = fsp.readFile
+    let parkRead = true
+    let denyTombstones = false
+    let releaseRead
+    const readGate = new Promise((resolve) => { releaseRead = resolve })
+    let readParked
+    const parked = new Promise((resolve) => { readParked = resolve })
+    fsp.readFile = async (file, ...rest) => {
+      if (denyTombstones && path.resolve(String(file)) === path.resolve(tombstoneFile)) {
+        const denied = new Error('fixture tombstone read denied')
+        denied.code = 'EACCES'
+        throw denied
+      }
+      if (parkRead && path.resolve(String(file)) === path.resolve(archive)) {
+        parkRead = false
+        const text = await realReadFile(file, ...rest)
+        readParked()
+        await readGate
+        return text
+      }
+      return realReadFile(file, ...rest)
+    }
+    try {
+      const scanning = scanningPool.scan()
+      await parked
+      const deleting = deletingPool.removeOwnSignIn(doomed.id)
+      const signInFile = doomed.credential.sourcePath
+      const deadline = Date.now() + 10_000
+      while (fs.existsSync(signInFile) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      assert.equal(fs.existsSync(signInFile), false)
+      denyTombstones = true
+      releaseRead()
+      await scanning
+      await deleting
+      assert.equal(scanningPool.list().length, 0,
+        'a scan that could not check the delete document must not commit')
+    } finally {
+      releaseRead()
+      fsp.readFile = realReadFile
+    }
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+test('a scan that read the pool before a delete cannot write the account back to the archive', async () => {
+  const fsp = require('node:fs/promises')
+  const { pool, dataDir, desktop } = machine('archive-race', { live: ['90000001234', 'Race'] })
+  const live = path.join(desktop, LIVE_NAME)
+  const credential = parseWorkBuddyAuth(fs.readFileSync(live, 'utf8'), live)
+  assert.ok(credential, 'the fixture sign-in parses')
+  const id = workbuddyAccountId(credential)
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  fs.writeFileSync(tombstoneFile, JSON.stringify({
+    version: 1,
+    entries: {
+      [id]: {
+        tokenDigest: createHash('sha256')
+          .update('workbuddy\0deleted\0' + credential.accessToken)
+          .digest('hex').slice(0, 32),
+        lastRefreshAtMs: 0,
+        deletedAtMs: Date.now(),
+      },
+    },
+  }))
+  const realReadFile = fsp.readFile
+  let tombstoneReads = 0
+  // The scan's first read predates the delete; the archive write runs after it.
+  fsp.readFile = async (file, ...rest) => {
+    if (path.resolve(String(file)) === path.resolve(tombstoneFile) && tombstoneReads++ === 0) {
+      // Make the next stamp differ, as the delete's write would.
+      const future = new Date(Date.now() + 5_000)
+      fs.utimesSync(tombstoneFile, future, future)
+      return JSON.stringify({ version: 1, entries: {} })
+    }
+    return realReadFile(file, ...rest)
+  }
+  try {
+    await pool.scan()
+    const archiveFile = path.join(dataDir, 'credentials-archive.json')
+    const archive = fs.existsSync(archiveFile)
+      ? JSON.parse(fs.readFileSync(archiveFile, 'utf8'))
+      : { entries: [] }
+    assert.equal(archive.entries.some((entry) => entry.id === id), false,
+      'a deleted sign-in must not return to the archive from a scan that started before the delete')
+  } finally {
+    fsp.readFile = realReadFile
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A failed delete has to restore the tombstone document exactly as it found it.
+ *
+ * The rollback used a map snapshot taken before the delete, while the write
+ * persisted whatever map the last read had installed. A concurrent delete in
+ * between made the two differ, and the failed delete's own tombstone survived -
+ * the account stayed hidden after the panel had reported the failure.
+ */
+/**
+ * A refresh that started before the user deleted the sign-in can finish after
+ * the re-login's scan released the tombstone. Its rotated token belongs to the
+ * session that was deleted, not to the sign-in now on disk.
+ */
+test('a refresh finishing after a re-login does not archive the deleted session', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-refresh-relogin-'))
+  const desktop = path.join(dataDir, 'desktop')
+  const signins = path.join(dataDir, 'signins')
+  const archive = path.join(dataDir, 'credentials-archive.json')
+  fs.mkdirSync(desktop)
+  const uin = '90000009989'
+  const signIn = (token, refreshToken, issued) => ({
+    region: 'cn', accessToken: token, refreshToken,
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin, enterpriseId: '', nickname: 'RefreshRelogin', lastRefreshAtMs: issued,
+  })
+  let releaseRefresh
+  let refreshStarted
+  const gate = new Promise((resolve) => { releaseRefresh = resolve })
+  const started = new Promise((resolve) => { refreshStarted = resolve })
+  try {
+    await writeOwnSignIn(signins, signIn('at-refresh-before', 'rt-refresh-before', Date.now() - DAY))
+    const pool = new WorkBuddyAccountPool({
+      authDirs: [desktop, signins],
+      dataPath: () => dataDir,
+      cooldownMs: 60000,
+      client: {
+        refreshToken: async () => {
+          refreshStarted()
+          await gate
+          return { accessToken: 'at-refresh-rotated', refreshToken: 'rt-refresh-rotated', expiresInSec: 28 * DAY }
+        },
+      },
+    })
+    const [account] = await pool.scan()
+    assert.ok(account !== undefined)
+    // The pool that deletes is not the one holding the refresh open; its
+    // roster cannot tell the refresher that the sign-in is gone.
+    const deletingPool = new WorkBuddyAccountPool({ authDirs: [desktop, signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    await deletingPool.scan()
+    const refreshing = pool.ensureFresh(account, true)
+    refreshing.catch(() => {})
+    await started
+
+    assert.equal(await deletingPool.removeOwnSignIn(account.id), true)
+    // The user signs in again; the client writes its live file.
+    fs.writeFileSync(path.join(desktop, LIVE_NAME), JSON.stringify({
+      auth: {
+        accessToken: 'at-recovered', refreshToken: 'rt-recovered',
+        expiresAt: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn', lastRefreshTime: Date.now(),
+      },
+      account: { uin, nickname: 'RefreshRelogin' },
+    }), 'utf8')
+    const recovered = await deletingPool.scan()
+    assert.equal(recovered.some(entry => entry.credential.accessToken === 'at-recovered'), true)
+
+    releaseRefresh()
+    assert.equal(await refreshing, 'failed')
+    const archived = fs.existsSync(archive)
+      ? JSON.parse(fs.readFileSync(archive, 'utf8')).entries ?? []
+      : []
+    assert.equal(archived.some(entry => entry.accessToken === 'at-refresh-rotated'), false,
+      'the deleted session must not be archived after the re-login')
+    const next = await pool.scan()
+    assert.equal(next.some(entry => entry.credential.accessToken === 'at-refresh-rotated'), false,
+      'the deleted session must not outrank the re-login')
+    assert.equal(next.some(entry => entry.credential.accessToken === 'at-recovered'), true)
+  } finally {
+    releaseRefresh()
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A failed unlink rolls the tombstone back. If that rollback write hits a
+ * transient sharing violation, the tombstone must not be left behind where a
+ * fresh process would hide a sign-in the panel said was not deleted.
+ */
+test('a failed delete retries a failed tombstone rollback', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-rollback-retry-'))
+  const signins = path.join(dataDir, 'signins')
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  const signIn = {
+    region: 'cn', accessToken: 'at-rollback-retry', refreshToken: 'rt-rollback-retry',
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin: '90000009990', enterpriseId: '', nickname: 'RollbackRetry', lastRefreshAtMs: Date.now(),
+  }
+  const fsp = require('node:fs/promises')
+  const realUnlink = fsp.unlink
+  const realRename = fsp.rename
+  let tombstoneRenames = 0
+  try {
+    await writeOwnSignIn(signins, signIn)
+    const pool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const [account] = await pool.scan()
+    assert.ok(account !== undefined)
+    fsp.unlink = async (file, ...rest) => {
+      if (path.resolve(String(file)) === path.resolve(account.credential.sourcePath)) {
+        const denied = new Error('fixture unlink denied')
+        denied.code = 'EPERM'
+        throw denied
+      }
+      return realUnlink(file, ...rest)
+    }
+    fsp.rename = async (from, to, ...rest) => {
+      if (path.resolve(String(to)) === path.resolve(tombstoneFile)) {
+        tombstoneRenames += 1
+        if (tombstoneRenames === 2) {
+          const denied = new Error('fixture rollback write denied')
+          denied.code = 'EACCES'
+          throw denied
+        }
+      }
+      return realRename(from, to, ...rest)
+    }
+    await assert.rejects(pool.removeOwnSignIn(account.id), { code: 'EPERM' })
+    const entries = JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries ?? {}
+    assert.equal(Object.hasOwn(entries, account.id), false,
+      'the failed delete must not leave its tombstone behind')
+    assert.equal(fs.existsSync(account.credential.sourcePath), true)
+  } finally {
+    fsp.unlink = realUnlink
+    fsp.rename = realRename
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * The success path has its own window: the rotation is already on disk when
+ * another pool deletes it, so the archive check skips the write. The pool that
+ * ran the refresh must not keep serving the rotated token either.
+ */
+test('a delete after the rotated write reverts the in-memory token', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-refresh-window-'))
+  const signins = path.join(dataDir, 'signins')
+  const archive = path.join(dataDir, 'credentials-archive.json')
+  const uin = '90000009991'
+  const signIn = {
+    region: 'cn', accessToken: 'at-window-old', refreshToken: 'rt-window-old',
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin, enterpriseId: '', nickname: 'RefreshWindow',
+    lastRefreshAtMs: Date.now() - 7 * 60 * 60 * 1000,
+  }
+  const client = {
+    refreshToken: async () => ({
+      accessToken: 'at-window-rotated', refreshToken: 'rt-window-rotated', expiresInSec: 28 * DAY,
+    }),
+  }
+  let archiveReached
+  let releaseArchiveCheck
+  const reached = new Promise((resolve) => { archiveReached = resolve })
+  const gate = new Promise((resolve) => { releaseArchiveCheck = resolve })
+  try {
+    const file = await writeOwnSignIn(signins, signIn)
+    const pool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000, client })
+    const [account] = await pool.scan()
+    assert.ok(account !== undefined)
+    const realArchiveCheck = pool.archiveRefreshedCredential.bind(pool)
+    pool.archiveRefreshedCredential = async (previous, refreshed) => {
+      archiveReached()
+      await gate
+      return await realArchiveCheck(previous, refreshed)
+    }
+    const refreshing = pool.ensureFresh(account, true)
+    await reached
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).auth.accessToken, 'at-window-rotated')
+
+    const deletingPool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const doomed = (await deletingPool.scan()).find(entry => entry.credential.uin === uin)
+    assert.ok(doomed !== undefined)
+    assert.equal(doomed.credential.accessToken, 'at-window-rotated')
+    assert.equal(await deletingPool.removeOwnSignIn(doomed.id), true)
+    assert.equal(fs.existsSync(file), false)
+
+    releaseArchiveCheck()
+    assert.equal(await refreshing, 'failed')
+    assert.equal(account.credential.accessToken, 'at-window-old',
+      'the in-memory credential must revert when the sign-in is gone')
+    assert.equal(pool.available(Date.now()).some(entry => entry.credential.accessToken === 'at-window-rotated'), false)
+    const archived = fs.existsSync(archive)
+      ? JSON.parse(fs.readFileSync(archive, 'utf8')).entries ?? []
+      : []
+    assert.equal(archived.some(entry => entry.accessToken === 'at-window-rotated'), false)
+    assert.equal((await pool.scan()).length, 0)
+  } finally {
+    releaseArchiveCheck()
+    await cleanup(dataDir)
+  }
+})
+
+test('a failed delete does not leave its own tombstone behind', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-rollback-'))
+  const signins = path.join(dataDir, 'signins')
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  const signIn = (uin, nickname) => ({
+    region: 'cn', accessToken: `at-${uin}`, refreshToken: `rt-${uin}`,
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin, enterpriseId: '', nickname,
+  })
+  try {
+    await writeOwnSignIn(signins, signIn('90000009970', 'Keep'))
+    await writeOwnSignIn(signins, signIn('90000009971', 'Other'))
+    await writeOwnSignIn(signins, signIn('90000009972', 'Later'))
+    const pool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const other = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const mine = await pool.scan()
+    await other.scan()
+    const target = mine.find(account => account.credential.uin === '90000009970')
+    const first = mine.find(account => account.credential.uin === '90000009971')
+    const second = mine.find(account => account.credential.uin === '90000009972')
+    assert.ok(target !== undefined && first !== undefined && second !== undefined)
+    assert.equal(await other.removeOwnSignIn(first.id), true)
+
+    const fsp = require('node:fs/promises')
+    const realUnlink = fsp.unlink
+    const realReadFile = fsp.readFile
+    const targetFile = target.credential.sourcePath
+    fsp.unlink = async (file, ...rest) => {
+      if (path.resolve(String(file)) === path.resolve(targetFile)) {
+        const denied = new Error('fixture sign-in cannot be removed')
+        denied.code = 'EPERM'
+        throw denied
+      }
+      return realUnlink(file, ...rest)
+    }
+    let parkRead = true
+    let releaseRead
+    const readGate = new Promise((resolve) => { releaseRead = resolve })
+    let readParked
+    const parked = new Promise((resolve) => { readParked = resolve })
+    fsp.readFile = async (file, ...rest) => {
+      if (parkRead && path.resolve(String(file)) === path.resolve(targetFile)) {
+        parkRead = false
+        readParked()
+        await readGate
+      }
+      return realReadFile(file, ...rest)
+    }
+    try {
+      const deleting = pool.removeOwnSignIn(target.id)
+      deleting.catch(() => {})
+      // The delete has recorded its tombstone and is about to check the file.
+      // This delete changes the tombstone document while the first one is in
+      // flight.
+      await parked
+      assert.equal(await other.removeOwnSignIn(second.id), true)
+      releaseRead()
+      await assert.rejects(deleting, (error) => error.code === 'EPERM')
+    } finally {
+      releaseRead()
+      fsp.unlink = realUnlink
+      fsp.readFile = realReadFile
+    }
+    const entries = JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries ?? {}
+    assert.equal(Object.hasOwn(entries, target.id), false,
+      'the failed delete must not leave its own tombstone behind')
+    assert.equal(Object.hasOwn(entries, workbuddyAccountId(first.credential)), true,
+      'the delete it merged from the other pool stays')
+    assert.equal(Object.hasOwn(entries, workbuddyAccountId(second.credential)), true,
+      'the concurrent delete stays')
+    const after = await pool.scan()
+    assert.equal(after.some(account => account.id === target.id), true,
+      'the account whose delete failed is still served')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A scan releasing an old delete must not erase a newer delete for the same
+ * account, written by another pool while the scan was reading the record.
+ */
+test('a scan releasing an old delete keeps a newer one written meanwhile', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-release-race-'))
+  const signins = path.join(dataDir, 'signins')
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  const oldToken = 'at-release-old'
+  const newToken = 'at-release-new'
+  const uin = '90000009980'
+  const id = workbuddyAccountId({ uin, nickname: 'ReleaseRace', sourcePath: '' })
+  const digest = (token) => createHash('sha256')
+    .update('workbuddy\0deleted\0' + token).digest('hex').slice(0, 32)
+  const earlier = { tokenDigest: digest(oldToken), lastRefreshAtMs: Date.now() - DAY, deletedAtMs: Date.now() - 30 * 60 * 1000 }
+  const later = { tokenDigest: digest(newToken), lastRefreshAtMs: Date.now(), deletedAtMs: Date.now() + 1_000 }
+  try {
+    await writeOwnSignIn(signins, {
+      region: 'cn', accessToken: newToken, refreshToken: 'rt-release-new',
+      expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+      uid: '', uin, enterpriseId: '', nickname: 'ReleaseRace', lastRefreshAtMs: Date.now(),
+    })
+    fs.writeFileSync(tombstoneFile, JSON.stringify({ version: 1, entries: { [id]: earlier } }, null, 2))
+    const fsp = require('node:fs/promises')
+    const realReadFile = fsp.readFile
+    let parkRead = true
+    let releaseRead
+    const readGate = new Promise((resolve) => { releaseRead = resolve })
+    let readParked
+    const parked = new Promise((resolve) => { readParked = resolve })
+    fsp.readFile = async (file, ...rest) => {
+      if (parkRead && path.resolve(String(file)) === path.resolve(tombstoneFile)) {
+        parkRead = false
+        const text = await realReadFile(file, ...rest)
+        readParked()
+        await readGate
+        return text
+      }
+      return realReadFile(file, ...rest)
+    }
+    try {
+      const pool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+      const scanning = pool.scan()
+      await parked
+      fs.writeFileSync(tombstoneFile, JSON.stringify({ version: 1, entries: { [id]: later } }, null, 2))
+      releaseRead()
+      await scanning
+    } finally {
+      releaseRead()
+      fsp.readFile = realReadFile
+    }
+    const entries = JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries ?? {}
+    assert.equal(entries[id]?.deletedAtMs, later.deletedAtMs,
+      'the newer delete must survive the older record being released')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A delete made from a stale roster must not replace the tombstone a newer
+ * delete left for the same account. The record naming the newer sign-in is the
+ * one that still has to hold, or the newer snapshot comes back as a re-login.
+ */
+test('a stale delete cannot overwrite a newer sign-in tombstone', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-stale-delete-'))
+  const signins = path.join(dataDir, 'signins')
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  const uin = '90000009981'
+  const olderIssued = Date.now() - 60 * 60 * 1000
+  const newerIssued = Date.now() - 10 * 60 * 1000
+  const digest = (token) => createHash('sha256')
+    .update('workbuddy\0deleted\0' + token).digest('hex').slice(0, 32)
+  const signIn = (token, issued) => ({
+    region: 'cn', accessToken: token, refreshToken: `rt-${token}`,
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin, enterpriseId: '', nickname: 'StaleDelete', lastRefreshAtMs: issued,
+  })
+  try {
+    await writeOwnSignIn(signins, signIn('at-stale-old', olderIssued))
+    const stalePool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const staleRoster = await stalePool.scan()
+    assert.equal(staleRoster.length, 1)
+
+    await writeOwnSignIn(signins, signIn('at-current', newerIssued))
+    const currentPool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const currentRoster = await currentPool.scan()
+    const current = currentRoster.find(account => account.credential.uin === uin)
+    assert.ok(current !== undefined)
+    assert.equal(await currentPool.removeOwnSignIn(current.id), true)
+
+    // The older pool still holds the previous sign-in and deletes it now.
+    assert.equal(await stalePool.removeOwnSignIn(staleRoster[0].id), true)
+    const afterDelete = JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries ?? {}
+    assert.equal(afterDelete[current.id]?.tokenDigest, digest('at-current'),
+      'the newer delete must not be replaced by the stale one')
+
+    // The snapshot of the newer sign-in is written again; the newer delete holds.
+    await writeOwnSignIn(signins, signIn('at-current', newerIssued))
+    assert.equal((await stalePool.scan()).length, 0,
+      'the newer sign-in must not return as a re-login')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A delete from another pool can land after this walk read the tombstones.
+ * The roster and adoption step must re-check the latest set before committing,
+ * or the scan serves a sign-in the other pool already removed.
+ */
+test('a delete committed during a scan is not served by that scan', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-inflight-delete-'))
+  const signins = path.join(dataDir, 'signins')
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  const uin = '90000009982'
+  const olderIssued = Date.now() - 60 * 60 * 1000
+  const currentIssued = Date.now() - 10 * 60 * 1000
+  const digest = (token) => createHash('sha256')
+    .update('workbuddy\0deleted\0' + token).digest('hex').slice(0, 32)
+  const signIn = {
+    region: 'cn', accessToken: 'at-inflight', refreshToken: 'rt-inflight',
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin, enterpriseId: '', nickname: 'Inflight', lastRefreshAtMs: currentIssued,
+  }
+  try {
+    await writeOwnSignIn(signins, signIn)
+    const deletingPool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const deletingRoster = await deletingPool.scan()
+    const doomed = deletingRoster.find(account => account.credential.uin === uin)
+    assert.ok(doomed !== undefined)
+
+    const id = workbuddyAccountId(doomed.credential)
+    fs.writeFileSync(tombstoneFile, JSON.stringify({
+      version: 1,
+      entries: {
+        [id]: {
+          tokenDigest: digest('at-inflight-older'),
+          lastRefreshAtMs: olderIssued,
+          deletedAtMs: Date.now() - 30 * 60 * 1000,
+        },
+      },
+    }, null, 2))
+
+    const fsp = require('node:fs/promises')
+    const realReadFile = fsp.readFile
+    let parkRead = true
+    let releaseRead
+    const readGate = new Promise((resolve) => { releaseRead = resolve })
+    let readParked
+    const parked = new Promise((resolve) => { readParked = resolve })
+    fsp.readFile = async (file, ...rest) => {
+      if (parkRead && path.resolve(String(file)) === path.resolve(tombstoneFile)) {
+        parkRead = false
+        const text = await realReadFile(file, ...rest)
+        readParked()
+        await readGate
+        return text
+      }
+      return realReadFile(file, ...rest)
+    }
+    try {
+      const scanningPool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+      const scanning = scanningPool.scan()
+      await parked
+      assert.equal(await deletingPool.removeOwnSignIn(doomed.id), true)
+      releaseRead()
+      await scanning
+      assert.equal(scanningPool.list().length, 0,
+        'the in-flight scan must not commit the sign-in deleted while it was reading')
+    } finally {
+      releaseRead()
+      fsp.readFile = realReadFile
+    }
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * Two deletes of one account can commit in the same millisecond. A rollback is
+ * allowed to drop only its own record; field equality cannot tell the two
+ * writes apart, so the record carries an identity of its own.
+ */
+test('concurrent deletes in one millisecond keep the successful tombstone', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-equal-ms-'))
+  const signins = path.join(dataDir, 'signins')
+  const tombstoneFile = path.join(dataDir, 'deleted-signins.json')
+  const uin = '90000009983'
+  const signIn = {
+    region: 'cn', accessToken: 'at-equal-ms', refreshToken: 'rt-equal-ms',
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin, enterpriseId: '', nickname: 'EqualMs', lastRefreshAtMs: Date.now() - DAY,
+  }
+  try {
+    await writeOwnSignIn(signins, signIn)
+    const pool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const [account] = await pool.scan()
+    assert.ok(account !== undefined)
+    const signInFile = account.credential.sourcePath
+    const fsp = require('node:fs/promises')
+    const realUnlink = fsp.unlink
+    const realNow = Date.now
+    const fixed = realNow()
+    let denyNext = true
+    Date.now = () => fixed
+    fsp.unlink = async (file, ...rest) => {
+      if (denyNext && path.resolve(String(file)) === path.resolve(signInFile)) {
+        denyNext = false
+        const denied = new Error('fixture first unlink denied')
+        denied.code = 'EACCES'
+        throw denied
+      }
+      return realUnlink(file, ...rest)
+    }
+    let results
+    try {
+      results = await Promise.allSettled([
+        pool.removeOwnSignIn(account.id),
+        pool.removeOwnSignIn(account.id),
+      ])
+    } finally {
+      Date.now = realNow
+      fsp.unlink = realUnlink
+    }
+    const fulfilled = results.filter((result) => result.status === 'fulfilled' && result.value === true)
+    const rejected = results.filter((result) => result.status === 'rejected')
+    assert.equal(rejected.length, 1, 'one delete fails on the unlink')
+    assert.equal(fulfilled.length, 1, 'the other delete succeeds')
+    const entries = JSON.parse(fs.readFileSync(tombstoneFile, 'utf8')).entries ?? {}
+    assert.equal(Object.hasOwn(entries, account.id), true,
+      'the successful delete must keep its tombstone')
+    await writeOwnSignIn(signins, signIn)
+    assert.equal((await pool.scan()).length, 0, 'the deleted sign-in must not come back')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * The archive phase runs after the scan's tombstone re-read and can take long
+ * enough for another pool to delete the account. The final check before the
+ * roster commit is what keeps this scan from serving it.
+ */
+test('a delete during the archive phase is not served by that scan', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-late-delete-'))
+  const signins = path.join(dataDir, 'signins')
+  const archive = path.join(dataDir, 'credentials-archive.json')
+  const uin = '90000009984'
+  const signIn = {
+    region: 'cn', accessToken: 'at-late', refreshToken: 'rt-late',
+    expiresAtMs: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+    uid: '', uin, enterpriseId: '', nickname: 'Late', lastRefreshAtMs: Date.now() - DAY,
+  }
+  try {
+    await writeOwnSignIn(signins, signIn)
+    const deletingPool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const deletingRoster = await deletingPool.scan()
+    const doomed = deletingRoster.find(account => account.credential.uin === uin)
+    assert.ok(doomed !== undefined)
+    assert.equal(fs.existsSync(archive), true, 'the first scan writes the archive')
+
+    const scanningPool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir, cooldownMs: 60000 })
+    const fsp = require('node:fs/promises')
+    const realReadFile = fsp.readFile
+    let parkRead = true
+    let releaseRead
+    const readGate = new Promise((resolve) => { releaseRead = resolve })
+    let readParked
+    const parked = new Promise((resolve) => { readParked = resolve })
+    fsp.readFile = async (file, ...rest) => {
+      if (parkRead && path.resolve(String(file)) === path.resolve(archive)) {
+        parkRead = false
+        const text = await realReadFile(file, ...rest)
+        readParked()
+        await readGate
+        return text
+      }
+      return realReadFile(file, ...rest)
+    }
+    try {
+      const scanning = scanningPool.scan()
+      await parked
+      const deleting = deletingPool.removeOwnSignIn(doomed.id)
+      // The delete's tombstone and unlink run before its archive purge, which
+      // waits for the lock this scan holds. Wait for the file to go, then let
+      // the scan continue into the final check.
+      const signInFile = doomed.credential.sourcePath
+      const deadline = Date.now() + 10_000
+      while (fs.existsSync(signInFile) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      assert.equal(fs.existsSync(signInFile), false, 'the delete commits while the scan is in its archive phase')
+      releaseRead()
+      await scanning
+      await deleting
+      assert.equal(scanningPool.list().length, 0,
+        'a delete committed during the archive phase must not be served')
+    } finally {
+      releaseRead()
+      fsp.readFile = realReadFile
+    }
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
+/**
+ * A snapshot deleted while the scan is in its archive phase must not be copied
+ * into the plugin's directory afterwards. The delete's unlink reaches its own
+ * copy, never the one this scan is about to write.
+ */
+test('a snapshot deleted during the archive phase is not adopted', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-adopt-adopt-late-'))
+  const desktop = path.join(dataDir, 'desktop')
+  const signins = path.join(dataDir, 'signins')
+  const archive = path.join(dataDir, 'credentials-archive.json')
+  const uin = '90000009985'
+  fs.mkdirSync(desktop, { recursive: true })
+  const snapshot = path.join(desktop, 'workbuddy-desktop-other.info')
+  fs.writeFileSync(snapshot, JSON.stringify({
+    auth: {
+      accessToken: 'at-adopt-late', refreshToken: 'rt-adopt-late',
+      expiresAt: Date.now() + 9 * DAY, domain: 'www.codebuddy.cn',
+      lastRefreshTime: Date.now() - DAY,
+    },
+    account: { uin, nickname: 'AdoptLate' },
+  }, null, 2))
+  try {
+    const deletingPool = new WorkBuddyAccountPool({ authDirs: [desktop], dataPath: () => dataDir, cooldownMs: 60000 })
+    const deletingRoster = await deletingPool.scan()
+    const doomed = deletingRoster.find(account => account.credential.uin === uin)
+    assert.ok(doomed !== undefined)
+    assert.equal(fs.readdirSync(signins).length, 1, 'the first scan took the snapshot over')
+    assert.equal(fs.existsSync(archive), true)
+
+    const scanningPool = new WorkBuddyAccountPool({ authDirs: [desktop], dataPath: () => dataDir, cooldownMs: 60000 })
+    const fsp = require('node:fs/promises')
+    const realReadFile = fsp.readFile
+    let parkRead = true
+    let releaseRead
+    const readGate = new Promise((resolve) => { releaseRead = resolve })
+    let readParked
+    const parked = new Promise((resolve) => { readParked = resolve })
+    fsp.readFile = async (file, ...rest) => {
+      if (parkRead && path.resolve(String(file)) === path.resolve(archive)) {
+        parkRead = false
+        const text = await realReadFile(file, ...rest)
+        readParked()
+        await readGate
+        return text
+      }
+      return realReadFile(file, ...rest)
+    }
+    try {
+      const scanning = scanningPool.scan()
+      await parked
+      const deleting = deletingPool.removeOwnSignIn(doomed.id)
+      const ownCopy = doomed.credential.sourcePath
+      const deadline = Date.now() + 10_000
+      while (fs.existsSync(ownCopy) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      assert.equal(fs.existsSync(ownCopy), false, 'the delete commits while the scan is in its archive phase')
+      releaseRead()
+      await scanning
+      await deleting
+      assert.equal(scanningPool.list().length, 0,
+        'a snapshot deleted during the archive phase must not be served')
+      assert.equal(fs.existsSync(signins) ? fs.readdirSync(signins).length : 0, 0,
+        'and must not be copied into the plugin directory')
+    } finally {
+      releaseRead()
+      fsp.readFile = realReadFile
+    }
+  } finally {
     await cleanup(dataDir)
   }
 })

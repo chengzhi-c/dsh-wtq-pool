@@ -336,7 +336,7 @@ function loadHost() {
   })
   const module = { exports: {} }
   const login = {
-    startDeviceLogin: async () => ({ state: 'fixture-login', authUrl: 'https://example.invalid/login' }),
+    startDeviceLogin: async () => ({ state: 'fixture-login', authUrl: 'https://copilot.tencent.com/login' }),
     pollDeviceLogin: async () => ({ status: 'pending' }),
   }
   const context = vm.createContext({

@@ -2,7 +2,7 @@
   "name": "dsh-wtq-pool",
   "displayName": "WTQ Pool",
   "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 DeepSeek Harness。限流或额度用尽时自动换号，三家各自开关，国内与国际账号分别成组。",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "license": "MIT",
   "author": "chengzhi-c",
   "homepage": "https://github.com/chengzhi-c/dsh-wtq-pool#readme",
@@ -52,7 +52,7 @@
     "build": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsdown",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:client": "tsc -p tsconfig.client.json --noEmit",
-    "pretest": "pnpm run build",
+    "pretest": "npm run build",
     "test": "node --test --test-timeout=60000 \"tests/*.test.cjs\""
   },
   "dsh": {
@@ -91,10 +91,5 @@
     "@deepseek-ai/dsh-settings": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.2-rc.1 <0.2.3-0",
     "@deepseek-ai/schemastery": "^3.18.4",
     "@earendil-works/pi-ai": ">=0.87.1 <0.88.0 || >=1.3.0 <2.0.0-0"
-  },
-  "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-settings": {
-      "optional": true
-    }
   }
 }

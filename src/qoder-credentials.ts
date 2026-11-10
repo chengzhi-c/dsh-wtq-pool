@@ -10,7 +10,7 @@ import { readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { QoderRegion, QoderStorageCandidate } from './qoder-discovery'
 import { decryptQoderOscrypt, qoderStorageCandidates } from './qoder-discovery'
-import { trustedWindowsChildEnv, trustedWindowsPowerShell } from './trusted-process'
+import { trustedSystemRootOf, trustedWindowsChildEnv, trustedWindowsPowerShell } from './trusted-process'
 
 /** One Qoder sign-in, token kept in memory only. */
 export interface QoderCredential {
@@ -143,6 +143,14 @@ export async function unwrapQoderOscryptKey(
     const stdout = await new Promise<string>((resolve, reject) => {
       const child = spawn(exe, ['-NoProfile', '-NonInteractive', '-Command', DPAPI_SCRIPT], {
         env: trustedWindowsChildEnv(env, { inheritTemp: true, includeSystemDrive: true }),
+        // A writable current directory on the DLL search path is how a planted
+        // library reaches an elevated PowerShell. The trusted root is the one
+        // that located the executable, not the inherited variable the caller
+        // can point anywhere.
+        cwd: (() => {
+          const root = trustedSystemRootOf(env)
+          return root === undefined ? undefined : join(root, 'System32')
+        })(),
         windowsHide: true,
         stdio: ['pipe', 'pipe', 'pipe'],
       })
@@ -159,6 +167,10 @@ export async function unwrapQoderOscryptKey(
         if (code === 0) resolve(out)
         else reject(new QoderKeyError('unavailable', `PowerShell exited ${code}: ${err.trim().slice(0, 160)}`))
       })
+      // A child that exits before reading stdin writes EPIPE here. The stream
+      // error is not the ChildProcess `error` event, and leaving it unhandled
+      // took down the whole plugin host; close/error above already settle.
+      child.stdin.on('error', () => {})
       child.stdin.end(payload.toString('base64'))
     })
     const key = Buffer.from(stdout.trim(), 'base64')

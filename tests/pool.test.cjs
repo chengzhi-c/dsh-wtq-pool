@@ -519,3 +519,36 @@ test('a pool with every account cooling answers the cause, not a 500', async () 
     await shim.close()
   }
 })
+
+test('clearing the roster keeps an active hold out of rotation', async () => {
+  const dir = scratch('clear-hold')
+  writeSignIn(dir, 'workbuddy-desktop', '90000000103')
+  const pool = poolOf([dir])
+  const [account] = await pool.scan()
+  pool.penalize(account.id, undefined, undefined, 'session')
+
+  pool.clear()
+  await pool.scan()
+
+  assert.equal(pool.available(Date.now(), undefined, 'cn').length, 0,
+    'a hold outlives the roster clear, so the rebuilt account must carry its deadline')
+  assert.equal(pool.activeHold(account.id)?.reason, 'session',
+    'and the panel still reports the hold it is keeping the account out for')
+})
+
+test('a server cooldown is bounded by its own window, not a longer hold', async () => {
+  const dir = scratch('server-own-window')
+  writeSignIn(dir, 'workbuddy-desktop', '90000000104')
+  const pool = poolOf([dir], { cooldownMs: 200 })
+  const [account] = await pool.scan()
+  const start = Date.now()
+
+  pool.penalize(account.id, undefined, undefined, 'spent')
+  pool.penalize(account.id, undefined, undefined, false, 'server')
+  pool.setCreditBalance(account.id, 100)
+
+  assert.equal(pool.unavailableReason(account.id, start + 300), null,
+    'the released balance hold must not leave the merged server deadline behind')
+  assert.equal(pool.available(start + 300, undefined, 'cn').length, 1,
+    'and the account serves once the server window itself ends')
+})

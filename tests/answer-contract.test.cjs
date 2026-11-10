@@ -773,3 +773,118 @@ test('a Trae 4001 that arrives inside the stream still hands the turn over', asy
   } finally { await gateway.close() }
 })
 
+
+/**
+ * A 5xx rotates to the next account instead of ending the turn.
+ *
+ * The first account in `priority` mode answers every request until something
+ * takes it out of rotation. A persistent 500 on that account used to break the
+ * loop and return 502 while healthy accounts behind it were never tried, so one
+ * broken deployment could fail every turn for the rest of the session.
+ */
+test('a 5xx rotates to the next account', async () => {
+  const dirs = signInDirs('server', 2)
+  const calls = []
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async (credential) => {
+      calls.push(credential.accessToken)
+      if (calls.length === 1) {
+        return { ok: false, kind: 'server', status: 500, message: 'upstream is down' }
+      }
+      return {
+        ok: true,
+        response: new Response('data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        }),
+      }
+    },
+  }
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 200, 'the healthy account must serve the turn')
+    assert.equal(calls.length, 2, 'the failing account is tried once, then the next one')
+    const failed = shim.pool.list().find((account) => account.credential.accessToken === calls[0])
+    assert.ok(failed.cooldownUntilMs > Date.now(), 'the account that answered 5xx is cooling')
+    assert.equal(failed.rateLimitHits, 0, 'a 5xx is not a rate-limit hit')
+    assert.equal(failed.rateLimitStreak ?? 0, 0, 'and it does not stretch the next rate-limit window')
+  } finally {
+    await shim.close()
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * A pool where every account answers 5xx says so, not "rate-limited".
+ *
+ * 5xx now rotates, so an outage reaches the exhausted-pool branch instead of
+ * the post-loop error writer. The shared fallback called every cause it did not
+ * recognize "rate-limited" and told the user to sign in again, which names a
+ * window and a remedy that have nothing to do with an upstream outage.
+ */
+test('every account answering 5xx is reported as an upstream outage', async () => {
+  const dirs = signInDirs('outage', 2)
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async () => ({ ok: false, kind: 'server', status: 503, message: 'upstream is down' }),
+  }
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 502)
+    assert.match(answer.text, /upstream server error/, 'the cause is named')
+    assert.match(answer.text, /retry shortly/, 'the remedy fits an outage')
+    assert.doesNotMatch(answer.text, /rate-limited/, 'an outage is not a frequency wall')
+    for (const account of shim.pool.list()) {
+      assert.ok(account.cooldownUntilMs > Date.now(), `${account.label} cools for the configured window`)
+      assert.equal(account.rateLimitHits, 0, `${account.label} is not counted as rate-limited`)
+      assert.equal(shim.pool.unavailableReason(account.id, Date.now(), 'hy3'), 'server',
+        `${account.label} reports the outage on the next request, not a rate limit`)
+    }
+  } finally {
+    await shim.close()
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * A WAF page is the gateway's fault, not a frequency wall on the account.
+ *
+ * It cools for the configured window and the next account serves, like a 5xx.
+ * Counting it as a limit inflated `rateLimitHits` and stretched the next real
+ * 429's backoff, so a block the user could only wait out looked like one the
+ * account had caused by asking too often.
+ */
+test('a WAF block rotates as a gateway fault, not a rate limit', async () => {
+  const dirs = signInDirs('waf', 2)
+  const calls = []
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async (credential) => {
+      calls.push(credential.accessToken)
+      if (calls.length === 1) {
+        return { ok: false, kind: 'waf_block', status: 403, message: '<html>blocked</html>' }
+      }
+      return {
+        ok: true,
+        response: new Response('data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        }),
+      }
+    },
+  }
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 200, 'the next account must serve the turn')
+    const blocked = shim.pool.list().find((account) => account.credential.accessToken === calls[0])
+    assert.ok(blocked.cooldownUntilMs > Date.now(), 'the blocked account cools for the configured window')
+    assert.equal(blocked.rateLimitHits, 0, 'a WAF page is not a rate-limit hit')
+    assert.equal(shim.pool.unavailableReason(blocked.id, Date.now(), 'hy3'), 'server',
+      'the next request reports a gateway fault, not a limit')
+  } finally {
+    await shim.close()
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

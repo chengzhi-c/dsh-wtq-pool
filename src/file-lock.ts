@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { trustedSystemRootOf, trustedWindowsChildEnv, trustedWindowsPowerShell } from './trusted-process'
 
 const FILE_LOCK_WAIT_MS = 5_000
@@ -27,7 +27,68 @@ interface ReclaimClaim {
 }
 
 type FileRelease = 'released' | 'missing' | 'replaced' | 'failed'
+
+/**
+ * The work committed, but the lock file could not be removed.
+ *
+ * Callers that treat an acquisition failure as a reason to roll their own
+ * change back must not do that here: the change is already on disk, and only
+ * the bookkeeping file is left behind.
+ */
+export class FileLockReleaseError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'FileLockReleaseError'
+  }
+}
 const ABANDONED_RECLAIMS = new Map<string, string>()
+/**
+ * Locks this process failed to release, by resolved path.
+ *
+ * A holder that shares only reads blocks the write that would mark the lock
+ * abandoned as well as the unlink. A sidecar records the same fact for other
+ * processes; this map is the fallback when even creating a new file is denied.
+ */
+const ABANDONED_LOCKS = new Map<string, string>()
+
+function abandonedMarker(file: string, token: string): string {
+  return `${file}.abandoned.${token}`
+}
+
+async function markAbandoned(file: string, token: string): Promise<void> {
+  ABANDONED_LOCKS.set(resolve(file), token)
+  try {
+    await writeFile(abandonedMarker(file, token), JSON.stringify({
+      token,
+      createdAtMs: Date.now(),
+    }), { flag: 'wx', mode: 0o600 })
+  } catch { /* the in-process record still keeps this process out of its own lock */ }
+}
+
+async function hasAbandonedMarker(file: string, token: string): Promise<boolean> {
+  try {
+    await stat(abandonedMarker(file, token))
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function cleanupAbandonedMarkers(file: string): Promise<void> {
+  const directory = dirname(file)
+  const prefix = `${basename(file)}.abandoned.`
+  let names: string[]
+  try {
+    names = await readdir(directory)
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue
+    await unlink(join(directory, name)).catch(() => {})
+  }
+  ABANDONED_LOCKS.delete(resolve(file))
+}
 
 /**
  * Commit a complete temporary file over its target.
@@ -117,6 +178,10 @@ async function lockState(file: string): Promise<LockState> {
     // answer about the lock. Throwing here failed the whole acquisition in 2 ms
     // while the caller's own wait loop was still running; "current" lets that
     // loop retry, which is the same treatment `releaseOwnedFile` gives it.
+    // An abandoned record is keyed by path, and another process may have
+    // reclaimed the path and created its own live lock since. Without a read
+    // there is no token to compare, so the record cannot justify deleting it;
+    // the record still recovers the lock once the read succeeds.
     if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') return 'current'
     throw error
   }
@@ -126,6 +191,10 @@ async function lockState(file: string): Promise<LockState> {
   // abandoned. Without this, the pid inside it is this live process and the
   // lock read as held for the rest of the process's life.
   if (owner?.state === 'abandoned') return 'stale'
+  if (typeof owner?.token === 'string') {
+    if (ABANDONED_LOCKS.get(resolve(file)) === owner.token) return 'stale'
+    if (await hasAbandonedMarker(file, owner.token)) return 'stale'
+  }
   const fileAge = await stat(file).then(entry => Date.now() - entry.mtimeMs, (): number => 0)
   const ownerAlive = typeof owner?.pid === 'number' ? processIsAlive(owner.pid) : undefined
   if (ownerAlive === false) return 'stale'
@@ -163,7 +232,12 @@ async function createOwnedFile(file: string): Promise<string | undefined> {
     }), { flag: 'wx', mode: 0o600 })
     return token
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return undefined
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'EEXIST') return undefined
+    // Windows reports a lock file that another writer is deleting as EPERM or
+    // EACCES, not EEXIST. That is contention, not a failed write: wait for the
+    // delete to finish instead of dropping the archive update for this pass.
+    if (process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES')) return undefined
     throw error
   }
 }
@@ -178,6 +252,13 @@ async function releaseOwnedFile(file: string, token: string): Promise<FileReleas
     } catch (error: unknown) {
       const code = (error as NodeJS.ErrnoException).code
       if (code === 'ENOENT' || code === 'ENOTDIR') return 'missing'
+      // The holder blocks the read that would let this process mark its own
+      // record abandoned. A sidecar needs only a new file in the directory, so
+      // the next acquisition can still treat this lock as recoverable.
+      if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') {
+        await markAbandoned(file, token)
+        return 'failed'
+      }
     }
     if (owner !== undefined) {
       if (owner.token !== token) return 'replaced'
@@ -199,7 +280,10 @@ async function releaseOwnedFile(file: string, token: string): Promise<FileReleas
         } catch { /* the next attempt still sees the same owner and retries */ }
       }
     }
-    if (Date.now() >= deadline) return 'failed'
+    if (Date.now() >= deadline) {
+      await markAbandoned(file, token)
+      return 'failed'
+    }
     await new Promise(resolve => setTimeout(resolve, RETRY_MS))
   }
 }
@@ -219,20 +303,29 @@ async function newestReclaimGeneration(lock: string): Promise<number> {
   return generation
 }
 
-async function cleanupTerminalReclaims(lock: string): Promise<void> {
+/**
+ * Drop reclaim generations that are no longer fencing anything.
+ *
+ * Answers false when a terminal generation could not be removed. Creating the
+ * next generation then would leave both files behind, and a filesystem that
+ * keeps refusing the delete would grow one more on every retry. The caller
+ * waits instead; the cleanup above succeeds once the deletion does.
+ */
+async function cleanupTerminalReclaims(lock: string): Promise<boolean> {
   const directory = dirname(lock)
   const prefix = `${basename(lock)}.reclaim.`
   let names: string[]
   try {
     names = await readdir(directory)
   } catch {
-    return
+    return true
   }
   const claimNames = names.filter(name => {
     if (!name.startsWith(prefix)) return false
     return /^\d+$/.test(name.slice(prefix.length))
   })
   const claimNameSet = new Set(claimNames)
+  let blocked = false
   for (const claimName of claimNames) {
     const claim = join(directory, claimName)
     const sidecars = names.filter(name => name.startsWith(`${claimName}.abandoned.`))
@@ -243,7 +336,11 @@ async function cleanupTerminalReclaims(lock: string): Promise<void> {
       owner = typeof parsed === 'object' && parsed !== null ? parsed as LockRecord : {}
     } catch { /* A sidecar still marks the generation as abandoned. */ }
     const terminalState = owner?.state === 'complete' || owner?.state === 'abandoned'
-    const rememberedAbandonment = ABANDONED_RECLAIMS.get(claim) === owner?.token
+    // Only a token this process remembers can make an unreadable claim
+    // abandoned. Two undefined tokens compared equal before, and a scanner that
+    // blocked the read made another process's live claim deletable.
+    const rememberedAbandonment = owner?.token !== undefined
+      && ABANDONED_RECLAIMS.get(claim) === owner.token
     if (sidecars.length === 0 && !terminalState && !rememberedAbandonment) continue
     let claimRemoved = false
     try {
@@ -253,7 +350,10 @@ async function cleanupTerminalReclaims(lock: string): Promise<void> {
       const code = (error as NodeJS.ErrnoException).code
       claimRemoved = code === 'ENOENT' || code === 'ENOTDIR'
     }
-    if (!claimRemoved) continue
+    if (!claimRemoved) {
+      blocked = true
+      continue
+    }
     for (const sidecar of sidecars) await unlink(join(directory, sidecar)).catch(() => {})
     for (const temporary of temporaryFiles) await unlink(join(directory, temporary)).catch(() => {})
     ABANDONED_RECLAIMS.delete(claim)
@@ -265,6 +365,7 @@ async function cleanupTerminalReclaims(lock: string): Promise<void> {
     if (claimNameSet.has(name.slice(0, abandoned))) continue
     await unlink(join(directory, name)).catch(() => {})
   }
+  return !blocked
 }
 
 async function claimStaleReclaim(lock: string): Promise<ReclaimClaim | undefined> {
@@ -286,7 +387,7 @@ async function claimStaleReclaim(lock: string): Promise<ReclaimClaim | undefined
     .map(name => join(directory, name))
   for (const claim of claims) {
     const claimName = basename(claim)
-    if (names.some(name => name.startsWith(`${claimName}.abandoned.`))) continue
+    if (names.some(name => name.startsWith(`${claimName}.abandoned.`))) return undefined
     let owner: LockRecord = {}
     try {
       const parsed = JSON.parse(await readFile(claim, 'utf8')) as unknown
@@ -297,9 +398,28 @@ async function claimStaleReclaim(lock: string): Promise<ReclaimClaim | undefined
         continue
       }
     }
-    if (owner.state === 'complete' || owner.state === 'abandoned') continue
-    if (ABANDONED_RECLAIMS.get(claim) === owner.token) continue
+    // A terminal claim the cleanup could not unlink still fences this path.
+    // Adding a generation beside it would grow the directory on every retry.
+    if (owner.state === 'complete' || owner.state === 'abandoned') return undefined
+    if (owner.token !== undefined && ABANDONED_RECLAIMS.get(claim) === owner.token) return undefined
     if (await lockState(claim) === 'current') return undefined
+    // A claimant that died mid-recovery leaves a claim that fences nothing.
+    // Removing it keeps generations bounded; if it cannot go, no new one can
+    // be told apart from it.
+    try {
+      await unlink(claim)
+    } catch (error: unknown) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') return undefined
+    }
+    // A claimant killed between its temporary write and the rename leaves that
+    // file under the claim's own name; the next generation knows nothing about
+    // it, so it goes with the claim.
+    for (const name of names) {
+      if (!name.startsWith(`${claimName}.`) || !name.endsWith('.tmp')) continue
+      await unlink(join(directory, name)).catch(() => {})
+    }
+    ABANDONED_RECLAIMS.delete(claim)
   }
   const file = `${lock}.reclaim.${String(generation + 1).padStart(12, '0')}`
   const token = await createOwnedFile(file)
@@ -366,16 +486,19 @@ async function abandonReclaim(reclaim: ReclaimClaim, cause: unknown): Promise<ne
 
 /** Run `work` while holding a lock file shared by every writer to the same document. */
 export async function withFileLock(lock: string, work: () => Promise<void>): Promise<void> {
-  await mkdir(dirname(lock), { recursive: true })
+  await mkdir(dirname(lock), { recursive: true, mode: 0o700 })
   const deadline = Date.now() + FILE_LOCK_WAIT_MS
   let token: string | undefined
   while (token === undefined) {
     token = await createOwnedFile(lock)
     if (token !== undefined) break
     const current = await lockState(lock)
-    if (current === 'missing') continue
     if (current === 'stale') {
-      const reclaim = await claimStaleReclaim(lock)
+      // A terminal claim whose unlink failed would otherwise stay beside the
+      // lock, and the next attempt would add another generation every 25 ms for
+      // the whole wait. Keep only the generation this attempt is about to use.
+      const cleaned = await cleanupTerminalReclaims(lock)
+      const reclaim = cleaned ? await claimStaleReclaim(lock) : undefined
       if (reclaim !== undefined) {
         try {
           if (await newestReclaimGeneration(lock) === reclaim.generation
@@ -390,12 +513,12 @@ export async function withFileLock(lock: string, work: () => Promise<void>): Pro
             await abandonReclaim(reclaim, error)
           }
         }
-        continue
       }
     }
     if (Date.now() >= deadline) throw new Error('timed out waiting for the credential document lock')
     await new Promise(resolve => setTimeout(resolve, RETRY_MS))
   }
+  await cleanupAbandonedMarkers(lock)
   await cleanupTerminalReclaims(lock)
   try {
     await work()
@@ -405,12 +528,18 @@ export async function withFileLock(lock: string, work: () => Promise<void>): Pro
     // (a write that failed) is what the caller can act on.
     const released = await releaseOwnedFile(lock, token)
     if (released !== 'released' && released !== 'missing') {
-      throw new Error('work failed and the credential document lock was not released', { cause: error })
+      // The work's own code decides what the caller sees. Wrapping it without
+      // one made an already-gone file look like a failed unlink, and a delete
+      // rolled its tombstone back on a sign-in that was already removed.
+      const wrapped = new Error('work failed and the credential document lock was not released', { cause: error })
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== undefined) (wrapped as NodeJS.ErrnoException).code = code
+      throw wrapped
     }
     throw error
   }
   const released = await releaseOwnedFile(lock, token)
   if (released !== 'released' && released !== 'missing') {
-    throw new Error('work completed but the credential document lock was not released')
+    throw new FileLockReleaseError('work completed but the credential document lock was not released')
   }
 }
