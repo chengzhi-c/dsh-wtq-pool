@@ -15,9 +15,9 @@ desktop.ini
 # cannot match it; `?` covers the combining character some tools leave behind.
 /C?/
 
-# Build output. The tarball is produced by `pnpm pack` from the tree, so it is a
-# release artifact rather than source: keeping it in history would carry a
-# ~180 KB binary through every version bump.
+# Build output. The tarball is produced by `npm pack --pack-destination dist`
+# from the tree, so it is a release artifact rather than source: keeping it in
+# history would carry the binary through every version bump.
 dist/
 *.norm
 

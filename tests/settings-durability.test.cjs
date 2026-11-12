@@ -71,6 +71,7 @@ function loadHost(options = {}) {
     'parseKnownModelIds', 'mergeSelectionForPartialRoster',
     'orderSourceCredentials', 'traeClaimFor', 'gatewaySelectionFor', 'sourceDistribution',
     'sourceRosterFor', 'traeNativeOf', 'traeDeclarationModels', 'traeGateways',
+    'qoderNativeOf', 'qoderDeclarationModels', 'qoderGateways',
     'creditReserves', 'isSelectableSourceModel', 'gatewayEnabledIds', 'sourceModelView', 'refreshAll']
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8'))
     + `\nmodule.exports.__internals = { ${internals.join(', ')} }\n`
@@ -525,6 +526,51 @@ test('a Trae model that states a credit rate carries it to the panel', () => {
     const row = declared.find((model) => model.id === 'doubao-seed-evolving')
     assert.equal(row.name, 'Doubao Seed Evolving · x0.79',
       'the picker must show the same cost suffix for a Trae model as for a WorkBuddy one')
+  } finally {
+    host.cleanup()
+  }
+})
+
+/**
+ * A default thinking level saved for a Trae or Qoder model has to be published.
+ *
+ * The panel stores it per model, and the host applies a declaration's
+ * `defaultThinkingLevel` to requests that name no effort. The source
+ * declarations never carried the field, so picking one of those models fell
+ * back to the catalog's own default while the saved setting read as accepted.
+ */
+test('a saved source default thinking level reaches the declaration', () => {
+  const host = loadHost()
+  try {
+    host.read('settings = ' + JSON.stringify({
+      modelSelection: {
+        'trae:cn': { overrides: { 'kimi-k3': { defaultThinkingLevel: 'high' } } },
+        'qoder:cn': { overrides: { gmodel: { defaultThinkingLevel: 'max' } } },
+      },
+    }))
+    host.internals.traeGateways.set('cn', {
+      gateway: {
+        models: () => [{
+          id: 'kimi-k3', name: 'Kimi K3', contextWindow: 256000, maxTokens: 32000,
+          reasoning: { supported: ['off', 'low', 'high'], defaultEffort: 'low' },
+        }],
+      },
+    })
+    const trae = host.internals.traeDeclarationModels('cn')
+    assert.equal(trae[0].defaultThinkingLevel, 'high',
+      'the Trae default the panel saved must be the one the host applies')
+
+    host.internals.qoderGateways.set('cn', {
+      gateway: {
+        models: () => [{
+          id: 'gmodel', name: 'GLM-5.3', contextWindow: 1000000, maxInputTokens: 180000,
+          supportsImages: true, effortLevels: ['low', 'high', 'max'], defaultEffort: 'high', alwaysThinking: true,
+        }],
+      },
+    })
+    const qoder = host.internals.qoderDeclarationModels('cn')
+    assert.equal(qoder[0].defaultThinkingLevel, 'max',
+      'and the Qoder default must reach its declaration too')
   } finally {
     host.cleanup()
   }

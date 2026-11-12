@@ -76,7 +76,6 @@ async function loadPlugin(t, temporary, growth) {
   record('redeemStreakTier')
   record('lotteryChances', growth.chances ?? 0)
   record('drawLottery', { prize: 'fixture' })
-  let activate
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')),
     module: { exports: {} }, exports: {}, __dirname: temporary,

@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { POOL_HOLD_MS, type WorkBuddyAccount, type WorkBuddyAccountPool } from './accounts'
 import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog'
-import { classifyUpstreamError, isHardCreditText, parseRateLimitReset, retryAfterSeconds, WorkBuddyUpstreamClient, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream'
+import { chatHostOf, classifyUpstreamError, isHardCreditText, parseRateLimitReset, retryAfterSeconds, WorkBuddyUpstreamClient, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream'
 import { SseDecoder, type SseEvent } from './trae-sse'
 
 export interface ShimLogger {
@@ -211,6 +211,19 @@ function conversationKeyOf(raw: string): string | undefined {
     return undefined
   }
   return undefined
+}
+
+/**
+ * The upstream a sign-in's chat traffic goes to.
+ *
+ * Transport failures are a property of the host, not of the account: a pool can
+ * hold sign-ins served by different gateways, and one unreachable host says
+ * nothing about the next one. The sign-in domain is not the chat host (every CN
+ * spelling lands on one gateway, and each international brand has its own), so
+ * the host is read from the same mapping the request itself uses.
+ */
+function upstreamHostOf(account: WorkBuddyAccount): string {
+  return chatHostOf(account.credential)
 }
 
 const EMPTY_STREAM_REFUSAL = 'workbuddy returned an empty answer stream'
@@ -528,7 +541,14 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
 
     const raw = (await readRequestBody(req)).toString('utf8')
     const prepared = client.prepareChatBody(raw)
-    const conversationKey = conversationKeyOf(raw)
+    // The region belongs in the key: both gateways share one pool and one
+    // sticky map, and a conversation's first message can be identical across
+    // two regions, so a shared key let one region's binding decide the other's
+    // account.
+    const conversationHash = conversationKeyOf(raw)
+    const conversationKey = conversationHash === undefined || region === undefined
+      ? conversationHash
+      : `${region}\n${conversationHash}`
 
     // The request's target model. The upstream rate limit is per-model ("可切换
     // 其他模型继续使用"), so cooldowns are keyed by (account, model): a 429 on
@@ -570,6 +590,45 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     let last: { kind: UpstreamErrorKind; status: number; message: string } | undefined
     let accountSkipped = false
     let transportAttempts = 0
+    /** Hosts that failed transport in this request; one failure condemns none of the others. */
+    const transportHosts = new Set<string>()
+    /** Whether any eligible account this request has not tried belongs to a host that has not failed. */
+    const hasUntriedHost = (): boolean => {
+      for (const peer of pool.available(Date.now(), modelId, region)) {
+        if (!skipped.has(peer.id) && !transportHosts.has(upstreamHostOf(peer))) return true
+      }
+      return false
+    }
+    /**
+     * Stop trying accounts served by a host that has already timed out.
+     *
+     * Used only once the transport cap is reached and another host is still
+     * waiting: the first failure gets one retry, and after that a peer on the
+     * same host only pays the same timeout again while a healthy account behind
+     * it waits. A single-host pool never reaches this branch because no other
+     * host is left to justify it.
+     */
+    const skipHost = (host: string): void => {
+      for (const peer of pool.list(region)) {
+        if (upstreamHostOf(peer) === host) skipped.add(peer.id)
+      }
+    }
+    /**
+     * Record one transport failure and answer whether the turn is spent.
+     *
+     * Up to the cap the next account gets its turn, including a peer on the
+     * same host. Past the cap another host still waiting is what keeps the turn
+     * alive, and the failed host's remaining peers are skipped so the healthy
+     * host is reached without paying their timeouts first.
+     */
+    const transportSpent = (host: string): boolean => {
+      transportHosts.add(host)
+      transportAttempts += 1
+      if (transportAttempts < MAX_TRANSPORT_ATTEMPTS) return false
+      if (!hasUntriedHost()) return true
+      skipHost(host)
+      return false
+    }
     // A 200 whose body ended before its first byte says the upstream answered
     // and then cut the answer off, which is not the host being unreachable. It
     // gets its own count for two reasons: the two failures need opposite
@@ -577,24 +636,35 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     // the turn without ever trying the healthy account behind them (three
     // accounts, two empties: answered 502, never served).
     let emptyStreams = 0
+    // Accounts whose sign-in was successfully refreshed once during this
+    // request. A second session-dead answer after that refresh is the sign-in
+    // itself, not a stale token: retrying it again only rotated the refresh
+    // token and spent another attempt on the same account.
+    const refreshedSessions = new Set<string>()
+    // The account to retry on the next pass after a refresh revived it. Set
+    // instead of letting the next acquire pick: priority would return the same
+    // head account anyway, but round-robin would move on before the retry.
+    let retryAccountId: string | undefined
     // Built on first use: the retry below is the only caller, and the answer does
     // not change inside one request. Every request would otherwise pay a full
     // parse+stringify of the whole conversation for a branch almost none take.
     let effortFallback: string | undefined
     let effortFallbackBuilt = false
 
-    // One attempt per account plus two retries, and never fewer than the old
-    // eight: a pool larger than the cap used to stop before trying its tail, so
-    // a healthy account could sit behind eight rate-limited ones forever.
-    // Transport failures have their own, much smaller cap: they say nothing
-    // about the account, and a host-wide outage must not cost one timeout per
-    // sign-in.
-    const maxAttempts = Math.max(8, pool.list(region).length + 2)
+    // One attempt per account, one retry for an account whose sign-in was
+    // refreshed, and two beyond that. The old fixed eight stopped before a
+    // healthy tail when several session-dead accounts each spent their retry.
+    const maxAttempts = Math.max(8, pool.list(region).length * 2 + 2)
     const maxEmptyStreams = emptyStreamAttemptsFor(pool.list(region).length)
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (controller.signal.aborted) return
 
-      const account = await pool.acquire(modelId, region, conversationKey, skipped)
+      const account = retryAccountId !== undefined
+        ? pool.available(Date.now(), modelId, region)
+          .find((candidate: { id: string }) => candidate.id === retryAccountId)
+          ?? await pool.acquire(modelId, region, conversationKey, skipped)
+        : await pool.acquire(modelId, region, conversationKey, skipped)
+      retryAccountId = undefined
       if (account === undefined) {
         // Distinguish "never signed in" from "every account was tried and
         // refused": they need opposite remedies, so they must not share a
@@ -695,7 +765,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
 
       let result = await client.chatStream(account.credential, prepared, controller.signal)
       let refreshOutcome: 'refreshed' | 'refused' | 'failed' | undefined
-      if (!result.ok && result.kind === 'session_dead') {
+      if (!result.ok && result.kind === 'session_dead' && !refreshedSessions.has(account.id)) {
         const failure = result
         refreshOutcome = await pool.refreshAccountOutcome(account.id)
         if (refreshOutcome === 'failed') {
@@ -715,6 +785,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         }
       }
       if (refreshOutcome === 'refreshed') {
+        refreshedSessions.add(account.id)
         // A caller that hung up while the refresh was in flight has already
         // stopped waiting: the retry would spend one more upstream call on a
         // turn nobody reads, and come back classed as `aborted` anyway.
@@ -875,7 +946,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                 logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} answered 200 with an empty stream; rotating`)
                 return
               }
-              logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} answered 200 with no stream: ${peeked.refusal}`)
+              logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} answered 200 with no stream: ${safeMessage(peeked.refusal)}`)
               // A prompt-screen refusal is the request's, not the account's:
               // rotating spends every sign-in and still answers the same way.
               if (peeked.code === '11128' || unapprovedChannelRefusal(peeked.refusal) !== undefined) {
@@ -908,22 +979,36 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                 } else if (envelopeKind === 'model_tier') {
                   pool.blockModel(account.id, modelId, Date.now() + MODEL_TIER_HOLD_MS)
                 } else if (envelopeKind === 'session_dead') {
-                  const refreshOutcome = await pool.refreshAccountOutcome(account.id)
-                  if (refreshOutcome === 'refused') {
+                  if (refreshedSessions.has(account.id)) {
+                    // The refresh minted a new token and the upstream refused it
+                    // too, so the sign-in is dead rather than stale. Holding it
+                    // is what keeps the next request from rotating the refresh
+                    // token again.
                     pool.penalize(account.id, holdUntil(), undefined, 'session')
-                  } else if (refreshOutcome === 'failed') {
-                    // A refresh endpoint that did not answer says nothing about
-                    // this sign-in. Parking it for six hours took a healthy
-                    // account out of rotation; skip it for this request instead.
                     skipped.add(account.id)
-                    last = {
-                      kind: 'transport',
-                      status: 502,
-                      message: `could not refresh the sign-in: ${peeked.refusal.slice(0, 200)}`,
+                  } else {
+                    const refreshOutcome = await pool.refreshAccountOutcome(account.id)
+                    if (refreshOutcome === 'refused') {
+                      pool.penalize(account.id, holdUntil(), undefined, 'session')
+                      skipped.add(account.id)
+                    } else if (refreshOutcome === 'failed') {
+                      // A refresh endpoint that did not answer says nothing about
+                      // this sign-in. Parking it for six hours took a healthy
+                      // account out of rotation; skip it for this request instead.
+                      skipped.add(account.id)
+                      last = {
+                        kind: 'transport',
+                        status: 502,
+                        message: `could not refresh the sign-in: ${peeked.refusal.slice(0, 200)}`,
+                      }
+                    } else {
+                      // The new token gets one attempt on this same account,
+                      // exactly as the non-200 session-dead path does. The next
+                      // loop pass retries it before any other account.
+                      refreshedSessions.add(account.id)
+                      retryAccountId = account.id
                     }
                   }
-                  // `refreshed`: the next attempt rides the new access token,
-                  // exactly as the non-200 session-dead path does.
                 } else {
                   pool.penalize(account.id, holdUntil(), undefined,
                     envelopeKind === 'hard_credit' ? 'spent' : 'restricted')
@@ -992,8 +1077,11 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
             emptyStreams += 1
             spent = emptyStreams >= maxEmptyStreams
           } else {
-            transportAttempts += 1
-            spent = transportAttempts >= MAX_TRANSPORT_ATTEMPTS
+            // The cap keeps a host-wide outage from costing one timeout per
+            // sign-in, but it must not strand a healthy account behind an
+            // unreachable host: a pool can hold sign-ins served by different
+            // gateways, so a host that has not failed yet earns one more turn.
+            spent = transportSpent(upstreamHostOf(account))
           }
           if (spent) break
           continue
@@ -1043,8 +1131,10 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         last = { kind: result.kind, status: result.status, message: result.message }
         accountSkipped = true
         skipped.add(account.id)
-        transportAttempts += 1
-        if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
+        // Same rule as the pre-first-byte branch: the cap stops a host-wide
+        // outage from costing a timeout per sign-in, while an untried host
+        // still gets its turn.
+        if (transportSpent(upstreamHostOf(account))) break
         logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} transport failure; rotating`)
         continue
       }

@@ -1626,23 +1626,33 @@ export class WorkBuddyAccountPool {
    * from settings and only filters at pick time.
    */
   private disabledIds = new Set<string>()
-  /** Cursor for round-robin and the next new sticky conversation. */
-  private cursor = 0
+  /**
+   * Last account handed out per region, for round-robin.
+   *
+   * Both region shims share one pool, and filtering to the caller's region
+   * before indexing used to make each region renormalise the same cursor
+   * against its own length: with two accounts per region, alternating turns
+   * served the same account in each region and never reached the others.
+   * A stored id also survives the pool shrinking between picks: an account
+   * whose refresh fails is excluded from the retry, and a numeric position
+   * would then point at an account that already had its turn.
+   */
+  private lastServed = new Map<string, string>()
   /** Sticky mode: conversation key → account id. Content stays out of memory. */
   private sticky = new Map<string, string>()
   /**
    * Account id → the order in which it last served. A readout only: the composer
    * shows the account a sticky conversation is on, and that account is the one
    * that just answered. A counter rather than a clock, because two acquires can
-   * land in the same millisecond. Not persisted; after a restart the cursor
-   * stands in.
+   * land in the same millisecond. Not persisted; after a restart the rotation
+   * starts over.
    */
   private servedOrder = new Map<string, number>()
   private servedCount = 0
   private lastScanAtMs = 0
   private preferredIds = new Map<WorkBuddyRegion | undefined, string>()
   /**
-   * Account ids the user removed from the pool for good.
+   * Account ids the user removed from the pool.
    *
    * Enforced while scan() assembles its result, so a removed account cannot
    * re-enter the pool when the desktop app rewrites its sign-in file. That is
@@ -3128,7 +3138,7 @@ export class WorkBuddyAccountPool {
     modelId?: string,
     region?: WorkBuddyRegion,
   ): IneligibleReason | null {
-    // Removed for good, or switched off: neither may serve a request. Switched
+    // Removed, or switched off: neither may serve a request. Switched
     // off is still listed, so the panel can switch it back on.
     if (this.storedIdMatches(this.removedIds, account)) return 'removed'
     if (this.storedIdMatches(this.disabledIds, account)) return 'switched off'
@@ -3251,7 +3261,7 @@ export class WorkBuddyAccountPool {
     const preferredId = this.preferredIdFor(region)
     const remaining = new Set(pool.map(account => account.id))
     while (remaining.size > 0) {
-      const account = pool.find(item => item.id === preferredId) ?? this.pick(pool, conversationKey)
+      const account = pool.find(item => item.id === preferredId) ?? this.pick(pool, conversationKey, region)
       if (account === undefined) return undefined
       remaining.delete(account.id)
       await this.ensureFresh(account)
@@ -3267,16 +3277,28 @@ export class WorkBuddyAccountPool {
     return undefined
   }
 
-  private pick(pool: WorkBuddyAccount[], conversationKey?: string): WorkBuddyAccount | undefined {
+  private pick(pool: WorkBuddyAccount[], conversationKey?: string, region?: WorkBuddyRegion): WorkBuddyAccount | undefined {
     if (this.distribution === 'expiry') return this.pickByExpiry(pool)
     if (this.distribution === 'sticky' && conversationKey !== undefined) {
       const bound = this.sticky.get(conversationKey)
       const kept = bound === undefined ? undefined : pool.find(account => account.id === bound)
-      if (kept !== undefined) return kept
-      const account = pool[this.cursor % pool.length]
+      if (kept !== undefined) {
+        // Reinsert on every hit, so the 200-key cap evicts the conversation
+        // that has gone longest without a request rather than the oldest one
+        // still in use - which would have moved a live conversation to a new
+        // account mid-thread.
+        this.sticky.delete(conversationKey)
+        this.sticky.set(conversationKey, kept.id)
+        return kept
+      }
+      const account = this.successor(pool, this.lastServedFor(region))
       if (account === undefined) return undefined
+      // Reinsert a rebound conversation too: `set` on an existing key keeps its
+      // old position, so a conversation that just moved to a new account would
+      // still be evicted as the oldest entry.
+      this.sticky.delete(conversationKey)
       this.sticky.set(conversationKey, account.id)
-      this.cursor = (this.cursor + 1) % pool.length
+      this.setLastServed(region, account.id)
       while (this.sticky.size > 200) {
         const oldest = this.sticky.keys().next().value
         if (oldest === undefined) break
@@ -3284,12 +3306,39 @@ export class WorkBuddyAccountPool {
       }
       return account
     }
-    const index = this.distribution === 'round-robin' ? this.cursor % pool.length : 0
-    const account = pool[index]
-    if (account !== undefined && this.distribution === 'round-robin') {
-      this.cursor = (index + 1) % pool.length
-    }
+    const account = this.distribution === 'round-robin' ? this.successor(pool, this.lastServedFor(region)) : pool[0]
+    if (account !== undefined && this.distribution === 'round-robin') this.setLastServed(region, account.id)
     return account
+  }
+
+  /**
+   * The first account after `previous` in roster order that is still in `pool`.
+   *
+   * `previous` can be missing from `pool` because this request already skipped
+   * it: a sign-in whose refresh failed is excluded from the retry. Walking the
+   * full roster keeps the rotation moving past it; looking only inside `pool`
+   * would restart at its head and retry the same account every turn while the
+   * accounts behind the skipped one never served.
+   */
+  private successor(pool: readonly WorkBuddyAccount[], previous: string | undefined): WorkBuddyAccount | undefined {
+    if (pool.length === 0) return undefined
+    const start = previous === undefined ? -1 : this.accounts.findIndex(account => account.id === previous)
+    if (start === -1) return pool[0]
+    const present = new Set(pool.map(account => account.id))
+    for (let step = 1; step <= this.accounts.length; step += 1) {
+      const candidate = this.accounts[(start + step) % this.accounts.length]
+      if (candidate !== undefined && present.has(candidate.id)) return candidate
+    }
+    return pool[0]
+  }
+
+  /** The last account served through one region; absent regions share one. */
+  private lastServedFor(region?: WorkBuddyRegion): string | undefined {
+    return this.lastServed.get(region ?? '')
+  }
+
+  private setLastServed(region: WorkBuddyRegion | undefined, accountId: string): void {
+    this.lastServed.set(region ?? '', accountId)
   }
 
   private pickByExpiry(pool: readonly WorkBuddyAccount[]): WorkBuddyAccount | undefined {
@@ -3297,30 +3346,30 @@ export class WorkBuddyAccountPool {
   }
 
   /**
-   * Next account the panel may name as "next up". Does not move the cursor.
+   * Next account the panel may name as "next up". Does not move the rotation.
    *
    * Sticky has no single next account - it is per conversation - so it names
    * nothing rather than pointing at a guess. The composer readout uses
    * `readoutPreview`, which can name the account that served last instead.
    */
-  preview(eligible: readonly WorkBuddyAccount[]): WorkBuddyAccount | undefined {
+  preview(eligible: readonly WorkBuddyAccount[], region?: WorkBuddyRegion): WorkBuddyAccount | undefined {
     if (eligible.length === 0) return undefined
     if (this.distribution === 'expiry') return this.pickByExpiry(eligible)
     if (this.distribution === 'priority') return eligible[0]
-    if (this.distribution === 'round-robin') return eligible[this.cursor % eligible.length]
+    if (this.distribution === 'round-robin') return this.successor(eligible, this.lastServedFor(region))
     return undefined
   }
 
   /**
-   * The account the composer readout names. Does not move the cursor.
+   * The account the composer readout names. Does not move the rotation.
    *
    * Round-robin names the account the next request takes. Sticky names the one
    * that served most recently, because the current conversation is most likely
-   * on it; before the first turn the cursor stands in.
+   * on it; before the first turn the rotation stands in.
    */
-  readoutPreview(eligible: readonly WorkBuddyAccount[]): WorkBuddyAccount | undefined {
+  readoutPreview(eligible: readonly WorkBuddyAccount[], region?: WorkBuddyRegion): WorkBuddyAccount | undefined {
     if (eligible.length === 0) return undefined
-    if (this.distribution !== 'sticky') return this.preview(eligible)
+    if (this.distribution !== 'sticky') return this.preview(eligible, region)
     let latest: WorkBuddyAccount | undefined
     let latestAt = -1
     for (const account of eligible) {
@@ -3330,7 +3379,7 @@ export class WorkBuddyAccountPool {
         latestAt = servedAt
       }
     }
-    return latest ?? eligible[this.cursor % eligible.length]
+    return latest ?? this.successor(eligible, this.lastServedFor(region))
   }
 
 

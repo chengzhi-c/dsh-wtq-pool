@@ -95,12 +95,12 @@ function loadPanel() {
   }
   return {
     presetRow, presets, formatTokens, withinCeiling, windowCeiling,
-    outputCeilingFor, clampOutput, effectiveWindow, effectiveOutput,
+    outputCeilingFor, clampOutput, effectiveOutput,
     draftFor, isDirty, reclampEntry, setDraft: (value) => { context.draft = value },
   }
 }
 
-const { presetRow, presets, withinCeiling, windowCeiling, outputCeilingFor, clampOutput, effectiveWindow, effectiveOutput, draftFor, isDirty, reclampEntry, setDraft } = loadPanel()
+const { presetRow, presets, withinCeiling, windowCeiling, outputCeilingFor, clampOutput, effectiveOutput, draftFor, isDirty, reclampEntry, setDraft } = loadPanel()
 const CONTEXT = presets('CONTEXT_WINDOW_PRESETS')
 const OUTPUT = presets('MAX_OUTPUT_PRESETS')
 

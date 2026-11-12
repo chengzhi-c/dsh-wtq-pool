@@ -137,6 +137,50 @@ test('a recycled PID in another process does not keep an old lock alive', async 
   }
 })
 
+test('a slow start-time probe runs once per acquisition', async () => {
+  // The stale check reads the same lock twice. If the first probe is slow
+  // enough to spend most of the 5s wait, a second probe gets too little time to
+  // confirm the same owner, so the lock is never removed and every later
+  // acquisition repeats the timeout. One probe per pid keeps the confirmation.
+  const directory = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-lock-probe-memo-'))
+  const lock = path.join(directory, 'document.lock')
+  const owner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+    windowsHide: true,
+  })
+  assert.equal(typeof owner.pid, 'number')
+  const childProcess = require('node:child_process')
+  const originalExecFile = childProcess.execFile
+  let probes = 0
+  childProcess.execFile = (_command, _args, _options, callback) => {
+    probes += 1
+    const actual = Date.now()
+    const output = process.platform === 'win32'
+      ? String(actual)
+      : new Date(actual).toUTCString().replace(/^\w+, /, '').replace(/ GMT$/, '')
+    setTimeout(() => callback(null, output), 3_000)
+    return undefined
+  }
+  fs.writeFileSync(lock, JSON.stringify({
+    pid: owner.pid,
+    token: 'old-slow-probe-owner',
+    createdAtMs: Date.now() - 120_000,
+    processStartedAtMs: Date.now() - 120_000,
+  }))
+  const old = new Date(Date.now() - 120_000)
+  fs.utimesSync(lock, old, old)
+  try {
+    let ran = false
+    await withFileLock(lock, async () => { ran = true })
+    assert.equal(ran, true, 'a slow probe must still let the stale lock be reclaimed')
+    assert.equal(probes, 1, 'the confirmation must reuse the probe the first stale check made')
+  } finally {
+    childProcess.execFile = originalExecFile
+    owner.kill()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
 test('a contender honors a live unique reclaim claim', async () => {
   const directory = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-lock-reclaim-fence-'))
   const lock = path.join(directory, 'document.lock')
@@ -584,8 +628,6 @@ test('a work failure survives a failed release', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wtq-lock-cause-'))
   const lock = path.join(directory, 'document.lock')
   const realUnlink = fsp.unlink
-  const realSetTimeout = global.setTimeout
-  const realNow = Date.now
   const workError = new Error('THE REAL WORK ERROR')
   fsp.unlink = async (file, ...rest) => {
     if (path.resolve(String(file)) === path.resolve(lock)) {

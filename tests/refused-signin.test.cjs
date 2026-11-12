@@ -13,7 +13,7 @@
  * stands. Every upstream is a stub and every auth directory a scratch one.
  */
 const assert = require('node:assert/strict')
-const { test, mock } = require('node:test')
+const { test } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')

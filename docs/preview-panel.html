@@ -42,9 +42,8 @@
           }
           if (channel === "xd.sourceCheckin") {
             // One Trae/Qoder account's own claim. The panel announces from
-            // `result.outcome`, so the answer has to carry a real outcome: the
-            // shared state fallback below left it undefined, and every row read
-            // that as "already collected today".
+            // `result.outcome`, so the answer carries a real outcome; a missing
+            // one reads as "already collected today" on every row.
             return Promise.resolve({ state: copy(data.state), result: { outcome: "claimed" } });
           }
           // Every other channel is a write, and a write answers with the whole

@@ -1,7 +1,7 @@
 {
   "rendered": {
     "renderer/index.html": "42ff7be54592a29f6082ece6f907ae7dd7fc331be4748573bba5f85d365aa0ac",
-    "renderer/panel.js": "563c66d112e5663dc3044a286ad6f5c66af01c65371788e67b1ab2c8bba0dc36",
+    "renderer/panel.js": "e8b08bde458746ad5d3e256b64bd30262ecec8618738f17d375ffda7f3473af5",
     "renderer/panel.css": "3ddbc3d928c8cdb2c4806f4e1c8da7f699f23afedd7dbfb1a70ec47eb69c8f07",
     "docs/preview-panel.html": "062e78c75b552a5a127f15a9a9c972dc0a2213bf3b8f15716f2166422144d3de",
     "docs/preview-data.js": "450c474495b8bca0fa64c88f860288f659dab71a0d2646571d25ea86814c4c64"

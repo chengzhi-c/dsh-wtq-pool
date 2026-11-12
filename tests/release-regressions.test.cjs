@@ -1112,6 +1112,21 @@ test('DSH account selection restarts credit polling after a successful preferenc
   assert.equal(restarted, 1, 'a preference save must not leave unread credits on the old five-minute timer')
 })
 
+test('DSH manual credit refresh restarts polling from the fresh answer', async () => {
+  const renderer = fs.readFileSync(path.join(root, 'src/client/composer.tsx'), 'utf8')
+  const refresh = renderer.match(/  const refresh = \(\): void => \{[^]*?\n  \}/)[0]
+  let restarted = 0
+  const context = vm.createContext({
+    refreshing: false, busy: false, routeRef: { current: {} }, provider: 'fixture-p', model: 'fixture-m',
+    invoke: async () => ({ show: true, total: null }),
+    setRefreshing() {}, setError() {}, setPoints() {},
+    restartPollRef: { current: () => { restarted++ } },
+  })
+  vm.runInContext(transpile(refresh + '\nrefresh()'), context)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(restarted, 1, 'a manual read must not leave unread credits on the slow timer')
+})
+
 /**
  * The delete button shares the remove button's box.
  *

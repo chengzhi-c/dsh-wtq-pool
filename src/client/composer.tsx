@@ -17,6 +17,7 @@
  */
 
 import * as React from 'react'
+import { createPortal } from 'react-dom'
 
 import { PANEL_BASE } from '../panel-route.ts'
 
@@ -275,7 +276,7 @@ const CSS = `
 .xd-points-btn{border:0;background:transparent;color:inherit;font:inherit;font-size:12px;line-height:1;display:inline-flex;align-items:center;gap:5px;padding:4px 7px;border-radius:999px;cursor:pointer;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .xd-points-btn:hover{background:var(--dsw-alias-bg-layer-3,rgba(127,127,127,.12))}
 .xd-points-mark{display:inline-block;width:6px;height:6px;flex:0 0 auto;border-radius:50%;background:var(--dsw-alias-state-success-primary,#4f9f7c)}
-.xd-points-panel{position:fixed;z-index:40;box-sizing:border-box;width:max-content;max-width:${PANEL_MAX_WIDTH}px;max-height:${PANEL_MAX_HEIGHT}px;overflow:auto;padding:8px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#1c1d21);color:var(--dsw-alias-label-primary,#e8e8ea);box-shadow:0 8px 28px rgba(0,0,0,.28);border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25))}
+.xd-points-panel{position:fixed;z-index:1100;box-sizing:border-box;width:max-content;max-width:${PANEL_MAX_WIDTH}px;max-height:${PANEL_MAX_HEIGHT}px;overflow:auto;padding:8px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#1c1d21);color:var(--dsw-alias-label-primary,#e8e8ea);box-shadow:0 8px 28px rgba(0,0,0,.28);border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25))}
 .xd-points-table{width:100%;border-collapse:collapse;font-size:11px;line-height:1.4}
 .xd-points-table th{text-align:left;font-weight:600;padding:4px 6px;color:var(--dsw-alias-label-tertiary,#8b8d93)}
 .xd-points-table td{padding:4px 6px;vertical-align:top}
@@ -431,8 +432,8 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
   React.useEffect(() => {
     if (!open) return undefined
     const onPointer = (event: PointerEvent): void => {
-      const target = event.target as Node | null
-      if (target === null) return
+      const target = event.target
+      if (!(target instanceof Node)) return
       if (rootRef.current?.contains(target) === true) return
       if (panelRef.current?.contains(target) === true) return
       setOpen(false)
@@ -448,8 +449,8 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
     // than fit (`max-height`), so every wheel turn inside it closed it: the one
     // control that exists to be read could not be read past the first screenful.
     const onViewport = (event: Event): void => {
-      const target = event.target as Node | null
-      if (target !== null && panelRef.current?.contains(target) === true) return
+      const target = event.target
+      if (target instanceof Node && panelRef.current?.contains(target) === true) return
       setOpen(false)
     }
     document.addEventListener('pointerdown', onPointer, true)
@@ -548,6 +549,10 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
         if (routeRef.current !== requestedRoute) return
         setRefreshing(false)
         if (next.show === true) setPoints(next)
+        // The manual read is the freshest answer there is; re-arm the poll from
+        // it so unread credits retry on the fast cadence instead of waiting out
+        // the slow timer a settled answer set.
+        restartPollRef.current()
       })
       .catch((failure: unknown) => {
         if (routeRef.current !== requestedRoute) return
@@ -570,8 +575,15 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
       React.createElement('span', { className: 'xd-points-mark', 'aria-hidden': 'true' }),
       balance === undefined ? '—' : formatCredits(balance),
     ),
-    open && rect !== null
-      ? React.createElement('div', {
+    // The composer seat is the containing block for fixed descendants while a
+    // conversation is open - its `will-change: transform` is what keeps the
+    // backdrop blur sampling the transcript - so a popup left inside it lands
+    // hundreds of pixels below the fold and the trigger looks dead. In a new
+    // conversation the seat carries no transform and the same popup works,
+    // which is why only that phase worked. Portaled to the body, the fixed
+    // coordinates are the viewport's again in both phases.
+    open && rect !== null && typeof document !== 'undefined'
+      ? createPortal(React.createElement('div', {
           className: 'xd-points-panel',
           ref: panelRef,
           role: 'dialog',
@@ -622,7 +634,7 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
               ),
             ))),
           ),
-        )
+        ), document.body)
       : null,
   )
 }

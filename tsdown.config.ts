@@ -11,6 +11,7 @@ const PLUGIN_ID = 'dsh-wtq-pool'
  */
 const CLIENT_EXTERNALS = [
   'react',
+  'react-dom',
   // The client tsconfig sets the automatic JSX runtime, so any JSX in these
   // `.tsx` files compiles to this import rather than to `react` directly.
   'react/jsx-runtime',

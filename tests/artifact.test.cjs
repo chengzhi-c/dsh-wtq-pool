@@ -52,6 +52,13 @@ test('the built entry loads and exports the contract the host calls', () => {
     assert.ok(plugin[name] !== undefined, `the built entry must export ${name}`)
   }
   assert.equal(plugin.name, 'llm-dsh-xdpool', 'and the Cordis row id it registers under')
+  // A keyed slot's key is `<package name>#<row id>`, so either literal drifting
+  // from its build input silently costs the plugin its Configure control.
+  const patch = fs.readFileSync(path.join(root, 'cordis.patch.yml'), 'utf8')
+  assert.match(patch, new RegExp(`^\\s*- id: ${plugin.name}$`, 'm'), 'the loader patch inserts the row id the entry registers')
+  assert.match(patch, new RegExp(`^\\s*name: ${pkg.name}$`, 'm'), 'and names the package the client bundle is keyed by')
+  const client = fs.readFileSync(path.join(root, 'lib', 'client.js'), 'utf8')
+  assert.ok(client.includes(`id: ${JSON.stringify(pkg.name)}`), 'the client bundle registers under the package name')
 })
 
 /** A Cordis context narrow enough for the entry, with real effect disposal. */

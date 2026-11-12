@@ -12,28 +12,10 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { registerHooks } = require('node:module')
-const { fileURLToPath } = require('node:url')
-const ts = require('typescript')
 
 // This half of the plugin ships from TypeScript sources, so the checks load them
 // the way every other test in this tree does.
-const root = path.resolve(__dirname, '..')
-const transpile = (source) => ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },
-}).outputText
-registerHooks({
-  resolve(specifier, context, next) {
-    const ownSource = context.parentURL?.startsWith('file:') && fileURLToPath(context.parentURL).startsWith(path.join(root, 'src') + path.sep)
-    return next(ownSource && specifier.startsWith('.') && path.extname(specifier) === '' ? specifier + '.ts' : specifier, context)
-  },
-  load(url, context, next) {
-    if (url.startsWith('file:') && url.endsWith('.ts')) return {
-      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')),
-    }
-    return next(url, context)
-  },
-})
+require('./ts-loader.cjs')
 
 const { WorkBuddyAccountPool } = require('../src/accounts.ts')
 const { createWorkBuddyShim } = require('../src/shim.ts')
@@ -43,14 +25,14 @@ const { createTraeGateway } = require('../src/trae-gateway.ts')
 const QUIET = { info() {}, warn() {}, error() {} }
 
 /** A sign-in file the pool reads, far from expiry so no refresh is spent. */
-function makeSignInDir(prefix, index) {
+function makeSignInDir(prefix, index, domain = 'www.codebuddy.cn', expiresAt = Date.now() + 3_600_000) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `wtq-${prefix}-`))
   fs.writeFileSync(path.join(dir, 'workbuddy-desktop.info'), JSON.stringify({
     auth: {
       accessToken: `t-${prefix}-${index}`,
       refreshToken: `r-${prefix}-${index}`,
-      expiresAt: Date.now() + 3_600_000,
-      domain: 'www.codebuddy.cn',
+      expiresAt,
+      domain,
     },
     account: { uin: `u-${prefix}-${index}`, nickname: `${prefix}-${index}` },
   }))
@@ -94,11 +76,11 @@ async function workbuddyShim({ client, models, model = 'hy3' }) {
 }
 
 /** A WorkBuddy gateway built from several sign-in files. */
-async function workbuddyShimFromDirs({ client, models, dirs, model = 'hy3' }) {
+async function workbuddyShimFromDirs({ client, models, dirs, region = 'cn', model = 'hy3' }) {
   const pool = new WorkBuddyAccountPool({ authDirs: dirs, cooldownMs: 60_000, client })
   await pool.scan()
   const shim = createWorkBuddyShim({
-    pool, region: 'cn', client, logger: QUIET,
+    pool, region, client, logger: QUIET,
     catalog: { visible: () => models.map((id) => ({ id })), current: () => models.map((id) => ({ id })) },
   })
   await shim.ready
@@ -354,6 +336,49 @@ test('a host-wide transport failure stops after one failover', async (t) => {
   }
 })
 
+test('a transport failure on one gateway still reaches an account on another', async (t) => {
+  // Two international brand domains are served by different gateways. The cap
+  // used to end the turn after two timeouts, so a healthy account on the other
+  // gateway was never tried when the broken gateway held the head of the queue.
+  // Queue order is by expiry, newest first, so the two accounts on the failing
+  // gateway are created last and head the queue.
+  const base = Date.now() + 3_600_000
+  const dirs = [
+    makeSignInDir('mixed', 0, 'codebuddy.ai', base),
+    makeSignInDir('mixed', 1, 'workbuddy.ai', base + 1_000),
+    makeSignInDir('mixed', 2, 'workbuddy.ai', base + 2_000),
+  ]
+  t.after(() => { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }) })
+  const called = []
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async (credential) => {
+      called.push(credential.domain)
+      if (credential.domain.endsWith('workbuddy.ai')) {
+        return { ok: false, kind: 'transport', status: 0, message: 'connect ECONNREFUSED' }
+      }
+      return {
+        ok: true,
+        response: new Response('data: {"choices":[{"delta":{"content":"served"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        }),
+      }
+    },
+  }
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs, region: 'global' })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 200, 'the healthy gateway serves the turn')
+    assert.match(answer.text, /served/)
+    assert.ok(called.includes('codebuddy.ai'), 'the second gateway is actually tried')
+    assert.equal(called.filter((domain) => domain.endsWith('workbuddy.ai')).length, 2,
+      'the failing gateway gets its capped retry, no more')
+    assert.ok(called.length <= 3, 'the failed gateway is not walked one sign-in at a time')
+  } finally {
+    await shim.close()
+  }
+})
+
 test('an account whose first byte never arrives is skipped for the next one', async (t) => {
   const dirs = signInDirs('head', 2)
   t.after(() => { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }) })
@@ -527,6 +552,105 @@ test('a 200 session envelope whose refresh fails is not held for six hours', asy
       'the account stays available for the next request')
   } finally {
     await shim.close()
+  }
+})
+
+test('a 200 session envelope that survives a refresh holds the account instead of rotating forever', async () => {
+  // The envelope branch used to treat any successful refresh as a retry it had
+  // already made: it wrote no hold and no skip, the next acquire returned the
+  // same head account, and the turn rotated its refresh token up to eight times
+  // while a healthy account behind it was never tried.
+  const dirs = signInDirs('churn', 2)
+  const calls = []
+  let refreshes = 0
+  let deadUin = ''
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    refreshToken: async () => {
+      refreshes += 1
+      return { accessToken: 'renewed-' + refreshes, expiresInSec: 3600 }
+    },
+    chatStream: async (credential) => {
+      calls.push(credential.uin)
+      if (credential.uin === deadUin) {
+        return {
+          ok: true,
+          response: new Response(JSON.stringify({ code: 12153, msg: 'Offline user session not found' }), {
+            status: 200, headers: { 'content-type': 'application/json' },
+          }),
+        }
+      }
+      return {
+        ok: true,
+        response: new Response('data: {"choices":[{"index":0,"delta":{"content":"second"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        }),
+      }
+    },
+  }
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs })
+  deadUin = shim.pool.list()[0].credential.uin
+  const healthyUin = shim.pool.list()[1].credential.uin
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 200, 'the healthy account must serve instead of the dead one looping')
+    assert.match(answer.text, /second/)
+    assert.deepEqual(calls, [deadUin, deadUin, healthyUin],
+      'one retry on the refreshed account, then the healthy one')
+    assert.equal(refreshes, 1, 'the dead sign-in must not rotate its refresh token per attempt')
+    const dead = shim.pool.list().find((account) => account.credential.uin === deadUin)
+    assert.equal(shim.pool.activeHold(dead.id)?.reason, 'session', 'a refresh that cannot revive the sign-in earns the hold')
+    assert.equal(shim.pool.isDisabled(dead.id), false, 'and the hold is not a permanent removal')
+  } finally {
+    await shim.close()
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a healthy account behind several dead sessions is still tried', async () => {
+  // Each dead session spends a refresh plus a retry. A cap of pool size + 2
+  // stopped before the healthy tail: four dead accounts used all eight
+  // attempts and the fifth account was never called.
+  const dirs = signInDirs('tail', 5)
+  const dead = new Set()
+  const calls = []
+  let refreshes = 0
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    refreshToken: async () => {
+      refreshes += 1
+      return { accessToken: 'renewed-' + refreshes, expiresInSec: 3600 }
+    },
+    chatStream: async (credential) => {
+      calls.push(credential.uin)
+      if (dead.has(credential.uin)) {
+        return {
+          ok: true,
+          response: new Response(JSON.stringify({ code: 12153, msg: 'Offline user session not found' }), {
+            status: 200, headers: { 'content-type': 'application/json' },
+          }),
+        }
+      }
+      return {
+        ok: true,
+        response: new Response('data: {"choices":[{"index":0,"delta":{"content":"tail"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        }),
+      }
+    },
+  }
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs })
+  const accounts = shim.pool.list()
+  for (const account of accounts.slice(0, 4)) dead.add(account.credential.uin)
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 200, 'the healthy fifth account must serve')
+    assert.match(answer.text, /tail/)
+    assert.equal(refreshes, 4, 'each dead sign-in is refreshed once')
+    assert.equal(calls.at(-1), accounts[4].credential.uin, 'and the healthy account is the last call')
+  } finally {
+    await shim.close()
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 

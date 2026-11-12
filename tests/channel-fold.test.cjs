@@ -9,9 +9,7 @@
  */
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const fs = require('node:fs')
-const path = require('node:path')
-const { root, transpile } = require('./ts-loader.cjs')
+require('./ts-loader.cjs')
 
 const { WorkBuddyUpstreamClient, foldSystemIntoUser } = require('../src/upstream.ts')
 

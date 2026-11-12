@@ -129,16 +129,17 @@ function processOutput(
   args: readonly string[],
   env: NodeJS.ProcessEnv,
   cwd: string,
+  timeoutMs: number,
 ): Promise<string | undefined> {
   return new Promise(resolve => {
-    execFile(command, [...args], { timeout: 2_000, maxBuffer: 1_024, windowsHide: true, env, cwd }, (error, stdout) => {
+    execFile(command, [...args], { timeout: timeoutMs, maxBuffer: 1_024, windowsHide: true, env, cwd }, (error, stdout) => {
       if (error !== null) resolve(undefined)
       else resolve(stdout.trim())
     })
   })
 }
 
-async function processStartedAt(pid: number): Promise<number | undefined> {
+async function processStartedAt(pid: number, timeoutMs = 2_000): Promise<number | undefined> {
   if (pid === process.pid) return PROCESS_STARTED_AT_MS
   if (process.platform === 'win32') {
     const systemRoot = trustedSystemRootOf(process.env)
@@ -150,7 +151,7 @@ async function processStartedAt(pid: number): Promise<number | undefined> {
       '-NonInteractive',
       '-Command',
       `$env:PSModulePath=[IO.Path]::Combine($env:SystemRoot,'System32\\WindowsPowerShell\\v1.0\\Modules'); $d=(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime(); ([DateTimeOffset]$d).ToUnixTimeMilliseconds()`,
-    ], trustedWindowsChildEnv(process.env, { inheritTemp: true, includeSystemDrive: true }), join(systemRoot, 'System32'))
+    ], trustedWindowsChildEnv(process.env, { inheritTemp: true, includeSystemDrive: true }), join(systemRoot, 'System32'), timeoutMs)
     const match = output?.match(/\d{10,}/)
     return match === undefined || match === null ? undefined : Number(match[0])
   }
@@ -160,14 +161,15 @@ async function processStartedAt(pid: number): Promise<number | undefined> {
     PATH: '/usr/bin:/bin',
     LC_ALL: 'C',
     TZ: 'UTC',
-  }, '/')
+  }, '/', timeoutMs)
   const started = output === undefined ? Number.NaN : Date.parse(`${output.trim()} UTC`)
   return Number.isFinite(started) ? started : undefined
 }
 
 type LockState = 'missing' | 'current' | 'stale'
+type ProbeStartedAt = (pid: number, timeoutMs: number) => Promise<number | undefined>
 
-async function lockState(file: string): Promise<LockState> {
+async function lockState(file: string, probeTimeoutMs = 2_000, probe: ProbeStartedAt = processStartedAt): Promise<LockState> {
   let text: string
   try {
     text = await readFile(file, 'utf8')
@@ -208,7 +210,7 @@ async function lockState(file: string): Promise<LockState> {
     // must still get the PID-reuse check rather than staying current until the
     // wall clock catches up.
     if (recordedStart !== undefined && Math.abs(fileAge) > PROCESS_START_TOLERANCE_MS) {
-      const actualStart = await processStartedAt(owner.pid)
+      const actualStart = await probe(owner.pid, probeTimeoutMs)
       if (actualStart !== undefined && actualStart - recordedStart > PROCESS_START_TOLERANCE_MS) return 'stale'
     }
     // A record with no start evidence cannot ever be told apart from a reused
@@ -368,7 +370,11 @@ async function cleanupTerminalReclaims(lock: string): Promise<boolean> {
   return !blocked
 }
 
-async function claimStaleReclaim(lock: string): Promise<ReclaimClaim | undefined> {
+async function claimStaleReclaim(
+  lock: string,
+  probeTimeoutMs = 2_000,
+  probe: ProbeStartedAt = processStartedAt,
+): Promise<ReclaimClaim | undefined> {
   const directory = dirname(lock)
   const base = basename(lock)
   const prefix = `${base}.reclaim.`
@@ -402,7 +408,7 @@ async function claimStaleReclaim(lock: string): Promise<ReclaimClaim | undefined
     // Adding a generation beside it would grow the directory on every retry.
     if (owner.state === 'complete' || owner.state === 'abandoned') return undefined
     if (owner.token !== undefined && ABANDONED_RECLAIMS.get(claim) === owner.token) return undefined
-    if (await lockState(claim) === 'current') return undefined
+    if (await lockState(claim, probeTimeoutMs, probe) === 'current') return undefined
     // A claimant that died mid-recovery leaves a claim that fences nothing.
     // Removing it keeps generations bounded; if it cannot go, no new one can
     // be told apart from it.
@@ -488,21 +494,35 @@ async function abandonReclaim(reclaim: ReclaimClaim, cause: unknown): Promise<ne
 export async function withFileLock(lock: string, work: () => Promise<void>): Promise<void> {
   await mkdir(dirname(lock), { recursive: true, mode: 0o700 })
   const deadline = Date.now() + FILE_LOCK_WAIT_MS
+  // One start-time probe per pid per acquisition. The reclaim path checks the
+  // same lock twice; probing again after the first probe used the budget left
+  // the second call too short to confirm a stale owner, so the lock was never
+  // removed and every later acquisition repeated the same timeout.
+  const probes = new Map<number, Promise<number | undefined>>()
+  const probe: ProbeStartedAt = (pid, timeoutMs) => {
+    let pending = probes.get(pid)
+    if (pending === undefined) {
+      pending = processStartedAt(pid, timeoutMs)
+      probes.set(pid, pending)
+    }
+    return pending
+  }
   let token: string | undefined
   while (token === undefined) {
     token = await createOwnedFile(lock)
     if (token !== undefined) break
-    const current = await lockState(lock)
+    const remaining = Math.max(250, deadline - Date.now())
+    const current = await lockState(lock, remaining, probe)
     if (current === 'stale') {
       // A terminal claim whose unlink failed would otherwise stay beside the
       // lock, and the next attempt would add another generation every 25 ms for
       // the whole wait. Keep only the generation this attempt is about to use.
       const cleaned = await cleanupTerminalReclaims(lock)
-      const reclaim = cleaned ? await claimStaleReclaim(lock) : undefined
+      const reclaim = cleaned ? await claimStaleReclaim(lock, Math.max(250, deadline - Date.now()), probe) : undefined
       if (reclaim !== undefined) {
         try {
           if (await newestReclaimGeneration(lock) === reclaim.generation
-            && await lockState(lock) === 'stale'
+            && await lockState(lock, Math.max(250, deadline - Date.now()), probe) === 'stale'
             && await newestReclaimGeneration(lock) === reclaim.generation) {
             await unlink(lock).catch(() => {})
           }

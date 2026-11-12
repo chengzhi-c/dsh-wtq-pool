@@ -69,7 +69,7 @@ interface Config {
   preferredAccountIds?: Record<string, string>;
   /** Picked Trae/Qoder account per region. */
   preferredSourceAccounts?: Record<string, string>;
-  /** Accounts removed from the pool for good, with their label kept. */
+  /** Accounts removed from the pool, with their label and region kept so the panel can restore them. */
   removedAccounts?: unknown[];
   /** Whether the credits readout is shown beside the composer. */
   showComposerPoints?: boolean;

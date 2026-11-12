@@ -4,26 +4,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
-const { createRequire, registerHooks } = require('node:module')
-const { fileURLToPath } = require('node:url')
-const ts = require('typescript')
-const root = path.resolve(__dirname, '..')
-const transpile = (source) => ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },
-}).outputText
-
-registerHooks({
-  resolve(specifier, context, next) {
-    const ownSource = context.parentURL?.startsWith('file:') && fileURLToPath(context.parentURL).startsWith(path.join(root, 'src') + path.sep)
-    return next(ownSource && specifier.startsWith('.') && path.extname(specifier) === '' ? specifier + '.ts' : specifier, context)
-  },
-  load(url, context, next) {
-    if (url.startsWith('file:') && url.endsWith('.ts')) return {
-      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')),
-    }
-    return next(url, context)
-  },
-})
+const { createRequire } = require('node:module')
+const { root, transpile } = require('./ts-loader.cjs')
 
 test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-pool-test-'))
@@ -1690,7 +1672,6 @@ test('a file the registry scan names is only run when its signature is valid', (
  * the fallback it actually bound, and the finding says which port was taken.
  */
 test('the doctor reports a published address for all three sources and names the port a held one fell back from', async (t) => {
-  const net = require('node:net')
   const { createServer } = require('node:http')
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-doctor-addr-'))
   const auth = path.join(temporary, 'auth')
@@ -1751,7 +1732,6 @@ test('the doctor reports a published address for all three sources and names the
   context.exports = context.module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8')), context)
   const plugin = context.module.exports
-  const address = (findings, id) => findings.find((finding) => finding.id === id)
   try {
     await plugin.onLoad()
     await startRegisteredService()

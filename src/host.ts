@@ -1130,8 +1130,8 @@ function creditReserves() {
 }
 
 /**
- * Accounts removed from the pool for good, with label and gateway kept so the
- * panel can still offer a restore after the account stops being scanned.
+ * Accounts removed from the pool, with label and gateway kept so the panel can
+ * still offer a restore after the account stops being scanned.
  */
 function removedAccounts() {
   const value = settings.removedAccounts;
@@ -1280,6 +1280,13 @@ function sourceModelView(key, model, native) {
     // declaration decides what to do with an edited list.
     ...Array.isArray(override.thinkingLevels) && override.thinkingLevels.length > 0
       ? { thinkingLevels: override.thinkingLevels }
+      : {},
+    // The level the panel saved as this model's default. It is published only
+    // when it survives the model's own list, but it has to reach the
+    // declaration: the host applies it to requests that name no effort, and a
+    // stored default the row never published was a setting that did nothing.
+    ...typeof override.defaultThinkingLevel === "string" && override.defaultThinkingLevel !== ""
+      ? { defaultThinkingLevel: override.defaultThinkingLevel }
       : {},
     // The upstream cost, read-only: it is the gateway's price, not a setting, so
     // there is no override and no `nativeMultiplier` beside it. WorkBuddy models
@@ -2220,7 +2227,8 @@ function traeDeclarationModels(region) {
       ? view.thinkingLevels.filter((level) => HOST_THINKING_LEVELS.includes(level))
       : [];
     const levels = edited.length > 0 ? HOST_THINKING_LEVELS.filter((level) => edited.includes(level)) : advertised;
-    models.push({
+    const published = offersThinking(levels) ? levels : ["off"];
+    const entry = {
       id: view.id,
       // Same label rule as WorkBuddy's declaration: the user's alias verbatim,
       // otherwise the catalog name with its cost suffix.
@@ -2230,8 +2238,12 @@ function traeDeclarationModels(region) {
       supportsImages: view.supportsImages,
       // An empty list is read by the host as "offer every level". A lone
       // "off" is how a model with no Trae levels is kept off that ladder.
-      thinkingLevels: offersThinking(levels) ? levels : ["off"],
-    });
+      thinkingLevels: published,
+    };
+    if (typeof view.defaultThinkingLevel === "string" && published.includes(view.defaultThinkingLevel)) {
+      entry.defaultThinkingLevel = view.defaultThinkingLevel;
+    }
+    models.push(entry);
     if (models.length >= MAX_MODELS) break;
   }
   return models;
@@ -2438,7 +2450,7 @@ function qoderDeclarationModels(region) {
     const published = edited.length > 0
       ? HOST_THINKING_LEVELS.filter((level) => edited.includes(level))
       : levels;
-    models.push({
+    const entry = {
       id: view.id,
       name: view.name,
       contextWindow: view.contextWindow,
@@ -2449,7 +2461,12 @@ function qoderDeclarationModels(region) {
       // stored `["off"]`-only edit therefore has to reach the declaration, or
       // the save reads as done and changes nothing.
       thinkingLevels: offersThinking(published) ? published : ["off"],
-    });
+    };
+    const levelsOffered = entry.thinkingLevels;
+    if (typeof view.defaultThinkingLevel === "string" && levelsOffered.includes(view.defaultThinkingLevel)) {
+      entry.defaultThinkingLevel = view.defaultThinkingLevel;
+    }
+    models.push(entry);
     if (models.length >= MAX_MODELS) break;
   }
   return models;
@@ -2820,12 +2837,14 @@ function cooldownPending() {
 function probesStale() {
   const now = Date.now();
   for (const account of core.pool.list()) {
-    // A cooling account is never probed (see statusDocument), so it can never
-    // have a cache entry: counting it would keep every state call reporting a
-    // detection pass in progress while the cooling lasts. A switched-off
-    // account is skipped for the same reason, and counting it held the panel's
-    // polling open for a row that never probes.
-    if (account.cooldownUntilMs > now
+    // A cooling account that is not held for a spent balance is read for its
+    // check-in only (see statusDocument), so it can never have a full cache
+    // entry: counting it would keep every state call reporting a detection pass
+    // in progress while the cooling lasts. A switched-off account is skipped for
+    // the same reason, and counting it held the panel's polling open for a row
+    // that never probes. A spent hold is the exception: its balance read is what
+    // releases it, so it must not stay stale.
+    if ((account.cooldownUntilMs > now && core.pool.activeHold?.(account.id)?.reason !== "spent")
       || core.pool.isDisabled(account.id)
       || !regionEnabled("workbuddy", regionOf(account.credential.domain))) continue;
     const cached = probeCache.get(account.id);
@@ -3328,7 +3347,9 @@ async function refreshSourceAccounts(generation: number) {
         const region = traeRegionOfCredential(credential);
         const previous = traeAccountRows.find((row) => row.label === label && row.region === region);
         const probe = await traeRowProbe(credential, previous);
-        noteSourceExpiry("trae", region, label, probe?.usage?.credits?.packages);
+        // A probe that outlived its activation must not write its expiry into
+        // the state the next one now owns.
+        if (generation === loadGeneration) noteSourceExpiry("trae", region, label, probe?.usage?.credits?.packages);
         return {
           label,
           region,
@@ -3345,6 +3366,7 @@ async function refreshSourceAccounts(generation: number) {
       traeLabelOverrides = overrides;
       traeAccountRows = rows.filter((row) => regionEnabled("trae", row.region));
     } else {
+      if (generation !== loadGeneration) return;
       traeAccountRows = [];
     }
   } catch (error) {
@@ -3354,6 +3376,7 @@ async function refreshSourceAccounts(generation: number) {
     const regions = activeQoderRegions();
     if (regions.length > 0) {
       const found = await discoverQoderCredentials();
+      if (generation !== loadGeneration) return;
       // Same rule as Trae: the label belongs to the account, not to the set of
       // regions that happen to be switched on right now.
       const allLabels = uniqueSourceLabels(found.credentials, qoderBaseLabel, (credential) => credential.userID);
@@ -3373,10 +3396,12 @@ async function refreshSourceAccounts(generation: number) {
       // decide whether the next one waits.
       let seen = 0;
       for (const { credential, label } of wanted) {
+        if (generation !== loadGeneration) return;
         if (seen > 0) await delay(QODER_ACCOUNT_DELAY_MS);
         seen += 1;
         const previous = qoderAccountRows.find((row) => row.label === label && row.region === credential.region);
         const probe = left() > 0 ? await qoderRowProbe(credential, previous) : previous;
+        if (generation !== loadGeneration) return;
         noteSourceExpiry("qoder", credential.region, label, probe?.usage?.credits?.packages);
         rows.push({
           label,
@@ -3391,11 +3416,13 @@ async function refreshSourceAccounts(generation: number) {
       qoderLabelOverrides = overrides;
       qoderAccountRows = rows.filter((row) => regionEnabled("qoder", row.region));
     } else {
+      if (generation !== loadGeneration) return;
       qoderAccountRows = [];
     }
   } catch (error) {
     log("warn", "listing Qoder sign-ins failed: " + safeMessage(error));
   }
+  if (generation !== loadGeneration) return;
   pruneSourceState();
 }
 
@@ -3548,7 +3575,8 @@ async function accountProbe(account, allowNetwork, checkinOnly = false) {
   if (allowNetwork !== true) {
     return cached === undefined ? { pending: true } : cached.value;
   }
-  // A check-in-only read (a cooling account) writes a value without credits.
+  // A check-in-only read (a cooling account that is not held for a spent
+  // balance) writes a value without credits.
   // Treating that entry as fresh for the full read that follows kept the
   // balance blank until the next TTL, and `probesStale` stopped asking for it.
   const cachedFresh = cached !== undefined
@@ -3764,7 +3792,7 @@ async function statusDocument(options) {
     // Priority, expiry and round-robin name the account the next request will
     // use. Sticky has no single next account, so it marks nothing rather than
     // point at a guess; the composer readout names the last one instead.
-    const nextUp = preferred ?? core.pool.preview(available);
+    const nextUp = preferred ?? core.pool.preview(available, region);
     runtimeNextUpId.set(region, nextUp === undefined ? undefined : nextUp.id);
 
     for (const account of core.pool.list(region)) {
@@ -3818,7 +3846,9 @@ async function statusDocument(options) {
       // account has no check-in programme" with no claim button, over an account
       // whose daily reward is still unclaimed and still claimable.
       if (!core.pool.isDisabled(account.id)) {
-        const checkinOnly = cooling;
+        // A spent account keeps a full read even while cooling: that read is
+        // what notices a top-up and releases the hold.
+        const checkinOnly = cooling && core.pool.activeHold?.(account.id)?.reason !== "spent";
         pendingProbes.push(accountProbe(account, allowNetwork, checkinOnly).then((probe) => {
           applyProbe(row, probe);
         }));
@@ -3883,6 +3913,32 @@ async function statusDocument(options) {
   // come back with the numbers on its next pass instead of losing them.
   if (pendingProbes.length > 0) {
     await settleWithin(Promise.all(pendingProbes).catch(() => {}), probeBudget);
+    // A full read can release a spent hold (the balance is back), and the row
+    // was built before the read. Rewrite the hold fields from the live accounts
+    // so the document that carries the released balance does not still say the
+    // account is cooling.
+    const liveAccounts = new Map(core.pool.list().map((account) => [account.id, account]));
+    const heldNow = Date.now();
+    // The "next up" row was chosen before the reads as well; a released hold can
+    // make a different account the one the next request will use.
+    const nextUpNow = new Map<string, string | undefined>();
+    for (const region of activeRegions()) {
+      const available = core.pool.available(heldNow, undefined, region);
+      const preferredNow = available.find((account) => account.id === preferredAccountIds[region]);
+      nextUpNow.set(region, (preferredNow ?? core.pool.preview(available, region))?.id);
+    }
+    for (const row of accounts) {
+      const account = liveAccounts.get(row.id);
+      if (account === undefined) continue;
+      const cooling = account.cooldownUntilMs > heldNow;
+      row.cooling = cooling;
+      if (cooling) row.cooldownUntil = new Date(account.cooldownUntilMs).toISOString();
+      else delete row.cooldownUntil;
+      const hold = core.pool.activeHold(account.id);
+      if (hold === null || hold.untilMs <= heldNow) delete row.hold;
+      else row.hold = hold.reason;
+      row.active = nextUpNow.get(row.region) === row.id;
+    }
   }
 
   // Only active gateways are offered: a source switched off removes its tabs
@@ -4389,7 +4445,7 @@ async function doctorReport() {
   ].join("\n");
   if (dataPath !== "") {
     try {
-      fs.writeFileSync(path.join(dataPath, "doctor.txt"), report, "utf8");
+      fs.writeFileSync(path.join(dataPath, "doctor.txt"), report, { encoding: "utf8", mode: 0o600 });
     } catch {
       // A report that cannot be written to disk is still a report: the panel
       // shows and copies it either way.
@@ -5235,9 +5291,17 @@ async function onPanelInvoke(channel, payload) {
      */
     case "xd.startLogin": {
       const realm = payload?.realm === "global" ? "global" : "cn";
-      const start = await startDeviceLogin(realm);
-      deviceLogins.set(realm, { state: start.state, at: Date.now() });
-      return { realm, authUrl: start.authUrl };
+      try {
+        const start = await startDeviceLogin(realm);
+        deviceLogins.set(realm, { state: start.state, at: Date.now() });
+        return { realm, authUrl: start.authUrl };
+      } catch (error: unknown) {
+        // An empty URL asks the panel for its localized "no link" line; the
+        // upstream reason stays in the log rather than in the banner.
+        deviceLogins.delete(realm);
+        log("warn", "could not start a WorkBuddy sign-in: " + safeMessage(error));
+        return { realm, authUrl: "" };
+      }
     }
 
     /**
@@ -7065,7 +7129,7 @@ function workbuddyComposerAccounts(region, modelId) {
   const available = core.pool.available(now, modelId, region);
   const preferredId = core.pool.resolvedPreferredId(region);
   const preferred = available.find((account) => account.id === preferredId);
-  const next = preferred ?? core.pool.readoutPreview(available);
+  const next = preferred ?? core.pool.readoutPreview(available, region);
   return list.map((account) => {
     const cached = probeCache.get(account.id)?.value?.credits;
     return {

@@ -497,6 +497,14 @@ test('only the current login writes credentials and returns the panel document',
     const state = await plugin.onPanelInvoke('xd.state')
     assert.equal(state.accounts.length, replied.state.accounts.length,
       'the answer and the next read agree, which is what makes the adoption visible')
+    await plugin.onPanelInvoke('xd.startLogin', { realm: 'cn' })
+    loginStub.startDeviceLogin = async () => { throw new Error('upstream refused the sign-in') }
+    const failed = await plugin.onPanelInvoke('xd.startLogin', { realm: 'cn' })
+    assert.equal(failed.realm, 'cn')
+    assert.equal(failed.authUrl, '',
+      'a start failure reaches the panel as an empty link, so it shows the localized message')
+    await assert.rejects(plugin.onPanelInvoke('xd.pollLogin', { realm: 'cn' }),
+      (error) => error.code === 'NO_LOGIN', 'a failed start leaves no pending login behind')
   } finally {
     await plugin.onUnload()
     fs.rmSync(directory, { recursive: true, force: true })

@@ -65,6 +65,11 @@ test('the panel asks for nothing through a script dialog', () => {
   assert.doesNotMatch(text, /window\.prompt\(/, 'window.prompt cannot show either')
 })
 
+test('a login start with no link is reported in the panel language', () => {
+  assert.match(source(), /throw new Error\(t\("login\.noLink"\)\)/,
+    'an empty answer has to reach the localized message, not a literal')
+})
+
 test('the delete button confirms on a second press', () => {
   const body = deleteControl()
   assert.match(body, /acct\.deleteConfirmAgain/, 'the armed label says what the next press does')

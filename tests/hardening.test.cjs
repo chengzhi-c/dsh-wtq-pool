@@ -12,29 +12,9 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
-const { createRequire, registerHooks } = require('node:module')
-const { fileURLToPath } = require('node:url')
-const ts = require('typescript')
+const { createRequire } = require('node:module')
 
-const root = path.resolve(__dirname, '..')
-const transpile = (source) => ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },
-}).outputText
-
-// The core imports its siblings without an extension, so the loader needs the
-// same `.ts` resolution the DSH entry builds against.
-registerHooks({
-  resolve(specifier, context, next) {
-    const ownSource = context.parentURL?.startsWith('file:') && fileURLToPath(context.parentURL).startsWith(path.join(root, 'src') + path.sep)
-    return next(ownSource && specifier.startsWith('.') && path.extname(specifier) === '' ? specifier + '.ts' : specifier, context)
-  },
-  load(url, context, next) {
-    if (url.startsWith('file:') && url.endsWith('.ts')) return {
-      format: 'commonjs', shortCircuit: true, source: transpile(fs.readFileSync(fileURLToPath(url), 'utf8')),
-    }
-    return next(url, context)
-  },
-})
+const { root, transpile } = require('./ts-loader.cjs')
 
 const scratch = (label) => fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), `dsh-${label}-`))
 
@@ -1841,7 +1821,7 @@ test('a Qoder acknowledgement is not read as a refusal', () => {
  * itself if it ever stops being discriminating.
  */
 test('the check-in hour is read in Beijing time, not the host zone', () => {
-  const { zonedDayHour, checkinSlotId, dueCheckinSlot, normaliseCheckinHours, CHECKIN_TIME_ZONE } = require('../src/checkin-time.ts')
+  const { zonedDayHour, checkinSlotId, CHECKIN_TIME_ZONE } = require('../src/checkin-time.ts')
   assert.equal(CHECKIN_TIME_ZONE, 'Asia/Shanghai', 'the zone is the one the reward windows are defined in')
 
   const localIn = (date, zone) => {
@@ -2894,7 +2874,7 @@ test('a loopback server stops listening and aborts a turn that is still in fligh
   })
   await server.ready
   let streaming
-  const inFlight = new Promise((resolve) => {
+  new Promise((resolve) => {
     streaming = http.get(`http://127.0.0.1:${server.port()}/hang`, (response) => {
       response.resume()
       response.on('end', () => resolve('ended'))
@@ -3076,6 +3056,111 @@ test('a sticky conversation keeps the account it started on', async () => {
     'the composer readout names the account the latest turn ran on instead of a dash')
   assert.equal(pool.preview(pool.available(Date.now())), undefined,
     'the panel still marks no next account: sticky has no single next one')
+})
+
+test('a rebound sticky conversation is not evicted as the oldest', async () => {
+  // The 200-key cap evicts the oldest insertion. `Map.set` on an existing key
+  // keeps its position, so a conversation that just moved accounts stayed at
+  // the front of the queue and the next new conversation evicted it, moving a
+  // live thread again and discarding its prompt cache.
+  const dir = scratch('sticky-lru')
+  for (const name of ['one', 'two', 'three']) {
+    fs.writeFileSync(path.join(dir, name + '.info'), JSON.stringify({
+      auth: { accessToken: 'token-' + name, refreshToken: 'r', expiresAt: 0, domain: 'www.workbuddy.cn' },
+      account: { uin: 'uin-' + name, nickname: name },
+    }))
+  }
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const pool = new WorkBuddyAccountPool({ authDirs: [dir], cooldownMs: 60_000, distribution: 'sticky' })
+  const first = await pool.acquire(undefined, undefined, 'conversation-0')
+  for (let index = 1; index < 200; index += 1) {
+    await pool.acquire(undefined, undefined, 'conversation-' + index)
+  }
+  // Make the bound account unusable, so the next turn has to rebind the
+  // conversation instead of keeping it.
+  pool.penalize(first.id, Date.now() + 60_000)
+  const rebound = await pool.acquire(undefined, undefined, 'conversation-0')
+  assert.notEqual(rebound?.id, first?.id, 'the unavailable account is replaced')
+  await pool.acquire(undefined, undefined, 'conversation-200')
+  assert.equal(pool.sticky.has('conversation-0'), true,
+    'a conversation used last must not be evicted before conversations idle for 200 turns')
+  assert.equal((await pool.acquire(undefined, undefined, 'conversation-0'))?.id, rebound?.id,
+    'the rebound conversation keeps its new account')
+})
+
+test('one pool rotates each region without starving the other', async () => {
+  // Both region shims share one pool and used to share one round-robin
+  // position. Normalising that position against each region's own length served
+  // the same account in each region on alternating turns and never reached the
+  // second account.
+  const dir = scratch('round-robin-regions')
+  for (const [name, domain] of [
+    ['cn-a', 'www.workbuddy.cn'],
+    ['cn-b', 'www.workbuddy.cn'],
+    ['global-a', 'workbuddy.ai'],
+    ['global-b', 'workbuddy.ai'],
+  ]) {
+    fs.writeFileSync(path.join(dir, name + '.info'), JSON.stringify({
+      auth: { accessToken: 'token-' + name, refreshToken: 'r', expiresAt: 0, domain },
+      account: { uin: 'uin-' + name, nickname: name },
+    }))
+  }
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  const pool = new WorkBuddyAccountPool({ authDirs: [dir], cooldownMs: 60_000, distribution: 'round-robin' })
+  const served = new Map([['cn', new Set()], ['global', new Set()]])
+  for (let turn = 0; turn < 4; turn += 1) {
+    served.get('cn').add((await pool.acquire(undefined, 'cn'))?.id)
+    served.get('global').add((await pool.acquire(undefined, 'global'))?.id)
+  }
+  assert.equal(served.get('cn').size, 2, 'both domestic accounts serve')
+  assert.equal(served.get('global').size, 2, 'both international accounts serve')
+  // Leave the two regions on different positions. A preview that read one
+  // shared position would then name the wrong account instead of passing by
+  // coincidence, which an even number of turns lets it do.
+  await pool.acquire(undefined, 'cn')
+  const cnAvailable = pool.available(Date.now(), undefined, 'cn')
+  const cnNext = pool.preview(cnAvailable, 'cn')
+  assert.equal(pool.readoutPreview(cnAvailable, 'cn')?.id, cnNext?.id,
+    'the composer readout reads the domestic position')
+  assert.equal((await pool.acquire(undefined, 'cn'))?.id, cnNext?.id,
+    'the preview reads the domestic position and names the next domestic account')
+  const globalNext = pool.preview(pool.available(Date.now(), undefined, 'global'), 'global')
+  assert.equal((await pool.acquire(undefined, 'global'))?.id, globalNext?.id,
+    'the preview reads the international position and names the next international account')
+})
+
+test('a rotating pool still reaches every account when one refresh fails', async () => {
+  // A failed refresh is skipped for the rest of that request but not cooled.
+  // The retry filters the sign-in out, so the rotation has to continue past its
+  // position in the full roster; restarting at the filtered head retried the
+  // same account every turn and never reached the accounts behind it.
+  const dir = scratch('round-robin-skip')
+  for (const name of ['one', 'two', 'three']) {
+    fs.writeFileSync(path.join(dir, name + '.info'), JSON.stringify({
+      auth: { accessToken: 'token-' + name, refreshToken: 'r', expiresAt: 0, domain: 'www.workbuddy.cn' },
+      account: { uin: 'uin-' + name, nickname: name },
+    }))
+  }
+  const { WorkBuddyAccountPool } = require('../src/accounts.ts')
+  for (const failingIndex of [0, 1, 2]) {
+    const pool = new WorkBuddyAccountPool({ authDirs: [dir], cooldownMs: 60_000, distribution: 'round-robin' })
+    await pool.scan()
+    const failing = pool.list('cn')[failingIndex]?.id
+    const served = new Set()
+    for (let request = 0; request < 6; request += 1) {
+      const first = await pool.acquire(undefined, 'cn')
+      if (first?.id === failing) {
+        const retry = await pool.acquire(undefined, 'cn', undefined, new Set([failing]))
+        assert.ok(retry !== undefined && retry.id !== failing,
+          `the retry serves another account when position ${failingIndex} fails`)
+        served.add(retry.id)
+      } else if (first !== undefined) {
+        served.add(first.id)
+      }
+    }
+    assert.equal(served.size, 2,
+      `both healthy accounts serve when the sign-in at position ${failingIndex} keeps failing`)
+  }
 })
 
 test('a rotating mode names the account the composer readout will show', async () => {
@@ -3830,7 +3915,8 @@ test('a refusal that merely contains "already" is a failure', () => {
 /**
  * The panel keeps polling while every account is cooling.
  *
- * `probesStale` skips cooling accounts by design, so an all-cooling pool read
+ * `probesStale` skips cooling accounts by design (a spent hold excepted), so an
+ * all-cooling pool read
  * as "nothing to refresh" and the panel stopped polling: the figures stayed
  * stale until the user clicked Refresh or the poll hit its attempt cap.
  */
@@ -3844,7 +3930,8 @@ test('the panel keeps polling while every account is cooling', () => {
   const mod = { exports: {} }
   const disabled = new Set()
   const regionsOff = new Set()
-  const core = { pool: { list: () => accounts, isDisabled: (id) => disabled.has(id) } }
+  const holds = new Map()
+  const core = { pool: { list: () => accounts, isDisabled: (id) => disabled.has(id), activeHold: (id) => holds.get(id) } }
   new Function('module', 'exports', 'require', 'core', 'regionEnabled', 'regionOf', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS',
     grab('cooldownPending') + '\n' + grab('probesStale') + '\nmodule.exports = { cooldownPending, probesStale };',
   )(mod, mod.exports, require, core, (source, region) => !regionsOff.has(source + ':' + region),
@@ -3853,6 +3940,10 @@ test('the panel keeps polling while every account is cooling', () => {
   assert.equal(mod.exports.probesStale(accounts), false, 'a cooling account is never probed')
   assert.equal(mod.exports.cooldownPending(accounts), true,
     'but the cooldown is still something the panel is waiting for')
+  holds.set('a', { reason: 'spent' })
+  assert.equal(mod.exports.probesStale(accounts), true,
+    'a spent hold still reads its balance so a top-up can release it')
+  holds.delete('a')
   disabled.add('a')
   assert.equal(mod.exports.cooldownPending(accounts), false,
     'a switched-off account never probes, so its cooldown is not a deadline')

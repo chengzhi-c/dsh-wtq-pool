@@ -543,6 +543,18 @@ function chatBase(credential: WorkBuddyCredential): string {
   return regionOf(credential.domain) === 'global' ? globalBase(credential) : CN_CHAT_BASE
 }
 
+/**
+ * The host a sign-in's chat traffic actually reaches.
+ *
+ * The sign-in domain is not the chat host: every CN spelling (including an
+ * empty one) is served by one gateway, and the two international brand domains
+ * have gateways of their own. Failover keys transport failures on this value so
+ * that one unreachable gateway condemns exactly the accounts it serves.
+ */
+export function chatHostOf(credential: WorkBuddyCredential): string {
+  return new URL(chatBase(credential)).host
+}
+
 function billingBase(credential: WorkBuddyCredential): string {
   return regionOf(credential.domain) === 'global' ? globalBase(credential) : CN_BILLING_BASE
 }

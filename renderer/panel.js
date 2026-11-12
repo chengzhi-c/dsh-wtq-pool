@@ -72,6 +72,7 @@ var EN = {
   "login.openAgain": "Open the link again",
   "login.waiting": "Finish the sign-in in your browser; this panel picks the account up by itself.",
   "login.timeout": "The sign-in did not finish. Start again for a new link.",
+  "login.noLink": "The plugin did not return a sign-in link.",
   "login.added": "Added {name}",
   "login.addedNoName": "Account added",
   "trae.title": "Trae",
@@ -359,6 +360,7 @@ var ZH = {
   "login.openAgain": "再打开一次链接",
   "login.waiting": "在浏览器里完成登录即可，面板会自己把这个账号收进来。",
   "login.timeout": "登录没有完成。重新开始一次拿新链接。",
+  "login.noLink": "插件没有返回登录链接。",
   "login.added": "已添加 {name}",
   "login.addedNoName": "账号已添加",
   "trae.title": "Trae",
@@ -1604,7 +1606,7 @@ function startLogin() {
   render();
   invoke("xd.startLogin", { realm: realm }).then(function (answer) {
     loginUrl = answer && typeof answer.authUrl === "string" ? answer.authUrl : "";
-    if (loginUrl === "") throw new Error("the plugin did not return a login link");
+    if (loginUrl === "") throw new Error(t("login.noLink"));
     // This page is a real browser tab, so the link opens the way its own footer
     // links do: a new tab, leaving the panel where it is.
     window.open(loginUrl, "_blank", "noopener,noreferrer");
@@ -2362,7 +2364,7 @@ function paintAccounts(host) {
 }
 
 /**
- * Accounts the user removed for good, each with a button that brings it back.
+ * Accounts the user removed, each with a button that brings it back.
  *
  * Shown because "remove" would otherwise be a one-way door: the account stops
  * being scanned, so there is nothing left in the account list to click.

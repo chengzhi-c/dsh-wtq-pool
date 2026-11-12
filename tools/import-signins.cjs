@@ -23,7 +23,7 @@
  */
 const fs = require('node:fs')
 const path = require('node:path')
-const { fileURLToPath, pathToFileURL } = require('node:url')
+const { fileURLToPath } = require('node:url')
 const { registerHooks } = require('node:module')
 
 // The plugin's own rules live in TypeScript that this build ships from source, so

@@ -14,7 +14,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const vm = require('node:vm')
 
-const { root, transpile } = require('./ts-loader.cjs')
+const { root } = require('./ts-loader.cjs')
 
 const { prepareSoloBody, collectTraeSoloModels, traeVariantFor } = require('../src/trae-upstream.ts')
 

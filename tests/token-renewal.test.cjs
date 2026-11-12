@@ -18,7 +18,7 @@ const { createHash, randomUUID } = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { root, transpile } = require('./ts-loader.cjs')
+require('./ts-loader.cjs')
 
 const { WorkBuddyAccountPool, workbuddyAccountId, renewOwnSignInFile } = require('../src/accounts.ts')
 

@@ -16,7 +16,15 @@ test('the preview serves public assets without exposing the checkout', { timeout
     child.kill()
     await exited
   })
-  const [output] = await once(child.stdout, 'data')
+  const output = await new Promise((resolve, reject) => {
+    let buffered = ''
+    child.stdout.on('data', (chunk) => {
+      buffered += chunk
+      if (buffered.includes('\n')) resolve(buffered)
+    })
+    child.once('error', reject)
+    child.once('exit', (code) => reject(new Error(`preview server exited before naming a port (${code})`)))
+  })
   const port = Number(String(output).match(/:(\d+)\//)?.[1])
   assert.ok(port > 0, 'the preview must bind an available local port')
 

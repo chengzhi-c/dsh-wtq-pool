@@ -129,25 +129,13 @@ export interface Config {
   preferredAccountIds?: Record<string, string>
   /** Picked Trae/Qoder account per region. */
   preferredSourceAccounts?: Record<string, string>
-  /** Accounts removed from the pool for good, with their label kept. */
+  /** Accounts removed from the pool, with their label and region kept so the panel can restore them. */
   removedAccounts?: unknown[]
   /** Whether the credits readout is shown beside the composer. */
   showComposerPoints?: boolean
   /** How each Trae/Qoder region spreads requests. */
   sourceDistributions?: Record<string, string>
 }
-
-/**
- * Whether the installed schemastery can mark a field volatile.
- *
- * `Config` is built at module evaluation, before any `ctx` exists to log
- * through, so the finding is recorded here and reported by the activation's
- * first logger-reaching call rather than dropped.
- */
-let volatileSupported = true
-
-/** Whether the finding above has already been named, so it is named once. */
-let degradationReported = false
 
 /**
  * Which activation currently owns the module-global state the core keeps.
@@ -159,51 +147,28 @@ let degradationReported = false
  */
 let activationToken = 0
 
-/**
- * Wrap one schema in `volatile()` when the installed schemastery has it.
- *
- * `volatile()` landed in schemastery 3.18.3. Hand-writing `meta.volatile` on an
- * older copy would bypass the host's own `validateVolatileSchema`, so an older
- * builder degrades to the plain schema instead.
- */
-function asVolatile<S>(schema: S): S {
-  const candidate = schema as unknown as { volatile?: () => S }
-  if (typeof candidate.volatile !== 'function') {
-    volatileSupported = false
-    return schema
-  }
-  return candidate.volatile()
-}
-
-/** Report the schema degradation once, when a logger is finally in reach. */
-function reportSchemaDegradation(logger: { warn(...args: unknown[]): void }): void {
-  if (volatileSupported || degradationReported) return
-  degradationReported = true
-  logger.warn('dsh-wtq-pool: the installed schemastery has no volatile(), so no settings field can be marked volatile: the settings card cannot render its section and every settings write this plugin makes is refused')
-}
-
 export const Config: z<Config> = z.object({
-  enabled: asVolatile(z.boolean().default(true).description('Serve this pool at all')),
-  sourceWorkbuddy: asVolatile(z.boolean().default(true).description('Merge the WorkBuddy desktop sign-ins')),
-  sourceTrae: asVolatile(z.boolean().default(true).description('Merge the Trae desktop sign-ins')),
-  sourceQoder: asVolatile(z.boolean().default(true).description('Merge the Qoder desktop sign-ins')),
-  authFile: asVolatile(z.string().description('WorkBuddy desktop auth file (defaults to the app own location)')),
-  autoCheckin: asVolatile(z.object({
+  enabled: z.boolean().default(true).description('Serve this pool at all').volatile(),
+  sourceWorkbuddy: z.boolean().default(true).description('Merge the WorkBuddy desktop sign-ins').volatile(),
+  sourceTrae: z.boolean().default(true).description('Merge the Trae desktop sign-ins').volatile(),
+  sourceQoder: z.boolean().default(true).description('Merge the Qoder desktop sign-ins').volatile(),
+  authFile: z.string().description("WorkBuddy desktop auth file (defaults to the app's own location)").volatile(),
+  autoCheckin: z.object({
     enabled: z.boolean().default(false),
     hours: z.array(z.number()).default([]),
-  }).description('Daily check-in across every discovered sign-in')),
-  cooldownSeconds: asVolatile(z.number().default(60).description('Rate-limit cooldown per account, in seconds')),
-  creditReserves: asVolatile(z.dict(z.number()).default({}).description('Per-account credit floor, keyed by account id')),
-  disabledAccountIds: asVolatile(z.array(z.string()).default([]).description('Account ids the pool must never pick')),
-  disabledRegions: asVolatile(z.array(z.string()).default([]).description('Regions parked on their own, as source:region')),
-  distribution: asVolatile(z.union(['priority', 'round-robin', 'expiry', 'sticky']).default('priority').description('How the WorkBuddy pool spreads requests')),
-  modelSelection: asVolatile(z.any().description('Per-gateway model selection')),
-  preferredAccountIds: asVolatile(z.any().description('Picked WorkBuddy account per region')),
-  preferredSourceAccounts: asVolatile(z.any().description('Picked Trae/Qoder account per region')),
-  removedAccounts: asVolatile(z.any().description('Accounts removed from the pool for good')),
-  showComposerPoints: asVolatile(z.boolean().default(false).description('Show the active account credits beside the composer')),
-  sourceDistributions: asVolatile(z.any().description('How each Trae/Qoder region spreads requests')),
-}) as z<Config>
+  }).description('Daily check-in across every discovered sign-in').volatile(),
+  cooldownSeconds: z.number().default(60).description('Rate-limit cooldown per account, in seconds').volatile(),
+  creditReserves: z.dict(z.number()).default({}).description('Per-account credit floor, keyed by account id').volatile(),
+  disabledAccountIds: z.array(z.string()).default([]).description('Account ids the pool must never pick').volatile(),
+  disabledRegions: z.array(z.string()).default([]).description('Regions parked on their own, as source:region').volatile(),
+  distribution: z.union(['priority', 'round-robin', 'expiry', 'sticky']).default('priority').description('How the WorkBuddy pool spreads requests').volatile(),
+  modelSelection: z.any().description('Per-gateway model selection').volatile(),
+  preferredAccountIds: z.any().description('Picked WorkBuddy account per region').volatile(),
+  preferredSourceAccounts: z.any().description('Picked Trae/Qoder account per region').volatile(),
+  removedAccounts: z.any().description('Accounts taken out of the pool; their label and region are kept so the panel can restore them').volatile(),
+  showComposerPoints: z.boolean().default(false).description('Show the active account credits beside the composer').volatile(),
+  sourceDistributions: z.any().description('How each Trae/Qoder region spreads requests').volatile(),
+}) as unknown as z<Config>
 
 /** Peel one volatile reference, if the running line wrapped it. */
 function unwrapVolatile<T>(value: T): T {
@@ -557,22 +522,51 @@ let writesInFlight = 0
 let writesStarted = 0
 let droppedPushes = 0
 
+/**
+ * Whether two setting values are the same document.
+ *
+ * Object key order carries no meaning in the stored document, and the loader's
+ * own comparison ignores it, so a key-order-sensitive check would predict an
+ * echo the host never emits.
+ */
+function sameSetting(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true
+  if (typeof a !== 'object' || a === null || typeof b !== 'object' || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  const aRecord = a as Record<string, unknown>
+  const bRecord = b as Record<string, unknown>
+  const keys = Object.keys(aRecord).filter((key) => aRecord[key] !== undefined)
+  if (keys.length !== Object.keys(bRecord).filter((key) => bRecord[key] !== undefined).length) return false
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(bRecord, key)) return false
+    if (!sameSetting(aRecord[key], bRecord[key])) return false
+  }
+  return true
+}
+
 /** Replace patched top-level fields without merging their dictionaries. */
 const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
   const mutate = settingsService?.mutate
   if (mutate === undefined) throw new Error('this host exposes no settings mutate()')
+  const before = current() as Record<string, unknown>
   writesStarted += 1
   writesInFlight += 1
-  let echoed = false
+  // DSH emits `loader/volatile-update` only when the write changes the
+  // document. A patch that sets the value already in force produces no echo,
+  // so counting it as one made a real host edit that raced the write look like
+  // an echo and dropped it for the rest of the activation.
+  let echoExpected = false
   try {
+    echoExpected = Object.keys(patch)
+      .some((key) => !sameSetting(before[key], patch[key]))
     await mutate.call(settingsService, settingsNamespace,
       Object.entries(patch).map(([key, value]) => ({ op: 'set', path: [key], value })))
-    echoed = true
+  } catch (error: unknown) {
+    // A rejected mutate emits no echo either.
+    echoExpected = false
+    throw error
   } finally {
-    // A rejected mutate emits no echo. Counting it as one made a real host edit
-    // that raced the failed write look like an echo, so the edit was dropped
-    // for the rest of the activation.
-    if (!echoed) writesStarted -= 1
+    if (!echoExpected) writesStarted -= 1
     writesInFlight -= 1
     if (writesInFlight === 0) {
       if (droppedPushes > writesStarted) {
@@ -595,10 +589,6 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
     getSettings: () => current() as Record<string, unknown>,
     setSettings: writeSettings,
     getDataPath: async () => {
-      // Reported here rather than where it is found: `Config` is built at module
-      // evaluation, before any `ctx` exists, and this is the first bridge call
-      // `onLoad` makes that can carry a logger.
-      reportSchemaDegradation(ctx.logger)
       const dir = path.join(dshHome(), 'dsh-wtq-pool')
       await fs.mkdir(dir, { recursive: true, mode: 0o700 })
       return dir

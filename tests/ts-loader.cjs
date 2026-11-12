@@ -1,3 +1,8 @@
+// Load TypeScript sources for the tests. Requiring this module installs the
+// hooks as a side effect; tests that need the compiled text import `transpile`.
+//
+// The resolve hook adds `.ts` only to relative imports made from under `src/`,
+// so a dependency's own extensionless imports are still left to Node.
 const fs = require('node:fs')
 const path = require('node:path')
 const { registerHooks } = require('node:module')
