@@ -40,13 +40,27 @@ function deviceCpuOf(): string | undefined {
   return nonEmpty(cpus()[0]?.model.split(' ')[0])
 }
 
-/** `x-device-id` when exactly one device-center id is persisted. */
+/**
+ * `x-device-id`: the device-center number the official clients send.
+ *
+ * That value is the numeric suffix of `iCubeAuthInfo://icube-dc:<id>`. The app
+ * also leaves entries of another shape behind — for example an `aha-…` key it
+ * writes when it migrates its device id — and those are not device numbers, so
+ * they are never what this header wants. One numeric id beside such leftovers
+ * is still the machine's own and must be used; two numeric ids are two sign-ins
+ * with no way to tell which one this account owns, so the caller still has to
+ * fall back. Keeping the single-entry case shape-blind preserves installs that
+ * persist no numeric id at all.
+ */
 export function traeDeviceCenterId(storage: Record<string, unknown>): string | undefined {
   const ids = Object.keys(storage)
     .filter(key => key.startsWith(TRAE_DEVICE_CENTER_PREFIX))
     .map(key => key.slice(TRAE_DEVICE_CENTER_PREFIX.length))
     .filter(Boolean)
-  return ids.length === 1 ? ids[0] : undefined
+  const numeric = ids.filter(id => /^\d+$/.test(id))
+  if (numeric.length === 1) return numeric[0]
+  if (numeric.length === 0 && ids.length === 1) return ids[0]
+  return undefined
 }
 
 async function readJsonFile(path: string): Promise<Record<string, unknown> | undefined> {
