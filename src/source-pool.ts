@@ -47,7 +47,6 @@ export interface SourcePool {
   /** The key both per-account maps are stored under. */
   accountStateKey(source: string, region: string, label: string): string
   noteSourceFailure(source: string, region: string, label: string, retryAfter?: string | null): void
-  packUrgency(source: string, region: string, label: string, now: number): number
   orderSourceCredentials<T extends SourceCredential>(
     source: string,
     region: string,
@@ -229,7 +228,6 @@ export function createSourcePool(host: SourcePoolHost): SourcePool {
     sourceCredentialExpired,
     accountStateKey,
     noteSourceFailure,
-    packUrgency,
     orderSourceCredentials,
   }
 }

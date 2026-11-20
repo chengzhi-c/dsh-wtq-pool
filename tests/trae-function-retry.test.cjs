@@ -34,8 +34,9 @@ function row(id, { dev, out = 32000 }) {
  * A gateway whose directory lists one model through two functions, and whose chat
  * path refuses through the one it is told to refuse through.
  */
-function harness({ refuse }) {
+function harness({ refuse, publishedWindow }) {
   const attempts = []
+  const maxModes = []
   const fetchImpl = async (url, init) => {
     const target = String(url)
     if (target.includes('get_detail_param')) {
@@ -47,6 +48,7 @@ function harness({ refuse }) {
     if (target.includes('/model')) return new Response(JSON.stringify({ data: { list: [] } }), { status: 200, headers: { 'content-type': 'application/json' } })
     const body = JSON.parse(String(init?.body ?? '{}'))
     attempts.push(body.function)
+    maxModes.push(body.extra_info?.v2_max_mode_enabled === true)
     if (body.function === refuse) {
       return new Response(JSON.stringify({ code: 4001, message: 'config not found' }), {
         status: 400, headers: { 'content-type': 'application/json' },
@@ -61,9 +63,10 @@ function harness({ refuse }) {
     credentials: async () => [credential],
     identity: async () => ({ machineId: 'm', deviceId: 'd', platform: 'win32' }),
     fetchImpl,
+    publishedWindowOf: () => publishedWindow,
     logger: { info() {}, warn() {}, error() {} },
   })
-  return { gateway, attempts }
+  return { gateway, attempts, maxModes }
 }
 
 async function turn(gateway, model) {
@@ -98,5 +101,16 @@ test('a refusal that belongs to the request is not retried elsewhere', async () 
     const answer = await turn(gateway, 'not-in-the-directory')
     assert.equal(answer.status, 404)
     assert.deepEqual(attempts, [], 'a model the directory does not list is not sent anywhere')
+  } finally { await gateway.close() }
+})
+
+test('a narrower fallback function uses Max for the published window', async () => {
+  const { gateway, maxModes } = harness({ refuse: 'solo_agent_remote', publishedWindow: 256000 })
+  try {
+    await gateway.ready
+    const answer = await turn(gateway, 'contested')
+    assert.equal(answer.status, 200)
+    assert.deepEqual(maxModes, [false, true],
+      'the 256k function needs no Max flag; the 128k fallback needs it to serve the declared 256k')
   } finally { await gateway.close() }
 })

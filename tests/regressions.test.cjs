@@ -72,6 +72,8 @@ test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
     assert.equal(models.mock.callCount(), 3, 'manual refresh must bypass the cache')
     await stopRegisteredService()
     await startRegisteredService()
+    // The bounded start hook may leave its listener warming behind the answer.
+    await plugin.onPanelInvoke('xd.state', { wait: true })
     assert.equal(await endpointResponds(), true, 'restarted endpoint must respond')
     let release
     let reading
@@ -828,6 +830,10 @@ test('a caller hang-up is not logged as an upstream stream failure', async () =>
     qoder: 'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n',
     workbuddy: 'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n',
   }
+  const FAILURE = {
+    trae: 'event: error\ndata: {"code":5001,"message":"UPSTREAM_ECHO_SENTINEL_user prompt excerpt"}\n\n',
+    qoder: 'data: {"code":105,"message":"UPSTREAM_ECHO_SENTINEL_user prompt excerpt"}\n\n',
+  }
   const TRAE_ROSTER = { config_info_list: [{ config_name: 'fixture-model', display_config: { display_name: 'Fixture' } }] }
   const QODER_ROSTER = { chat: [{ key: 'fixture-model', display_name: 'Fixture', enable: true }] }
   const traeCredential = {
@@ -845,11 +851,12 @@ test('a caller hang-up is not logged as an upstream stream failure', async () =>
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify(document))
   })
-  /** Streams until the caller goes away, unless `fails` makes it fall over. */
-  const upstream = (wire, fails) => createServer((req, res) => {
+  /** Streams until the caller goes away, unless the test ends or fails it. */
+  const upstream = (wire, ending, source) => createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream' })
     res.write(wire)
-    if (fails) { setTimeout(() => { try { res.socket.destroy() } catch { /* already gone */ } }, 60); return }
+    if (ending === 'transport-failure') { setTimeout(() => { try { res.socket.destroy() } catch { /* already gone */ } }, 60); return }
+    if (ending === 'quoted-failure') { setTimeout(() => res.end(FAILURE[source]), 60); return }
     const keep = setInterval(() => { try { res.write(': keep-alive\n\n') } catch { clearInterval(keep) } }, 50)
     res.on('close', () => clearInterval(keep))
   })
@@ -894,10 +901,10 @@ test('a caller hang-up is not logged as an upstream stream failure', async () =>
   }
 
   /** Run one turn against a real gateway; return the warnings it wrote. */
-  const run = async (source, fails) => {
+  const run = async (source, ending) => {
     const lines = []
     const logger = { info() {}, warn: (...args) => lines.push(args.map(String).join(' ')) }
-    const stream = upstream(OPENING[source], fails)
+    const stream = upstream(OPENING[source], ending, source)
     const streamPort = await listen(stream)
     const roster = answers(source === 'trae' ? TRAE_ROSTER : QODER_ROSTER)
     const rosterPort = await listen(roster)
@@ -912,7 +919,7 @@ test('a caller hang-up is not logged as an upstream stream failure', async () =>
         : createWorkBuddyShim({ pool: poolFixture(), client: shimClient(streamPort), catalog: catalogFixture, logger })
     try {
       await gateway.ready
-      if (fails) {
+      if (ending !== 'hang-up') {
         // Read to completion: no hang-up here, the upstream itself falls over.
         const response = await fetch(`http://127.0.0.1:${gateway.port()}/v1/chat/completions`, {
           method: 'POST',
@@ -933,8 +940,14 @@ test('a caller hang-up is not logged as an upstream stream failure', async () =>
   }
 
   for (const source of ['trae', 'qoder', 'workbuddy']) {
-    assert.deepEqual(await run(source, false), [], `${source}: a hang-up must not be logged as an upstream failure`)
-    assert.ok((await run(source, true)).length > 0, `${source}: a genuine upstream failure must still warn`)
+    assert.deepEqual(await run(source, 'hang-up'), [], `${source}: a hang-up must not be logged as an upstream failure`)
+    assert.ok((await run(source, 'transport-failure')).length > 0, `${source}: a genuine transport failure must still warn`)
+    if (source !== 'workbuddy') {
+      const warnings = await run(source, 'quoted-failure')
+      assert.equal(warnings.some((line) => line.includes('UPSTREAM_ECHO_SENTINEL')), false,
+        `${source}: upstream failure text must not be written to the host log`)
+      assert.equal(warnings.length, 1, `${source}: a mid-flight failure must still warn once`)
+    }
   }
 })
 

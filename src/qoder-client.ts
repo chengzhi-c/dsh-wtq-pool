@@ -1086,6 +1086,7 @@ export class QoderUpstreamClient {
     }
     if (!response.ok) {
       const text = await readErrorBody(response, 300, options.signal)
+      deadline.abort()
       return {
         ok: false,
         status: response.status,
@@ -1100,7 +1101,7 @@ export class QoderUpstreamClient {
       ok: true,
       response: response.body === null
         ? response
-        : new Response(withIdleWatchdog(response.body, options.timeouts?.idleMs, options.signal), {
+        : new Response(withIdleWatchdog(response.body, options.timeouts?.idleMs, options.signal, deadline.abort), {
           status: response.status,
           headers: response.headers,
         }),

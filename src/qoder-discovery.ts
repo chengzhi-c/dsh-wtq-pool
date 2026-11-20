@@ -138,4 +138,19 @@ export function decryptQoderOscrypt(blob: Buffer, key: Buffer): string | undefin
   }
 }
 
+/** Chromium's macOS OSCrypt uses a fixed IV of sixteen ASCII spaces. */
+const MAC_OSCRYPT_IV = Buffer.alloc(16, 0x20)
+
+/** A macOS `v10` blob stores the prefix followed by AES-CBC ciphertext. */
+export function decryptQoderOscryptMac(blob: Buffer, key: Buffer): string | undefined {
+  if (blob.length < 3 + 16) return undefined
+  if (blob.subarray(0, 3).toString('latin1') !== 'v10') return undefined
+  try {
+    const decipher = createDecipheriv('aes-128-cbc', key, MAC_OSCRYPT_IV)
+    return Buffer.concat([decipher.update(blob.subarray(3)), decipher.final()]).toString('utf8')
+  } catch {
+    return undefined
+  }
+}
+
 

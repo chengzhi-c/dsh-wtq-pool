@@ -1361,13 +1361,14 @@ function sameDirs(a: readonly string[], b: readonly string[]): boolean {
  * throws, so the writer leaves the file alone instead of saving an empty one
  * over every sign-in it still holds.
  */
-async function readArchivedCredentials(file: string): Promise<Map<string, WorkBuddyCredential>> {
-  const stored = new Map<string, WorkBuddyCredential>()
+async function readArchivedCredentials(file: string): Promise<{ stored: Map<string, WorkBuddyCredential>, pruned: boolean }> {
+  const result = { stored: new Map<string, WorkBuddyCredential>(), pruned: false }
+  const { stored } = result
   let text: string
   try {
     text = await readFile(file, 'utf8')
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return stored
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return result
     throw error
   }
   let parsed: unknown
@@ -1376,9 +1377,9 @@ async function readArchivedCredentials(file: string): Promise<Map<string, WorkBu
   } catch {
     throw new Error('credential archive is not valid JSON')
   }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return stored
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return result
   const entries = (parsed as { entries?: unknown }).entries
-  if (!Array.isArray(entries)) return stored
+  if (!Array.isArray(entries)) return result
   const horizon = Date.now() - ARCHIVE_RETENTION_MS
   for (const entry of entries) {
     if (typeof entry !== 'object' || entry === null) continue
@@ -1398,7 +1399,10 @@ async function readArchivedCredentials(file: string): Promise<Map<string, WorkBu
     // 1970. Treating it as one dropped every credential without a stated expiry,
     // which is precisely the kind it is unsafe to drop: nothing else holds a copy.
     const lastUsable = Math.max(expiresAt, refreshExpiresAt)
-    if (lastUsable > 0 && lastUsable < horizon) continue
+    if (lastUsable > 0 && lastUsable < horizon) {
+      result.pruned = true
+      continue
+    }
     stored.set(record['id'], {
       accessToken: record['accessToken'],
       refreshToken: typeof record['refreshToken'] === 'string' ? record['refreshToken'] : '',
@@ -1413,7 +1417,7 @@ async function readArchivedCredentials(file: string): Promise<Map<string, WorkBu
       sourcePath: typeof record['sourcePath'] === 'string' ? record['sourcePath'] : '',
     })
   }
-  return stored
+  return result
 }
 
 /** How old a leftover write temp must be before another writer removes it. */
@@ -2051,51 +2055,43 @@ export class WorkBuddyAccountPool {
       replaced = tombstone === undefined
         || !tombstoneBlocks({ record: tombstone, current: true }, deletingCredential)
     }
-    const onDisk = await readCredential(ownedPath)
-    if (!replaced) {
-      replaced = onDisk.kind === 'sealed'
-        || onDisk.kind === 'unreadable'
-        || (onDisk.kind === 'credential'
-          && (workbuddyAccountId(onDisk.credential) !== account.id
-            || !sameCredential(onDisk.credential)))
+    // Share the writer's queue from the identity check through the unlink:
+    // a re-login must not replace the old document between those two acts.
+    try {
+      await withSignInWriteLock(ownedPath, async () => {
+        const onDisk = await readCredential(ownedPath)
+        if (!replaced) {
+          replaced = onDisk.kind === 'sealed'
+            || onDisk.kind === 'unreadable'
+            || (onDisk.kind === 'credential'
+              && (workbuddyAccountId(onDisk.credential) !== account.id
+                || !sameCredential(onDisk.credential)))
+        }
+        if (replaced) return
+        try {
+          const tombstoneFile = this.deletedSignInsFile()
+          if (tombstoneFile === undefined) await unlink(ownedPath)
+          else await withFileLock(`${tombstoneFile}.lock`, async () => { await unlink(ownedPath) })
+        } catch (error: unknown) {
+          // A committed unlink stays successful if only its lock release fails.
+          if (!(error instanceof FileLockReleaseError) && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
+        // A renewal interrupted before its rename also leaves a token here.
+        await removeAbandonedTemps(ownedPath, 0)
+      })
+    } catch (error: unknown) {
+      // A failed delete must leave the live account visible after a rescan.
+      await fail()
+      this.rosterRevision += 1
+      await this.rescan().catch((rescanError: unknown) => {
+        this.logger?.warn?.(`${LOG_PREFIX}: could not restore the roster after a failed delete: ${String(rescanError)}`)
+      })
+      throw error
     }
     if (replaced) {
       await fail()
       return false
     }
-    // Already gone is success: the point is that no sign-in is left, and a
-    // second delete must not read as a failure. The unlink runs under the same
-    // tombstone lock a renewal takes, so a rotation in flight either lands
-    // before this remove or is refused after it; without that, its rename
-    // landed past the unlink and recreated the file with a token newer than the
-    // tombstone, which `endsTombstone` read as a re-login.
-    try {
-      const tombstoneFile = this.deletedSignInsFile()
-      if (tombstoneFile === undefined) await unlink(ownedPath)
-      else await withFileLock(`${tombstoneFile}.lock`, async () => { await unlink(ownedPath) })
-    } catch (error: unknown) {
-      const code = (error as NodeJS.ErrnoException).code
-      // The unlink itself ran and only the lock file could not be removed.
-      // Rolling the tombstone back here treated a successful delete as a
-      // failure, and the archive then brought the account back.
-      if (!(error instanceof FileLockReleaseError) && code !== 'ENOENT') {
-        // The file is still there, so the delete failed and the row has to stay.
-        // Keeping the tombstone wrote it anyway: the next scan would hide the
-        // account while the panel had just reported the delete as failed, and the
-        // file left behind would bring it back once the tombstone was gone.
-        await fail()
-        this.rosterRevision += 1
-        await this.rescan().catch((rescanError: unknown) => {
-          this.logger?.warn?.(`${LOG_PREFIX}: could not restore the roster after a failed delete: ${String(rescanError)}`)
-        })
-        throw error
-      }
-    }
-    // A renewal interrupted between write and rename leaves a full token in a
-    // temp file beside the sign-in; deleting the sign-in has to take it too.
-    // No age floor here: the account is going away, so even a write still in
-    // flight must not leave its token on disk.
-    await removeAbandonedTemps(ownedPath, 0)
     // Any scan that passed the tombstone read before the unlink still holds the
     // account being removed. Retire it at the successful commit boundary.
     this.rosterRevision += 1
@@ -2495,8 +2491,8 @@ export class WorkBuddyAccountPool {
     if (file === undefined) return
     const run = this.archiveQueue.then(async () => {
       await withFileLock(`${file}.lock`, async () => {
-        const stored = await readArchivedCredentials(file)
-        let dropped = false
+        const { stored, pruned } = await readArchivedCredentials(file)
+        let dropped = pruned
         for (const id of ids) dropped = stored.delete(id) || dropped
         if (!dropped) return
         await writeArchivedCredentials(file, stored)
@@ -2601,7 +2597,7 @@ export class WorkBuddyAccountPool {
     const run = this.archiveQueue.then(async () => {
       await withFileLock(`${file}.lock`, async () => {
         if (signal?.aborted) return
-        const stored = await readArchivedCredentials(file)
+        const { stored, pruned } = await readArchivedCredentials(file)
         if (signal?.aborted) return
         // A scan that read the pool before a delete can reach this write after
         // it. The delete's tombstone is already on disk by then, so re-read it
@@ -2613,7 +2609,7 @@ export class WorkBuddyAccountPool {
         // Unknown is not empty: an unreadable tombstone may name this
         // credential, so skip the write rather than risk a resurrection.
         if (tombstones === undefined) return
-        let changed = false
+        let changed = pruned
         for (const credential of credentials) {
           const id = workbuddyAccountId(credential)
           const entry = tombstoneOf(tombstones, credential, id)
@@ -2648,20 +2644,22 @@ export class WorkBuddyAccountPool {
   }
 
   /** Credentials the archive kept for a directory this walk can read. */
-  private async archivedCredentials(homes: ReadonlySet<string>): Promise<WorkBuddyCredential[]> {
+  private async archivedCredentials(homes: ReadonlySet<string>, signal?: AbortSignal): Promise<WorkBuddyCredential[]> {
     const file = this.archiveFile()
     if (file === undefined) return []
+    let stored = new Map<string, WorkBuddyCredential>()
     try {
-      let stored = new Map<string, WorkBuddyCredential>()
       await withFileLock(`${file}.lock`, async () => {
+        if (signal?.aborted) return
         await removeAbandonedTemps(file)
-        stored = await readArchivedCredentials(file)
+        const archive = await readArchivedCredentials(file)
+        stored = archive.stored
+        if (archive.pruned) await writeArchivedCredentials(file, stored, signal)
       })
-      return [...stored.values()].filter(credential => homes.has(this.homeOf(credential)))
     } catch (error: unknown) {
-      this.logger?.warn?.(`${LOG_PREFIX}: could not read the credential archive: ${String(error)}`)
-      return []
+      if (!signal?.aborted) this.logger?.warn?.(`${LOG_PREFIX}: could not read or prune the credential archive: ${String(error)}`)
     }
+    return [...stored.values()].filter(credential => homes.has(this.homeOf(credential)))
   }
 
   /** The auth directory a credential was read from. */
@@ -2888,7 +2886,7 @@ export class WorkBuddyAccountPool {
         refreshBlockedIds.add(account.id)
       }
     }
-    const archived = await this.archivedCredentials(readableDirs)
+    const archived = await this.archivedCredentials(readableDirs, signal)
     if (signal.aborted || rosterRevision !== this.rosterRevision) return this.accounts
     for (const credential of archived) {
       const id = workbuddyAccountId(credential)

@@ -275,6 +275,7 @@ export function withIdleWatchdog(
   body: ReadableStream<Uint8Array>,
   idleMs: number = STREAM_IDLE_TIMEOUT_MS,
   signal?: AbortSignal,
+  abortTransport?: (reason?: unknown) => void,
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader()
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -296,6 +297,7 @@ export function withIdleWatchdog(
   const stop = (reason: Error): void => {
     if (idle !== undefined) return
     idle = reason
+    abortTransport?.(reason)
     void reader.cancel(reason).catch(() => {})
     disarm()
     // Detached as well as on the terminal paths: once the read is cancelled
@@ -353,6 +355,9 @@ export function withIdleWatchdog(
     },
     cancel(reason) {
       finish()
+      // A host-held Response clone keeps tee cancellation pending until the
+      // transport itself ends, so cancel the fetch as well as this branch.
+      abortTransport?.(reason)
       return reader.cancel(reason)
     },
   })
@@ -379,7 +384,7 @@ export function withIdleWatchdog(
 export function headersDeadline(
   caller: AbortSignal | undefined,
   ms: number,
-): { signal: AbortSignal; arrived: () => void } {
+): { signal: AbortSignal; arrived: () => void; abort: (reason?: unknown) => void } {
   const controller = new AbortController()
   const onCallerAbort = (): void => controller.abort(caller?.reason)
   // A caller that hung up before this was built has already said everything:
@@ -393,6 +398,7 @@ export function headersDeadline(
   timer.unref?.()
   return {
     signal: controller.signal,
+    abort: reason => controller.abort(reason),
     arrived: () => {
       clearTimeout(timer)
       // Detached as well as disarmed: one listener is added per call, and a
@@ -1470,7 +1476,7 @@ export class WorkBuddyUpstreamClient {
         // Response built around a stream this plugin made stops delivering to a
         // `Readable.fromWeb` reader after the first chunks, so the gateway pumps
         // this stream directly instead.
-        const relayed = withIdleWatchdog(response.body, timeouts?.idleMs, signal)
+        const relayed = withIdleWatchdog(response.body, timeouts?.idleMs, signal, deadline.abort)
         return {
           ok: true,
           response: withRelayStream(new Response(relayed, {
@@ -1480,6 +1486,7 @@ export class WorkBuddyUpstreamClient {
         }
       }
       const text = (await readErrorBody(response, ERROR_BODY_LIMIT, signal))
+      deadline.abort()
       const retryAfter = retryAfterSeconds(response.headers)
       if (attempt === 0 && response.status === 400 && isChannelCheckText(text)) {
         const folded = foldSystemIntoUser(body)

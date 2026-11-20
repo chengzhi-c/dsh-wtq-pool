@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Demo data for the panel preview page (docs/index.html).
  *
  * Synthetic only - accounts, credits and model ids here are illustrative and

@@ -99,7 +99,6 @@ export type TraeUpstreamErrorKind =
   | 'not_found'
   | 'server'
   | 'client'
-  | 'unconfigured'
   | 'aborted'
   // A 200 that ended before a single frame: the sign-in answered nothing, which
   // says nothing about the accounts behind it. Separate from `server` because
@@ -296,7 +295,6 @@ function traeIdentityHeaders(identity: TraeIdentity): Record<string, string> {
     ...identity.deviceCpu === undefined ? {} : { 'x-device-cpu': identity.deviceCpu },
     ...identity.osVersion === undefined ? {} : { 'x-os-version': identity.osVersion },
     ...identity.appVersion === undefined ? {} : { 'x-app-version': identity.appVersion, 'x-ide-version': identity.appVersion },
-    ...identity.buildVersion === undefined ? {} : { 'x-app-version-code': identity.buildVersion, 'x-ide-version-code': identity.buildVersion },
     'x-ide-version-type': 'stable',
   }
 }
@@ -308,16 +306,15 @@ function traeIdentityHeaders(identity: TraeIdentity): Record<string, string> {
 function buildTraeHeaders(
   credential: TraeCredential,
   identity: TraeIdentity,
-  options: { appId?: string; requestId?: string } = {},
 ): Record<string, string> {
-  const requestId = options.requestId ?? randomUUID()
+  const requestId = randomUUID()
   const traceId = requestId.replaceAll('-', '').slice(0, 32)
   return {
     'Authorization': `Cloud-IDE-JWT ${credential.accessToken}`,
     'X-Ide-Token': credential.accessToken,
     'x-plugin-channel': 'icube-ai',
     'User-Agent': `Trae/${identity.appVersion ?? identity.buildVersion ?? 'unknown'}`,
-    'x-app-id': options.appId ?? '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8',
+    'x-app-id': '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8',
     ...traeIdentityHeaders(identity),
     // The upstream binds these as numbers; a dotted build string is rejected.
     'x-app-version-code': normalizeTraeVersionCode(identity.buildVersion),
@@ -1184,7 +1181,7 @@ export class TraeSoloUpstreamClient {
         ok: true,
         response: response.body === null
           ? response
-          : new Response(withIdleWatchdog(response.body, timeouts?.idleMs, signal), {
+          : new Response(withIdleWatchdog(response.body, timeouts?.idleMs, signal, deadline.abort), {
             status: response.status,
             headers: response.headers,
           }),
@@ -1197,6 +1194,7 @@ export class TraeSoloUpstreamClient {
     // message, which are exactly what the failover needs to choose another
     // account.
     const text = (await readErrorBody(response, 1024, signal))
+    deadline.abort()
     return {
       ok: false,
       status: response.status,

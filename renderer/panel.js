@@ -29,6 +29,9 @@ var EN = {
   "tab.models": "Models",
   "tab.check": "Connection check",
   "tab.growth": "Growth centre",
+  "tabs.sources": "Account source",
+  "tabs.views": "Plugin views",
+  "tabs.regions": "Account region",
   "risk.note": "Unofficial clients may trigger account restrictions. Follow each vendor's terms of service.",
   "host.missing": "The host has not registered {count} model group(s) from this plugin yet: reload the plugin.",
   "btn.rescan": "Detect accounts again",
@@ -317,6 +320,9 @@ var ZH = {
   "tab.models": "模型",
   "tab.check": "连接检查",
   "tab.growth": "成长中心",
+  "tabs.sources": "账号来源",
+  "tabs.views": "插件页面",
+  "tabs.regions": "账号区域",
   "risk.note": "非官方客户端可能触发账号风控，请遵守厂商服务条款。",
   "host.missing": "宿主还没有注册本插件的 {count} 个模型组：重新加载插件。",
   "btn.rescan": "重新检测账号",
@@ -956,7 +962,7 @@ function renderSourceTabs() {
   for (var i = 0; i < tabs.length; i += 1) {
     var on = tabs[i].getAttribute("data-source") === activeSource;
     tabs[i].classList.toggle("active", on);
-    tabs[i].setAttribute("aria-selected", on ? "true" : "false");
+    tabs[i].setAttribute("aria-pressed", on ? "true" : "false");
   }
   var groups = document.querySelectorAll("#poolView .source-group");
   for (var j = 0; j < groups.length; j += 1) {
@@ -1057,15 +1063,14 @@ function sourceFoot(source) {
  */
 function fillRegionNav(nav, source, regions, accounts, active) {
   clear(nav);
+  nav.setAttribute("role", "group");
+  nav.setAttribute("aria-label", t("tabs.regions"));
   regions.forEach(function (region) {
     var on = region === active;
     var button = el("button", on ? "active" : "");
     button.type = "button";
     button.disabled = busy !== null;
-    button.setAttribute("role", "tab");
-    // A `tab` without `aria-selected` is invalid ARIA, and it is what a screen
-    // reader reads to say which one is current.
-    button.setAttribute("aria-selected", on ? "true" : "false");
+    button.setAttribute("aria-pressed", on ? "true" : "false");
     button.textContent = sourceRegionLabel(region);
     if (regionParked(source, region)) button.appendChild(el("span", "muted", " " + t("region.parkedShort")));
     var count = accounts.filter(function (account) { return account.region === region; }).length;
@@ -1081,7 +1086,7 @@ function fillRegionNav(nav, source, regions, accounts, active) {
 
 /** A fresh region row for a page that is rebuilt on every render. */
 function sourceRegionNav(source, regions, accounts) {
-  return fillRegionNav(el("nav", "regions"), source, regions, accounts, activeRegionOf(source));
+  return fillRegionNav(el("div", "regions"), source, regions, accounts, activeRegionOf(source));
 }
 
 /**
@@ -1811,9 +1816,11 @@ function renderAutoCheckin() {
   // render the panel had ever drawn. The handler reads the hours field when it
   // runs, so binding it once in `bind` is enough.
   var run = $("autoRunNow");
-  run.textContent = busy === "checkin" ? t("auto.running") : t("auto.runNow");
+  var pending = auto.last !== undefined && auto.last !== null && auto.last.pending === true;
+  var passRunning = state !== null && state.growth !== undefined && state.growth !== null && state.growth.running === true;
+  run.textContent = busy === "checkin" || pending || passRunning ? t("auto.running") : t("auto.runNow");
   run.title = t("auto.runNowHint");
-  run.disabled = busy !== null || checkinBusy !== null;
+  run.disabled = busy !== null || checkinBusy !== null || pending || passRunning;
 
   // The keep-alive row: one button, run by hand. It is a static node, so the
   // handler lives in `bind`. Its own card, its own log: it renews tokens rather
@@ -2023,6 +2030,8 @@ function renderGrowth() {
   run.textContent = busy === "growth" ? t("growth.running") : t("growth.run");
   run.title = t("growth.runHint");
   run.disabled = busy !== null || running;
+  if (running) pollGrowthRun();
+  else stopGrowthPoll();
   $("growthText").textContent = growthStateText();
   paintGrowthAccounts($("growthAccounts"));
   $("growthHint").textContent = t("growth.hint");
@@ -2258,6 +2267,7 @@ function readGrowth() {
 /** Run the growth centre on its own. */
 function runGrowth() {
   if (busy !== null) return Promise.resolve();
+  growthPollFailures = 0;
   return runBusy("growth", function () {
     return invoke("xd.growthRun").then(function (payload) {
       // The run answers with the document beside its own counts, and this card
@@ -4201,6 +4211,65 @@ function stopCheckinPoll() {
   }
 }
 
+var growthPoll = null;
+var GROWTH_POLL_MS = CHECKIN_POLL_MS;
+var GROWTH_POLL_MAX_FAILURES = CHECKIN_POLL_MAX_FAILURES;
+var growthPollFailures = 0;
+
+function stopGrowthPoll() {
+  if (growthPoll !== null) {
+    window.clearTimeout(growthPoll);
+    growthPoll = null;
+  }
+}
+
+/**
+ * Keep asking for the document while a growth pass is still running.
+ *
+ * The host answers "run now" after its budget even when the pass continues and
+ * leaves `growth.running` set. Without this watch the card's button stayed
+ * disabled after that answer, so once the pass landed there was no way to start
+ * another one.
+ */
+function pollGrowthRun() {
+  if (!state || !state.growth || state.growth.running !== true || !pageIsVisible()) {
+    stopGrowthPoll();
+    return;
+  }
+  // A pending check-in pass already has `pollCheckinLog` asking for the same
+  // document, and that watch clears once the pass lands.
+  if (state.autoCheckin && state.autoCheckin.last && state.autoCheckin.last.pending === true) {
+    stopGrowthPoll();
+    return;
+  }
+  if (busy !== null) { stopGrowthPoll(); return; }
+  if (growthPoll !== null) return;
+  growthPoll = window.setTimeout(function () {
+    growthPoll = null;
+    var revision = stateRevision;
+    invoke("xd.state").then(function (again) {
+      if (revision !== stateRevision) { pollGrowthRun(); return; }
+      if (busy !== null) { stopGrowthPoll(); return; }
+      var wasRunning = state && state.growth && state.growth.running === true;
+      adopt(again);
+      growthPollFailures = 0;
+      render();
+      if (wasRunning && !(again && again.growth && again.growth.running === true)
+        && activeTab === "growth" && growthStale()) {
+        readGrowth();
+      }
+    }).catch(function () {
+      growthPollFailures += 1;
+      if (growthPollFailures < GROWTH_POLL_MAX_FAILURES) { pollGrowthRun(); return; }
+      stopGrowthPoll();
+      if (state && state.growth && state.growth.running === true) {
+        adopt(Object.assign({}, state, { growth: Object.assign({}, state.growth, { running: false }) }));
+        render();
+      }
+    });
+  }, GROWTH_POLL_MS);
+}
+
 /**
  * Whether this page is worth polling for.
  *
@@ -4644,6 +4713,7 @@ function selectTab(name) {
     var isActive = tabs[i].getAttribute("data-tab") === name;
     tabs[i].className = isActive ? "subtab active" : "subtab";
     tabs[i].setAttribute("aria-selected", isActive ? "true" : "false");
+    tabs[i].tabIndex = isActive ? 0 : -1;
   }
   // Each page starts at its own top. Carrying the previous page's offset over
   // landed the user mid-roster after leaving the pool scrolled to its third
@@ -4665,7 +4735,28 @@ function selectTab(name) {
     && !(state && state.growth && state.growth.running === true)) readGrowth();
 }
 
+/** Move focus inside a tablist without changing the selected view. */
+function moveTabFocus(list, current, key) {
+  var tabs = Array.prototype.filter.call(list.querySelectorAll('[role="tab"]'), function (tab) {
+    return !tab.hidden && !tab.disabled;
+  });
+  var index = tabs.indexOf(current);
+  if (index < 0 || tabs.length < 2) return false;
+  var targetIndex;
+  if (key === "ArrowRight") targetIndex = (index + 1) % tabs.length;
+  else if (key === "ArrowLeft") targetIndex = (index + tabs.length - 1) % tabs.length;
+  else if (key === "Home") targetIndex = 0;
+  else if (key === "End") targetIndex = tabs.length - 1;
+  else return false;
+  current.tabIndex = -1;
+  tabs[targetIndex].tabIndex = 0;
+  tabs[targetIndex].focus();
+  return true;
+}
+
 function labelTabs() {
+  $("sourceTabs").setAttribute("aria-label", t("tabs.sources"));
+  $("viewTabs").setAttribute("aria-label", t("tabs.views"));
   var tabs = document.querySelectorAll("#viewTabs .subtab");
   for (var i = 0; i < tabs.length; i += 1) {
     var key = tabs[i].getAttribute("data-tab");
@@ -4690,11 +4781,15 @@ function bind() {
   // A hidden page stops polling; showing it again re-arms whatever the current
   // document says is still running.
   document.addEventListener("visibilitychange", function () {
-    if (!pageIsVisible()) { stopPolling(); stopCheckinPoll(); return; }
+    if (!pageIsVisible()) { stopPolling(); stopCheckinPoll(); stopGrowthPoll(); return; }
     if (state && state.refreshing === true) adoptAndMaybePoll(state, 0);
     else if (state && state.autoCheckin && state.autoCheckin.last && state.autoCheckin.last.pending === true) {
       checkinPollFailures = 0;
       pollCheckinLog(0);
+    }
+    if (state && state.growth && state.growth.running === true) {
+      growthPollFailures = 0;
+      pollGrowthRun();
     }
   });
   $("refreshBtn").addEventListener("click", refresh);
@@ -4768,8 +4863,19 @@ function bind() {
   for (var i = 0; i < viewTabs.length; i += 1) {
     (function (button) {
       button.addEventListener("click", function () { selectTab(button.getAttribute("data-tab")); });
+      button.addEventListener("keydown", function (event) {
+        if (moveTabFocus($('viewTabs'), button, event.key)) event.preventDefault();
+      });
     })(viewTabs[i]);
   }
+  var viewTabList = $("viewTabs");
+  viewTabList.addEventListener("focusout", function (event) {
+    if (viewTabList.contains(event.relatedTarget)) return;
+    var tabs = viewTabList.querySelectorAll('[role="tab"]');
+    for (var i = 0; i < tabs.length; i += 1) {
+      tabs[i].tabIndex = tabs[i].getAttribute("aria-selected") === "true" ? 0 : -1;
+    }
+  });
 
   // A source tab owns both the pool page and the models page, so switching it
   // re-renders whichever of the two is on screen.

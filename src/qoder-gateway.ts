@@ -175,7 +175,6 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       return cachedModels
     })
     if (watcher.signal.aborted) return
-    if (roster.length === 0) roster = cachedModels
     if (roster.length === 0) {
       writeOpenAIError(res, 503, 'upstream_unavailable', reason)
       return
@@ -230,7 +229,7 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       try {
         relayed = await openQoderResponse(result.response, model, {
           onFailure: (error: unknown) => {
-            logger?.warn?.(LOG_PREFIX + ': qoder relay stream failed mid-flight', error)
+            logger?.warn?.(LOG_PREFIX + ': qoder relay stream failed mid-flight', error instanceof Error ? error.name : 'unknown error')
             // A sign-in that dies mid-turn has already proved it cannot serve,
             // and the hold below is the only thing that keeps the next request
             // from paying the same round trip on it. A caller hang-up is not the
@@ -341,10 +340,6 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       return
     }
     const relayed = opened.relayed
-    if (relayed.body === null) {
-      writeOpenAIError(res, 502, 'upstream_error', 'Qoder returned no stream')
-      return
-    }
     // The peek can take seconds on a slow first token; a caller who stopped
     // waiting in that window still has a response object that reports writable.
     // Cancel the bridge too: its push loop is parked on this stream's queue and
@@ -374,7 +369,7 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       // one warning per cancelled turn buried everything worth reading.
       const aborted = watcher.signal.aborted || (error instanceof Error && error.name === 'AbortError')
       if (!aborted) {
-        logger?.warn?.(LOG_PREFIX + ': qoder relay stream failed mid-flight', error)
+        logger?.warn?.(LOG_PREFIX + ': qoder relay stream failed mid-flight', error instanceof Error ? error.name : 'unknown error')
       }
       if (res.writable) res.end()
     })

@@ -978,11 +978,11 @@ function saveCheckinSlots() {
   try {
     // The host normally creates this directory; without this the slots would
     // silently never persist on a data path it did not make.
-    fs.mkdirSync(dataPath, { recursive: true });
+    fs.mkdirSync(dataPath, { recursive: true, mode: 0o700 });
     // Written beside its target and renamed, like the declaration: a process
     // killed mid-write leaves the previous file whole rather than a truncated
     // one that reads as a day with no entries.
-    fs.writeFileSync(staging, JSON.stringify(byDay), "utf8");
+    fs.writeFileSync(staging, JSON.stringify(byDay), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(staging, target);
   } catch (error) {
     // A write that failed halfway leaves the staging file behind, and nothing
@@ -3941,6 +3941,35 @@ async function statusDocument(options) {
     }
   }
 
+  // Both sources report on the same shape: their own region pair, accounts,
+  // account pick and published roster. The panel reads either row the same way.
+  const sourceDocument = (source: "trae" | "qoder") => {
+    const sourceRegions = source === "trae" ? activeTraeRegions : activeQoderRegions;
+    const accounts = source === "trae" ? traeAccountRows : qoderAccountRows;
+    const gateways = source === "trae" ? traeGateways : qoderGateways;
+    const declarationModels = source === "trae" ? traeDeclarationModels : qoderDeclarationModels;
+    const nativeOf = source === "trae" ? traeNativeOf : qoderNativeOf;
+    return {
+      regions: sourceRegions(),
+      distribution: sourceDistribution(source),
+      accounts,
+      preferred: sourcePreferredMap(source),
+      gateways: Array.from(gateways.values()).map((entry) => ({
+        region: entry.region,
+        port: entry.gateway.port(),
+        models: declarationModels(entry.region).length,
+        portFallback: entry.portFallback,
+        preferredPort: entry.preferredPort,
+        lastError: entry.lastError,
+        // Roster and selection come from one pass, and the selection is the one
+        // the gateway really publishes rather than the raw stored value: after a
+        // catalog rename the two used to disagree, so the panel showed every
+        // model unticked while the gateway served all of them.
+        ...sourcePublishedModels(source + ":" + entry.region, entry.gateway.models(), nativeOf),
+      })),
+    };
+  };
+
   // Only active gateways are offered: a source switched off removes its tabs
   // instead of showing an empty tab that can never fill.
   return {
@@ -3949,50 +3978,10 @@ async function statusDocument(options) {
     // Which regions the user parked, so the panel can still show them (and let
     // them be switched back on) after they leave `regions` above.
     disabledRegions: disabledRegionKeys(),
-    // Trae's gateways report separately: its regions are a different pair, and
-    // its accounts are not part of the WorkBuddy pool the tabs above drive.
-    trae: {
-      regions: activeTraeRegions(),
-      distribution: sourceDistribution("trae"),
-      accounts: traeAccountRows,
-      // One map per source, keyed by region: the panel's "which account serves
-      // this region" picker reads it straight back, so a pick survives the next
-      // document instead of snapping back to automatic.
-      preferred: sourcePreferredMap("trae"),
-      gateways: Array.from(traeGateways.values()).map((entry) => ({
-        region: entry.region,
-        port: entry.gateway.port(),
-        models: traeDeclarationModels(entry.region).length,
-        portFallback: entry.portFallback,
-        preferredPort: entry.preferredPort,
-        lastError: entry.lastError,
-        // Roster and selection come from one pass, and the selection is the one
-        // the gateway really publishes rather than the raw stored value: after a
-        // catalog rename the two used to disagree, so the panel showed every
-        // model unticked while the gateway served all of them.
-        ...sourcePublishedModels("trae:" + entry.region, entry.gateway.models(), traeNativeOf),
-      })),
-    },
-    // Qoder's gateways report beside Trae's on the same terms: its regions are
-    // the WorkBuddy pair, and its accounts are not part of the pool either.
-    qoder: {
-      regions: activeQoderRegions(),
-      distribution: sourceDistribution("qoder"),
-      accounts: qoderAccountRows,
-      preferred: sourcePreferredMap("qoder"),
-      gateways: Array.from(qoderGateways.values()).map((entry) => ({
-        region: entry.region,
-        port: entry.gateway.port(),
-        models: qoderDeclarationModels(entry.region).length,
-        portFallback: entry.portFallback,
-        preferredPort: entry.preferredPort,
-        // The panel reads this for Qoder exactly as it does for Trae, so an
-        // unreachable directory has to reach the card here too, not only on the
-        // other source.
-        lastError: entry.lastError,
-        ...sourcePublishedModels("qoder:" + entry.region, entry.gateway.models(), qoderNativeOf),
-      })),
-    },
+    // Each source reports beside the WorkBuddy tabs: its own regions, accounts
+    // and published roster, never an empty tab that can never fill.
+    trae: sourceDocument("trae"),
+    qoder: sourceDocument("qoder"),
     enabled: settings.enabled !== false,
     // Declared but not yet registered by the host: the panel says how to make
     // the model groups appear instead of letting them be silently missing.
@@ -4165,39 +4154,40 @@ function addressDrift() {
 
 
 /**
- * Trae discovery for the doctor: count only, never token material.
+ * Discovery detail shared by Trae and Qoder.
  *
- * Answers `{ok, detail}` so the finding can carry the verdict instead of
- * hard-coding `true`: a source that could not be read, or that holds no
- * sign-in at all, is a failed check, and the report used to pass it.
+ * Counts and served-model figures only: the report is copyable out of the panel,
+ * so no token material or filesystem path reaches it.
  */
-async function traeDoctorDetail() {
-  if (!sourceEnabled("trae")) return { ok: true, detail: "switched off in plugin settings (deliberate; not a failure)" };
+async function sourceDoctorDetail(spec) {
+  if (!sourceEnabled(spec.source)) return { ok: true, detail: "switched off in plugin settings (deliberate; not a failure)" };
   try {
-    const found = await discoverTraeCredentials();
+    const found = await spec.discover();
+    const failures = found.failures.length > 0 ? `; ${found.failures.length} ${spec.unreadable}` : "";
     if (found.credentials.length === 0) {
-      return { ok: false, detail: "on; no Trae sign-in found (sign in to Trae CN / TRAE SOLO CN, then run the check again)" };
+      return { ok: false, detail: `on; no ${spec.label} sign-in found (${spec.hint})${failures}` };
     }
     const byRegion = {};
     for (const credential of found.credentials) {
-      const region = traeRegionOfCredential(credential);
+      const region = spec.regionOf(credential);
       byRegion[region] = (byRegion[region] || 0) + 1;
     }
     const parts = Object.entries(byRegion).map(([region, count]) => `${region} x${count}`).join(", ");
-    const failures = found.failures.length > 0 ? `; ${found.failures.length} unreadable file(s)` : "";
-    const servedRegions = activeTraeRegions();
+    // What the provider actually publishes, after the user's tick filter: the
+    // doctor has to say serving or not, never a stale "not served yet".
+    const servedRegions = spec.activeRegions();
     const served = servedRegions
-      .map((region) => `${region}: ${traeDeclarationModels(region).length} model(s)`)
+      .map((region) => `${region}: ${spec.declarationModels(region).length} model(s)`)
       .join(", ");
     const stillReading = [];
     const problems = [];
     for (const region of servedRegions) {
-      const entry = traeGateways.get(region);
+      const entry = spec.gateways.get(region);
       if (entry === undefined && !byRegion[region]) {
         problems.push(`${region}: no sign-in for this region`);
       } else if (entry === undefined || entry.warmSettled !== true) {
         stillReading.push(region);
-      } else if (traeDeclarationModels(region).length === 0) {
+      } else if (spec.declarationModels(region).length === 0) {
         problems.push(entry.lastError !== ""
           ? `${region}: ${entry.lastError}`
           : `${region}: no models selected`);
@@ -4216,49 +4206,34 @@ async function traeDoctorDetail() {
   }
 }
 
-/** Qoder credentials for the doctor: count only, never token material. */
-async function qoderDoctorDetail() {
-  if (!sourceEnabled("qoder")) return { ok: true, detail: "switched off in plugin settings (deliberate; not a failure)" };
-  try {
-    const found = await discoverQoderCredentials();
-    if (found.credentials.length === 0) {
-      const failures = found.failures.length > 0 ? `; ${found.failures.length} unreadable app dir(s)` : "";
-      return { ok: false, detail: `on; no Qoder sign-in found (sign in to Qoder, then run the check again)${failures}` };
-    }
-    const byRegion = {};
-    for (const credential of found.credentials) {
-      byRegion[credential.region] = (byRegion[credential.region] || 0) + 1;
-    }
-    const parts = Object.entries(byRegion).map(([region, count]) => `${region} x${count}`).join(", ");
-    const failures = found.failures.length > 0 ? `; ${found.failures.length} unreadable app dir(s)` : "";
-    // Same contract as Trae's: report what is actually served now, not a bare count.
-    const servedRegions = activeQoderRegions();
-    const served = servedRegions
-      .map((region) => `${region}: ${qoderDeclarationModels(region).length} model(s)`)
-      .join(", ");
-    const stillReading = [];
-    const problems = [];
-    for (const region of servedRegions) {
-      const entry = qoderGateways.get(region);
-      if (entry === undefined && !byRegion[region]) {
-        problems.push(`${region}: no sign-in for this region`);
-      } else if (entry === undefined || entry.warmSettled !== true) {
-        stillReading.push(region);
-      } else if (qoderDeclarationModels(region).length === 0) {
-        problems.push(entry.lastError !== ""
-          ? `${region}: ${entry.lastError}`
-          : `${region}: no models selected`);
-      }
-    }
-    return {
-      ok: problems.length === 0,
-      detail: `on; ${found.credentials.length} account(s) (${parts})${failures}; serving ${served}`
-        + (stillReading.length > 0 ? `; still reading models for ${stillReading.join(", ")}` : "")
-        + (problems.length > 0 ? `; ${problems.join("; ")}` : ""),
-    };
-  } catch (error) {
-    return { ok: false, detail: `on; discovery failed (${errorCodeOf(error)})` };
-  }
+/** Trae discovery for the doctor. */
+function traeDoctorDetail() {
+  return sourceDoctorDetail({
+    source: "trae",
+    label: "Trae",
+    hint: "sign in to Trae CN / TRAE SOLO CN, then run the check again",
+    unreadable: "unreadable file(s)",
+    discover: discoverTraeCredentials,
+    regionOf: traeRegionOfCredential,
+    activeRegions: activeTraeRegions,
+    declarationModels: traeDeclarationModels,
+    gateways: traeGateways,
+  });
+}
+
+/** Qoder discovery for the doctor. */
+function qoderDoctorDetail() {
+  return sourceDoctorDetail({
+    source: "qoder",
+    label: "Qoder",
+    hint: "sign in to Qoder, then run the check again",
+    unreadable: "unreadable app dir(s)",
+    discover: discoverQoderCredentials,
+    regionOf: (credential) => credential.region,
+    activeRegions: activeQoderRegions,
+    declarationModels: qoderDeclarationModels,
+    gateways: qoderGateways,
+  });
 }
 
 /** A readable report of everything that has to hold for a chat to reach upstream. */
@@ -5453,35 +5428,8 @@ async function onPanelInvoke(channel, payload) {
      */
     case "xd.composerRefresh": {
       const hit = matchComposerModel(payload);
-      if (hit === undefined) return composerPoints(payload);
-      const { left, settle } = budget(COMPOSER_REFRESH_BUDGET_MS);
-      if (hit.source === "workbuddy") {
-        for (const account of core.pool.list(hit.region)) probeCache.delete(account.id);
-        await settle(statusDocument({ allowNetwork: true, budgetMs: COMPOSER_REFRESH_BUDGET_MS }));
-      } else {
-        const rows = hit.source === "trae" ? traeAccountRows : qoderAccountRows;
-        const found = hit.source === "trae" ? await discoverTraeCredentials() : await discoverQoderCredentials();
-        // One bounded probe per account, and no shared budget, is minutes on a
-        // machine with several sign-ins, so the bound lives here. Past it a row
-        // keeps the figures the popup is already showing; the readout polls on,
-        // so a late probe still lands on the next poll rather than being lost.
-        for (const row of rows) {
-          if (row.region !== hit.region) continue;
-          if (left() === 0) break;
-          const credential = found.credentials.find((item) => {
-            const itemLabel = hit.source === "trae" ? traeRowLabel(item) : qoderRowLabel(item);
-            const itemRegion = hit.source === "trae" ? traeRegionOfCredential(item) : item.region;
-            return itemLabel === row.label && itemRegion === row.region;
-          });
-          if (credential === undefined) continue;
-          // The previous row is the fallback: a failed read keeps the figures the
-          // popup is already showing instead of blanking them.
-          const probe = hit.source === "trae"
-            ? await traeRowProbe(credential, row)
-            : await qoderRowProbe(credential, row);
-          if (probe?.usage) row.usage = probe.usage;
-          if (probe?.checkin) row.checkin = probe.checkin;
-        }
+      if (hit !== undefined) {
+        await settleWithin(composerRefreshWork(hit), COMPOSER_REFRESH_BUDGET_MS);
       }
       return composerPoints(payload);
     }
@@ -5715,6 +5663,33 @@ const GROWTH_BUDGET_MS = 90000;
  * credentials read from turning the click into a client-side timeout.
  */
 const COMPOSER_REFRESH_BUDGET_MS = 15000;
+
+async function composerRefreshWork(hit) {
+  if (hit.source === "workbuddy") {
+    for (const account of core.pool.list(hit.region)) probeCache.delete(account.id);
+    await statusDocument({ allowNetwork: true, budgetMs: COMPOSER_REFRESH_BUDGET_MS });
+    return;
+  }
+  const { left } = budget(COMPOSER_REFRESH_BUDGET_MS);
+  const rows = hit.source === "trae" ? traeAccountRows : qoderAccountRows;
+  const found = hit.source === "trae" ? await discoverTraeCredentials() : await discoverQoderCredentials();
+  for (const row of rows) {
+    if (row.region !== hit.region) continue;
+    if (left() === 0) break;
+    const credential = found.credentials.find((item) => {
+      const itemLabel = hit.source === "trae" ? traeRowLabel(item) : qoderRowLabel(item);
+      const itemRegion = hit.source === "trae" ? traeRegionOfCredential(item) : item.region;
+      return itemLabel === row.label && itemRegion === row.region;
+    });
+    if (credential === undefined) continue;
+    // An in-flight probe still updates the cache after the call budget expires.
+    const probe = hit.source === "trae"
+      ? await traeRowProbe(credential, row)
+      : await qoderRowProbe(credential, row);
+    if (probe?.usage) row.usage = probe.usage;
+    if (probe?.checkin) row.checkin = probe.checkin;
+  }
+}
 
 /**
  * Light one account's growth streak, then redeem every tier it opened.

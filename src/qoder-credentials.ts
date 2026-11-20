@@ -5,11 +5,12 @@
  * whether it is signed in, and hands the token to the caller in memory only.
  * Nothing writes to the Qoder apps' files.
  */
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { pbkdf2Sync } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { QoderRegion, QoderStorageCandidate } from './qoder-discovery'
-import { decryptQoderOscrypt, qoderStorageCandidates } from './qoder-discovery'
+import { decryptQoderOscrypt, decryptQoderOscryptMac, qoderStorageCandidates } from './qoder-discovery'
 import { trustedSystemRootOf, trustedWindowsChildEnv, trustedWindowsPowerShell } from './trusted-process'
 
 /** One Qoder sign-in, token kept in memory only. */
@@ -136,19 +137,19 @@ export async function unwrapQoderOscryptKey(
     } catch { /* an unstatable file is treated as stale */ }
     const cached = oscryptKeyCache.get(localStatePath)
     if (cached !== undefined && cached.mtimeMs === mtimeMs) return Buffer.from(cached.key)
-    const exe = trustedWindowsPowerShell(env)
+    const exe = trustedWindowsPowerShell()
     if (exe === undefined) throw new QoderKeyError('unavailable', 'SystemRoot is not set, cannot locate PowerShell')
     // `spawn` rather than `execFile`, because the blob has to go in on stdin and
     // only the key comes back on stdout.
     const stdout = await new Promise<string>((resolve, reject) => {
       const child = spawn(exe, ['-NoProfile', '-NonInteractive', '-Command', DPAPI_SCRIPT], {
-        env: trustedWindowsChildEnv(env, { inheritTemp: true, includeSystemDrive: true }),
+        env: trustedWindowsChildEnv(env),
         // A writable current directory on the DLL search path is how a planted
         // library reaches an elevated PowerShell. The trusted root is the one
         // that located the executable, not the inherited variable the caller
         // can point anywhere.
         cwd: (() => {
-          const root = trustedSystemRootOf(env)
+          const root = trustedSystemRootOf()
           return root === undefined ? undefined : join(root, 'System32')
         })(),
         windowsHide: true,
@@ -259,6 +260,73 @@ async function firstAuthBlob(paths: readonly string[]): Promise<Buffer | undefin
   return undefined
 }
 
+/** Keychain service names for the current and older Qoder builds. */
+const QODER_KEYCHAIN_SERVICES: Record<QoderRegion, readonly string[]> = {
+  cn: ['Qoder CN App Safe Storage', 'Qoder CN Safe Storage', 'QoderWork CN Safe Storage'],
+  global: ['Qoder App Safe Storage', 'Qoder Safe Storage', 'QoderWork Safe Storage'],
+}
+
+/**
+ * PBKDF2 parameters Chromium's macOS OSCrypt uses to turn the Keychain
+ * password into the 16-byte AES-128 key. Fixed by Chromium, not secret.
+ */
+const MAC_OSCRYPT_SALT = 'saltysalt'
+const MAC_OSCRYPT_ITERATIONS = 1003
+
+/** Derived macOS keys, keyed on the Keychain service they came from. */
+const darwinKeyCache = new Map<string, Buffer>()
+
+/** Pin the system helper and bound the wait for a Keychain prompt. */
+function darwinKeychainPassword(service: string): Promise<string | undefined> {
+  return new Promise(resolve => {
+    execFile('/usr/bin/security', ['find-generic-password', '-s', service, '-w'], { timeout: 8_000 }, (error, stdout) => {
+      resolve(error ? undefined : stdout.trim() || undefined)
+    })
+  })
+}
+
+/** One app directory's credential on macOS, or the reason there is none. */
+async function readQoderCredentialMac(
+  authBlob: Buffer,
+  region: QoderRegion,
+  appDir: string,
+): Promise<{ credential?: QoderCredential; failure?: QoderCredentialFailure }> {
+  const base = { region }
+  let decrypted = false
+  for (const service of QODER_KEYCHAIN_SERVICES[region]) {
+    let key = darwinKeyCache.get(service)
+    if (key === undefined) {
+      const password = await darwinKeychainPassword(service)
+      if (password === undefined) continue
+      key = pbkdf2Sync(password, MAC_OSCRYPT_SALT, MAC_OSCRYPT_ITERATIONS, 16, 'sha1')
+      darwinKeyCache.set(service, key)
+    }
+    const plain = decryptQoderOscryptMac(authBlob, key)
+    if (plain === undefined) continue
+    decrypted = true
+    const session = parseQoderAuthSession(plain)
+    if (session === undefined) continue
+    const machineID = await machineIdOf(appDir)
+    return {
+      credential: {
+        ...base,
+        ...session,
+        ...machineID === undefined ? {} : { machineID },
+      },
+    }
+  }
+  return {
+    failure: {
+      ...base,
+      reason: decrypted ? 'invalid' : 'no-key',
+      ...decrypted ? {} : {
+        message:
+          'no macOS Keychain key opened the sign-in (sign in to the Qoder app, then allow the Keychain prompt and rescan)',
+      },
+    },
+  }
+}
+
 /** Read one app directory's credential, or the reason there is none. */
 export async function readQoderCredential(
   candidates: readonly QoderStorageCandidate[],
@@ -272,6 +340,13 @@ export async function readQoderCredential(
 
   const authBlob = await firstAuthBlob(byKind('auth-v1'))
   if (authBlob === undefined) return { failure: { ...base, reason: 'no-auth' } }
+
+  // macOS keeps no key wrapper in `Local State`; the key lives in the login
+  // Keychain and the blob is AES-128-CBC, so the whole reader takes another
+  // path rather than reusing the DPAPI unwrap that only Windows implements.
+  if ((options.platform ?? process.platform) === 'darwin') {
+    return readQoderCredentialMac(authBlob, region, appDir)
+  }
   let key: Buffer
   try {
     const localState = byKind('local-state')[0]
@@ -313,9 +388,16 @@ export async function readQoderCredential(
 const DISCOVERY_TTL_MS = 30_000
 let discoveryCache: { at: number; value: { credentials: QoderCredential[]; failures: QoderCredentialFailure[] } } | undefined
 
-/** Drop the cached discovery answer, e.g. when the user asks for a rescan. */
+/**
+ * Drop the cached discovery answer, e.g. when the user asks for a rescan.
+ *
+ * The macOS Keychain keys go with it: a desktop re-login can rotate the stored
+ * password, and a rescan is exactly when a rotated key has to be re-read
+ * instead of failing every decrypt with the stale copy.
+ */
 export function resetQoderCredentialCache(): void {
   discoveryCache = undefined
+  darwinKeyCache.clear()
 }
 
 /**

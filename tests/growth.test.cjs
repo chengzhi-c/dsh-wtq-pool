@@ -795,6 +795,87 @@ test('a growth run that outran its answer waits for the pass instead', async () 
     'the card says the pass is still going rather than sitting silent')
   assert.equal(context.busy, null, 'and the panel is free again')
 })
+
+/**
+ * Lift the growth-running watch and the card repaint that arms it.
+ *
+ * The host can answer "run now" while the pass is still going; the watch is
+ * what turns that answer into a live button when the pass lands.
+ */
+function panelGrowthPoll(answers) {
+  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const parts = []
+  for (const name of ['stopGrowthPoll', 'pollGrowthRun', 'adopt', 'renderGrowth']) {
+    const from = source.indexOf(`function ${name}(`)
+    assert.notEqual(from, -1, `${name} must exist in the panel`)
+    let depth = 0
+    let index = source.indexOf('{', from)
+    for (; index < source.length; index += 1) {
+      if (source[index] === '{') depth += 1
+      else if (source[index] === '}') { depth -= 1; if (depth === 0) break }
+    }
+    parts.push(source.slice(from, index + 1))
+  }
+  const timers = []
+  const calls = []
+  const nodes = {}
+  const sandbox = {
+    state: null,
+    stateRevision: 0,
+    busy: null,
+    activeTab: 'growth',
+    growthState: null,
+    growthReading: false,
+    growthDropped: 0,
+    growthPoll: null,
+    growthPollFailures: 0,
+    GROWTH_POLL_MS: 0,
+    GROWTH_POLL_MAX_FAILURES: 3,
+    pageIsVisible: () => true,
+    growthStale: () => true,
+    window: {
+      setTimeout(fn) { timers.push(fn); return timers.length },
+      clearTimeout() {},
+    },
+    $: (id) => nodes[id] || (nodes[id] = { textContent: '', title: '', disabled: false }),
+    t: (key) => key,
+    growthStateText: () => '',
+    paintGrowthAccounts: () => {},
+    paintGrowthNote: () => {},
+    readGrowth: () => { calls.push('readGrowth') },
+    invoke: (channel) => {
+      calls.push(channel)
+      return Promise.resolve(answers[channel])
+    },
+    render: () => { sandbox.renderGrowth() },
+    console,
+  }
+  const context = vm.createContext(sandbox)
+  vm.runInContext(parts.join('\n'), context)
+  return { context, timers, calls, nodes }
+}
+
+test('the growth card follows a pass that outran its answer', async () => {
+  const finished = { accounts: [], growth: { running: false } }
+  const { context, timers, calls, nodes } = panelGrowthPoll({ 'xd.state': finished })
+  context.state = { growth: { running: true } }
+  context.renderGrowth()
+  assert.equal(nodes.growthRun.disabled, true, 'the button waits while the pass runs')
+  assert.equal(timers.length, 1, 'and the card schedules a state read')
+  timers.shift()()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(calls, ['xd.state', 'readGrowth'],
+    'the finished document is adopted and the rows are read again')
+  assert.equal(context.state, finished, 'the running marker does not outlive the pass')
+  assert.equal(nodes.growthRun.disabled, false, 'and the button is live once the pass lands')
+})
+
+test('the growth watch leaves a pending check-in to its own poll', () => {
+  const { context, timers } = panelGrowthPoll({})
+  context.state = { growth: { running: true }, autoCheckin: { last: { pending: true } } }
+  context.renderGrowth()
+  assert.equal(timers.length, 0, 'the check-in watch already asks for the same document')
+})
 /**
  * The keep-alive record is on screen even when the pass log is empty.
  *

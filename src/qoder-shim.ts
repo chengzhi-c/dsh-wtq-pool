@@ -193,8 +193,7 @@ export function qoderRequestBody(
   openAiBody: string,
   model: string,
   entry?: QoderChatModel,
-  options: { enableThinking?: boolean; reasoningEffort?: string; sessionId?: string } = {},
-): { body: string; model: string; options: { enableThinking?: boolean; reasoningEffort?: string; sessionId?: string } } {
+): { body: string; model: string; options: { enableThinking?: boolean; reasoningEffort?: string } } {
   // The picked level is only honoured if it reaches the client builder, so it
   // is read here instead of being left to the caller: without this the menu
   // the host offers would change nothing at all on the wire.
@@ -210,12 +209,9 @@ export function qoderRequestBody(
   return {
     body: openAiBody,
     model,
-    options: {
-      ...options,
-      ...requested === undefined ? {} : {
-        enableThinking: !off,
-        ...wire === undefined ? {} : { reasoningEffort: wire },
-      },
+    options: requested === undefined ? {} : {
+      enableThinking: !off,
+      ...wire === undefined ? {} : { reasoningEffort: wire },
     },
   }
 }
@@ -702,7 +698,8 @@ export async function openQoderResponse(
   // Nothing has been forwarded yet, so a failure found here can still become a
   // real status code. Once output has started, the stream is already committed.
   if (failure !== undefined && !sawOutput) {
-    await reader.cancel().catch(() => {})
+    // A host's capture clone can keep tee cancellation pending until EOF.
+    void reader.cancel().catch(() => {})
     const { status, kind, error } = classifyQoderFailure(failure)
     const retryAfter = error instanceof QoderQueueRejection || error instanceof QoderDailyLimitRejection
       ? error.retryAfterSeconds

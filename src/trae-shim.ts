@@ -633,7 +633,8 @@ export async function openTraeResponse(
   // Nothing has been forwarded yet, so a failure found here can still become a
   // real status code. Once output has started, the stream is already committed.
   if (failure !== undefined && !sawOutput) {
-    await reader.cancel().catch(() => {})
+    // A host's capture clone can keep tee cancellation pending until EOF.
+    void reader.cancel().catch(() => {})
     const { status, kind, retryAfterSeconds } = classifyTraeFailure(failure)
     const wait = retryAfterHeader(retryAfterSeconds)
     return Response.json(

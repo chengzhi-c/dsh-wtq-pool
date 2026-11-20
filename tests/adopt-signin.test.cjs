@@ -1493,6 +1493,38 @@ test('two pools merge archive writes instead of losing one', async () => {
   }
 })
 
+test('a scan removes expired archived tokens when no sign-in files remain', async () => {
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-archive-retention-'))
+  const signins = ownSignInDir(dataDir)
+  const archive = path.join(dataDir, 'credentials-archive.json')
+  const expired = Date.now() - 31 * DAY
+  const entry = (uin, expiresAtMs, refreshExpiresAtMs) => ({
+    id: workbuddyAccountId({ uin, domain: 'www.codebuddy.cn' }),
+    accessToken: `access-${uin}`, refreshToken: `refresh-${uin}`,
+    expiresAtMs, refreshExpiresAtMs, uin, domain: 'www.codebuddy.cn',
+    sourcePath: path.join(signins, `workbuddy-panel-${uin}.info`),
+  })
+  fs.mkdirSync(signins)
+  fs.writeFileSync(archive, JSON.stringify({ version: 1, entries: [
+    entry('expired', expired, expired),
+    entry('refreshable', expired, Date.now() + DAY),
+    entry('undated', 0, 0),
+  ] }))
+  try {
+    const pool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir })
+    const accounts = await pool.scan()
+    assert.equal(accounts.some(account => account.credential.uin === 'expired'), false)
+    assert.deepEqual(JSON.parse(fs.readFileSync(archive, 'utf8')).entries.map(item => item.uin).sort(),
+      ['refreshable', 'undated'], 'expired tokens must leave disk even when the scan finds no new credentials')
+    fs.writeFileSync(archive, JSON.stringify({ version: 1, entries: [entry('undated', expired, expired)] }))
+    assert.equal(await pool.removeOwnSignIn(accounts.find(account => account.credential.uin === 'undated').id), true)
+    assert.deepEqual(JSON.parse(fs.readFileSync(archive, 'utf8')).entries, [],
+      'deleting an archived account must also persist expiry cleanup done while reading its entry')
+  } finally {
+    await cleanup(dataDir)
+  }
+})
+
 test('a delete does not run without its file lock', async () => {
   const { pool, dataDir } = machine('delete-lock-failure', { snapshots: [['90000006005', 'Locked']] })
   const [account] = await pool.scan()
@@ -1638,6 +1670,54 @@ test('a delete keeps a re-login rewritten to the same pool path during a scan', 
   } finally {
     fsp.readFile = realReadFile
     releaseRead?.()
+    await cleanup(dataDir)
+  }
+})
+
+test('a re-login survives a delete that already read the old sign-in', async () => {
+  const dataDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-delete-login-write-'))
+  const signins = ownSignInDir(dataDir)
+  const signIn = (accessToken) => ({
+    accessToken, refreshToken: `refresh-${accessToken}`, expiresAtMs: Date.now() + 9 * DAY,
+    domain: 'www.codebuddy.cn', uin: '90000006011', uid: '', nickname: 'Racing', enterpriseId: '',
+    lastRefreshAtMs: Date.now(),
+  })
+  const file = await writeOwnSignIn(signins, signIn('old-login'))
+  const pool = new WorkBuddyAccountPool({ authDirs: [signins], dataPath: () => dataDir })
+  const [account] = await pool.scan()
+  const fsp = require('node:fs/promises')
+  const realReadFile = fsp.readFile
+  let releaseRead, readStarted, releaseTimer, rewriting
+  const started = new Promise(resolve => { readStarted = resolve })
+  const gate = new Promise(resolve => { releaseRead = resolve })
+  let held = false
+  fsp.readFile = async (target, ...rest) => {
+    const text = await realReadFile(target, ...rest)
+    if (!held && path.resolve(String(target)) === path.resolve(file)) {
+      held = true
+      readStarted()
+      await gate
+    }
+    return text
+  }
+  const removing = pool.removeOwnSignIn(account.id)
+  try {
+    await started
+    rewriting = writeOwnSignIn(signins, signIn('new-login'))
+    // A serialized writer waits for the old read to finish; an unlocked one
+    // commits first and exposes the delete's stale-file window.
+    releaseTimer = setTimeout(releaseRead, 1000)
+    rewriting.then(releaseRead, releaseRead)
+    assert.equal(await removing, true)
+    await rewriting
+    assert.equal(fs.existsSync(file), true, 'the new login must remain on disk')
+    assert.equal(parseWorkBuddyAuth(fs.readFileSync(file, 'utf8'), file).accessToken, 'new-login')
+    assert.equal((await pool.rescan())[0]?.credential.accessToken, 'new-login')
+  } finally {
+    clearTimeout(releaseTimer)
+    releaseRead()
+    fsp.readFile = realReadFile
+    await Promise.allSettled([removing, rewriting])
     await cleanup(dataDir)
   }
 })

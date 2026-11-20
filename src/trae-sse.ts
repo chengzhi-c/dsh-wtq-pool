@@ -10,8 +10,6 @@
 export interface SseEvent {
   event?: string
   data: string
-  id?: string
-  retry?: number
 }
 
 /** Incremental SSE decoder supporting CRLF, chunk splits and multi-line data. */
@@ -36,8 +34,6 @@ const MAX_DATA_CHARS = 4 * 1024 * 1024
 export class SseDecoder {
   private buffer = ''
   private event: string | undefined
-  private id: string | undefined
-  private retry: number | undefined
   private data: string[] = []
   private dataChars = 0
   private rawFrame = ''
@@ -121,25 +117,19 @@ export class SseDecoder {
       this.data.push(value)
       this.dataChars += value.length + 1
     }
-    else if (field === 'id' && !value.includes('\0')) this.id = value
-    else if (field === 'retry' && /^\d+$/.test(value)) this.retry = Number(value)
     return undefined
   }
 
   private dispatch(): SseEvent | undefined {
     if (this.data.length === 0) {
       this.event = undefined
-      this.retry = undefined
       return undefined
     }
     const result: SseEvent = {
       ...this.event === undefined || this.event === '' ? {} : { event: this.event },
       data: this.data.join('\n'),
-      ...this.id === undefined ? {} : { id: this.id },
-      ...this.retry === undefined ? {} : { retry: this.retry },
     }
     this.event = undefined
-    this.retry = undefined
     this.data = []
     this.dataChars = 0
     return result

@@ -142,8 +142,8 @@ function processOutput(
 async function processStartedAt(pid: number, timeoutMs = 2_000): Promise<number | undefined> {
   if (pid === process.pid) return PROCESS_STARTED_AT_MS
   if (process.platform === 'win32') {
-    const systemRoot = trustedSystemRootOf(process.env)
-    const powershell = trustedWindowsPowerShell(process.env)
+    const systemRoot = trustedSystemRootOf()
+    const powershell = trustedWindowsPowerShell()
     if (systemRoot === undefined || powershell === undefined) return undefined
     const output = await processOutput(powershell, [
       '-NoLogo',
@@ -151,7 +151,7 @@ async function processStartedAt(pid: number, timeoutMs = 2_000): Promise<number 
       '-NonInteractive',
       '-Command',
       `$env:PSModulePath=[IO.Path]::Combine($env:SystemRoot,'System32\\WindowsPowerShell\\v1.0\\Modules'); $d=(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime(); ([DateTimeOffset]$d).ToUnixTimeMilliseconds()`,
-    ], trustedWindowsChildEnv(process.env, { inheritTemp: true, includeSystemDrive: true }), join(systemRoot, 'System32'), timeoutMs)
+    ], trustedWindowsChildEnv(process.env), join(systemRoot, 'System32'), timeoutMs)
     const match = output?.match(/\d{10,}/)
     return match === undefined || match === null ? undefined : Number(match[0])
   }

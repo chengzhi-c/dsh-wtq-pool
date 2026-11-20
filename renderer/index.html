@@ -38,11 +38,11 @@
          every view below, so the three sources never mix on one screen. The risk
          note shares their line: it applies to whichever of the three is chosen. -->
     <div class="tabs-row">
-      <nav class="tabs" id="sourceTabs" role="tablist">
-        <button type="button" class="tab active" data-source="workbuddy" role="tab" aria-selected="true">WorkBuddy</button>
-        <button type="button" class="tab" data-source="trae" role="tab" aria-selected="false">Trae</button>
-        <button type="button" class="tab" data-source="qoder" role="tab" aria-selected="false">Qoder</button>
-      </nav>
+      <div class="tabs" id="sourceTabs" role="group" aria-label="Account source">
+        <button type="button" class="tab active" data-source="workbuddy" aria-pressed="true">WorkBuddy</button>
+        <button type="button" class="tab" data-source="trae" aria-pressed="false">Trae</button>
+        <button type="button" class="tab" data-source="qoder" aria-pressed="false">Qoder</button>
+      </div>
       <p class="tab-risk" id="riskNote"></p>
     </div>
 
@@ -51,17 +51,17 @@
     <p class="hint" id="hostHint" hidden></p>
 
     <!-- Second level: the three views of the selected source. -->
-    <nav class="subtabs" id="viewTabs" role="tablist">
-      <button type="button" class="subtab active" id="view-pool" data-tab="pool" role="tab" aria-controls="poolView" aria-selected="true"></button>
-      <button type="button" class="subtab" id="view-models" data-tab="models" role="tab" aria-controls="modelsView" aria-selected="false"></button>
-      <button type="button" class="subtab" id="view-check" data-tab="check" role="tab" aria-controls="checkView" aria-selected="false"></button>
-      <button type="button" class="subtab" id="view-growth" data-tab="growth" role="tab" aria-controls="growthView" aria-selected="false"></button>
+    <nav class="subtabs" id="viewTabs" role="tablist" aria-label="Panel view">
+      <button type="button" class="subtab active" id="view-pool" data-tab="pool" role="tab" aria-controls="poolView" aria-selected="true" tabindex="0"></button>
+      <button type="button" class="subtab" id="view-models" data-tab="models" role="tab" aria-controls="modelsView" aria-selected="false" tabindex="-1"></button>
+      <button type="button" class="subtab" id="view-check" data-tab="check" role="tab" aria-controls="checkView" aria-selected="false" tabindex="-1"></button>
+      <button type="button" class="subtab" id="view-growth" data-tab="growth" role="tab" aria-controls="growthView" aria-selected="false" tabindex="-1"></button>
     </nav>
 
     <section id="poolView" class="view" role="tabpanel" aria-labelledby="view-pool">
       <div class="source-group" data-source="workbuddy">
         <div class="source-head" id="workbuddyHead"></div>
-        <nav class="regions" id="regionTabs" role="tablist"></nav>
+        <div class="regions" id="regionTabs" role="group" aria-label="Region"></div>
         <div class="strip" id="poolStrip"></div>
         <div id="accounts"></div>
       </div>
@@ -120,7 +120,7 @@
            columns below are shared. What differs - which roster, which stored
            selection, which gateway the save writes - is answered in panel.js,
            so Trae and Qoder get the pool's own editor instead of a copy. -->
-      <nav class="regions" id="modelRegionTabs" role="tablist"></nav>
+      <div class="regions" id="modelRegionTabs" role="group" aria-label="Region"></div>
       <!-- Two columns: the roster on the left, the settings of the ticked
            models on the right. The grid collapses to one column (roster above
            settings) once the window is dragged narrower than 720px - see the

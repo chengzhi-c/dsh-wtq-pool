@@ -858,7 +858,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
          */
         const failInBand = (error: unknown): void => {
           if (controller.signal.aborted || !res.writable) return
-          logger?.warn?.(LOG_PREFIX + ': upstream stream failed mid-flight', safeMessage(error))
+          logger?.warn?.(LOG_PREFIX + ': upstream stream failed mid-flight', error instanceof Error ? error.name : 'unknown error')
           try {
             res.write(`data: ${JSON.stringify({
               error: { message: safeMessage(error), type: 'upstream_error' },
@@ -936,7 +936,8 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
             head = peeked.head
             ended = peeked.ended
             if (peeked.refusal !== undefined) {
-              await reader.cancel().catch(() => {})
+              // A host's response clone can keep tee cancellation waiting for EOF.
+              void reader.cancel().catch(() => {})
               // A 200 whose body ended before the first byte is the same
               // pre-first-byte failure as a reset: no header was sent, so the
               // next account can still take the turn.
@@ -946,7 +947,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
                 logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} answered 200 with an empty stream; rotating`)
                 return
               }
-              logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} answered 200 with no stream: ${safeMessage(peeked.refusal)}`)
+              logger?.warn?.(`${LOG_PREFIX}: ${accountLogTag(account.label)} answered 200 with no stream`)
               // A prompt-screen refusal is the request's, not the account's:
               // rotating spends every sign-in and still answers the same way.
               if (peeked.code === '11128' || unapprovedChannelRefusal(peeked.refusal) !== undefined) {

@@ -85,10 +85,7 @@
         js.src = "../renderer/panel.js";
         document.body.appendChild(js);
       }).catch(function (error) {
-        // Opening this file straight from disk is the likely cause, so the
-        // message names the command that works.
-        document.body.textContent = "panel failed to load (" + error + "). " +
-          "Open the page through the local server instead: node docs/serve.cjs";
+        document.body.textContent = "面板加载失败：" + error;
       });
     })();
   </script>

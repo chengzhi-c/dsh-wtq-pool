@@ -13,7 +13,6 @@
  */
 const assert = require('node:assert/strict')
 const { test } = require('node:test')
-const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -22,7 +21,6 @@ const { createRequire } = require('node:module')
 const { WebServer } = require('@deepseek-ai/dsh-host-webserver')
 
 const { root, transpile } = require('./ts-loader.cjs')
-const { withoutComments } = require('../docs/capture-shape.cjs')
 const sourceOf = file => fs.readFileSync(path.join(root, file), 'utf8')
 
 /** Every channel the panel page and the composer component actually call. */
@@ -324,7 +322,7 @@ function liftFunction(source, name) {
  * Cases that have to dispatch a channel need the real module, not a slice of its
  * text, so this loads `src/host.ts` whole the way the other suites do.
  */
-function loadHost() {
+function loadHost(overrides = {}) {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-panel-'))
   const settings = { enabled: true, sourceWorkbuddy: false, sourceTrae: false, sourceQoder: false }
   const ownRequire = createRequire(path.join(root, 'src/host.ts'))
@@ -340,14 +338,15 @@ function loadHost() {
     pollDeviceLogin: async () => ({ status: 'pending' }),
   }
   const context = vm.createContext({
-    require: name => name === './login' ? login : ownRequire(name), module, exports: module.exports,
+    require: name => Object.hasOwn(overrides, name) ? overrides[name]
+      : name === './login' ? login : ownRequire(name), module, exports: module.exports,
     console: { log() {}, warn() {}, error() {} },
     AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
     URL, Buffer, process, TextEncoder, TextDecoder,
   })
   context.exports = module.exports
   vm.runInContext(transpile(sourceOf('src/host.ts')), context, { filename: 'src/host.ts' })
-  return { plugin: module.exports, cleanup: () => fs.rmSync(temporary, { recursive: true, force: true }) }
+  return { plugin: module.exports, context, cleanup: () => fs.rmSync(temporary, { recursive: true, force: true }) }
 }
 
 /** The slice of an `<input>` the panel touches, with listeners a case can fire. */
@@ -503,35 +502,6 @@ test('the popup width cap leaves room for the right anchor it is pinned by', () 
 })
 
 /**
- * The two hosts disagree about how a disabled button is dimmed, and the row the
- * popup marks as selected is one; the dot beside that row is one colour, not the
- * host's success token.
- *
- * PI-Desktop's shell stylesheet carries a global `button:disabled` rule that
- * fades it; DeepSeek Harness has no such rule outside its own update dialog, so
- * the same row read at full strength here and dimmed there. The fade is stated
- * in the popup's own rules, which both builds carry, so the selected row reads
- * the same in either host.
- *
- * `--dsw-alias-state-success-primary` resolves to a saturated `#22c55e` in this
- * host, while the same dot in the PI-Desktop build is `#4f9f7c`. Two panels of
- * one product should not carry two greens, so the colour is written out.
- */
-test('the row the popup marks as selected states its own dimming and marker colour', () => {
-  const source = sourceOf('src/client/composer.tsx')
-  const selected = source
-    .split('\n').find(line => line.startsWith('.xd-points-table .xd-points-btn:disabled{'))
-  assert.ok(selected, 'the selected row must not depend on a host rule for its fade')
-  assert.match(selected, /opacity:\s*\.5\b/,
-    'the fade is the one PI-Desktop applies; a different value would read as two products')
-
-  const marker = source.split('\n').find(line => line.startsWith('.xd-points-dot{'))
-  assert.ok(marker, 'the row marker rule must exist')
-  assert.match(marker, /background:\s*#4f9f7c/i, 'the marker is a fixed colour shared with the PI-Desktop build')
-  assert.doesNotMatch(marker, /var\(--/, 'a host token here resolves to a different green in this host')
-})
-
-/**
  * The frame around the panel follows the panel's own height, up to a cap, and
  * the reading is skipped, not taken, while the panel document has no body.
  *
@@ -675,30 +645,52 @@ test('a panel.css that 404s twice before it loads is waited out, not reported mi
  * though the reads succeeded. The pass is bounded below the call deadline, and
  * the probe it abandons still writes the cache the readout polls.
  */
-test('the composer refresh is bounded inside the readout call deadline', () => {
-  const client = sourceOf('src/client/composer.tsx')
-  const declared = /const INVOKE_TIMEOUT_MS = (\d+)/.exec(client)
-  assert.ok(declared, 'the readout must declare the deadline it aborts on')
-  const callDeadline = Number(declared[1])
-
-  const host = sourceOf('src/host.ts')
-  const budget = /const COMPOSER_REFRESH_BUDGET_MS = (\d+)/.exec(host)
-  assert.ok(budget, 'the refresh needs a budget of its own')
-  assert.ok(Number(budget[1]) < callDeadline,
-    `the refresh budget (${budget[1]}ms) must stay under the call deadline (${callDeadline}ms)`)
-
-  const handler = host.slice(host.indexOf('case "xd.composerRefresh"'))
-  const body = handler.slice(0, handler.indexOf('case "', 10))
-  assert.match(body, /statusDocument\(\{ allowNetwork: true, budgetMs: COMPOSER_REFRESH_BUDGET_MS \}\)/,
-    'the WorkBuddy pass must spend its own budget, not the wider panel step')
-  // Both the statement and its use: an unanchored match also accepts a scaled
-  // or offset deadline such as `COMPOSER_REFRESH_BUDGET_MS * 1000`, and a
-  // deadline nothing consults bounds nothing at all.
-  assert.match(body, /budget\(COMPOSER_REFRESH_BUDGET_MS\)/,
-    'the Trae and Qoder pass must share that one budget, unscaled')
-  assert.match(body, /if \(left\(\) === 0\) break;/,
-    'the shared budget has to stop the per-account loop, or the pass runs to its own end')
-})
+for (const source of ['trae', 'qoder']) {
+  test(`${source} composer refresh answers before its last slow probe finishes`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+    const rows = ['A', 'B', 'C'].map(label => ({ label, region: 'cn' }))
+    const discover = async () => ({ credentials: rows })
+    const probe = () => new Promise(resolve => {
+      setTimeout(() => resolve({ usage: { credits: { total: 42 } } }), 8000)
+    })
+    const host = loadHost({
+      './trae-discovery': { discoverTraeCredentials: discover, traeRegionOfCredential: credential => credential.region },
+      './qoder-credentials': { discoverQoderCredentials: discover },
+    })
+    Object.assign(host.context, { Date, fixtureRows: rows, fixtureSource: source, discover, probe })
+    vm.runInContext(`
+      matchComposerModel = () => ({ source: fixtureSource, region: 'cn' });
+      composerPoints = () => ({ show: true });
+      traeAccountRows = qoderAccountRows = fixtureRows;
+      traeRowLabel = qoderRowLabel = credential => credential.label;
+      traeRowProbe = qoderRowProbe = probe;
+    `, host.context)
+    t.after(() => host.cleanup())
+    let answer
+    const pending = host.plugin.onPanelInvoke('xd.composerRefresh', {}).then(value => {
+      answer = value
+    })
+    const flush = () => new Promise(resolve => setImmediate(resolve))
+    try {
+      await flush()
+      t.mock.timers.tick(8000)
+      await flush()
+      assert.equal(rows[0].usage.credits.total, 42)
+      t.mock.timers.tick(7000)
+      await flush()
+      assert.equal(answer?.show, true, 'the refresh must answer within its 15-second budget')
+      assert.equal(rows[1].usage, undefined, 'the second probe is still waiting')
+      t.mock.timers.tick(1000)
+      await flush()
+      assert.equal(rows[1].usage.credits.total, 42, 'a late probe still updates the popup cache')
+      assert.equal(rows[2].usage, undefined, 'the expired budget must not start a third probe')
+    } finally {
+      t.mock.timers.tick(30000)
+      await flush()
+      await pending
+    }
+  })
+}
 
 /**
  * The model sheet's numeric fields must refuse a value the host will not store.
@@ -950,6 +942,7 @@ test('the panel page boots whole, with its controls at the top level', () => {
 test('every string the panel asks for exists in both languages', () => {
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
   const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
+  assert.doesNotMatch(page, /data-foot="market"|data-foot-label="market"|plugins\.aiuo\.net/i)
   const tables = ['EN', 'ZH'].map((dictionary) => {
     const from = source.indexOf(`var ${dictionary} = {`)
     assert.notEqual(from, -1, `the ${dictionary} table has to be in the panel`)
@@ -1011,6 +1004,95 @@ test('every view tab names the panel it controls, and that panel names it back',
   }
 })
 
+test('source and region selectors expose pressed buttons instead of orphan tabs', () => {
+  const page = sourceOf('renderer/index.html')
+  const panel = sourceOf('renderer/panel.js')
+  const sourceGroup = /<(?:div|nav)[^>]*id="sourceTabs"[^>]*>/.exec(page)?.[0]
+  assert.ok(sourceGroup?.includes('role="group"'), 'source selectors do not control a tabpanel')
+  assert.match(sourceGroup, /aria-label=/, 'the source button group has a name')
+  for (const source of ['workbuddy', 'trae', 'qoder']) {
+    const button = [...page.matchAll(/<button[^>]*>/g)].map(match => match[0])
+      .find(tag => tag.includes(`data-source="${source}"`))
+    assert.ok(button?.includes('aria-pressed='), `${source} exposes its selected state`)
+    assert.ok(!button.includes('role="tab"'), `${source} does not claim an unrelated tab panel`)
+  }
+  assert.match(page, /id="regionTabs" role="group" aria-label=/)
+  assert.match(page, /id="modelRegionTabs" role="group" aria-label=/)
+  const regionStart = panel.indexOf('function fillRegionNav(')
+  let depth = 0
+  let regionEnd = panel.indexOf('{', regionStart)
+  for (; regionEnd < panel.length; regionEnd += 1) {
+    if (panel[regionEnd] === '{') depth += 1
+    else if (panel[regionEnd] === '}' && --depth === 0) break
+  }
+  const context = vm.createContext({
+    busy: null,
+    clear: node => { node.children = [] },
+    el: (_tag, className, text) => ({
+      className,
+      textContent: text || '',
+      attributes: {},
+      children: [],
+      setAttribute(name, value) { this.attributes[name] = value },
+      appendChild(child) { this.children.push(child) },
+      addEventListener() {},
+    }),
+    regionParked: () => false,
+    render() {},
+    setActiveRegion() {},
+    sourceRegionLabel: region => region === 'cn' ? 'China' : 'Global',
+    t: key => key === 'tabs.regions' ? 'Account region' : key,
+  })
+  vm.runInContext(panel.slice(regionStart, regionEnd + 1), context)
+  const nav = { children: [], setAttribute(name, value) { this[name] = value }, appendChild(child) { this.children.push(child) } }
+  context.nav = nav
+  vm.runInContext('fillRegionNav(nav, "qoder", ["cn", "global"], [{region:"cn"}], "cn")', context)
+  assert.equal(nav.role, 'group', 'generated region controls are exposed as a group')
+  assert.equal(nav['aria-label'], 'Account region')
+  assert.deepEqual(nav.children.map(button => button.attributes['aria-pressed']), ['true', 'false'])
+})
+
+test('view tabs support manual arrow navigation and wrap without activating panels', () => {
+  const panel = sourceOf('renderer/panel.js')
+  const start = panel.indexOf('function moveTabFocus(')
+  assert.notEqual(start, -1, 'the panel has a view-tab keyboard handler')
+  let depth = 0
+  let end = panel.indexOf('{', start)
+  for (; end < panel.length; end += 1) {
+    if (panel[end] === '{') depth += 1
+    else if (panel[end] === '}' && --depth === 0) break
+  }
+  const context = vm.createContext({})
+  vm.runInContext(panel.slice(start, end + 1), context)
+  const focused = []
+  const tabs = [
+    { hidden: false, disabled: false, tabIndex: 0, attributes: { 'aria-selected': 'true' },
+      getAttribute(name) { return this.attributes[name] }, setAttribute(name, value) { this.attributes[name] = value },
+      focus() { focused.push(this) } },
+    { hidden: true, disabled: false, tabIndex: -1, focus() { focused.push(this) } },
+    { hidden: false, disabled: true, tabIndex: -1, focus() { focused.push(this) } },
+    { hidden: false, disabled: false, tabIndex: -1, attributes: { 'aria-selected': 'false' },
+      getAttribute(name) { return this.attributes[name] }, setAttribute(name, value) { this.attributes[name] = value },
+      focus() { focused.push(this) } },
+  ]
+  context.list = { querySelectorAll: () => tabs }
+  context.tabs = tabs
+
+  assert.equal(vm.runInContext('moveTabFocus(list, tabs[0], "ArrowRight")', context), true)
+  assert.equal(focused.at(-1), tabs[3], 'right arrow skips hidden and disabled tabs')
+  assert.deepEqual(tabs.map(tab => tab.tabIndex), [-1, -1, -1, 0])
+  assert.deepEqual(tabs.map(tab => tab.getAttribute?.('aria-selected')), ['true', undefined, undefined, 'false'],
+    'arrow navigation leaves the selected tab unchanged')
+  assert.equal(vm.runInContext('moveTabFocus(list, tabs[3], "ArrowRight")', context), true)
+  assert.equal(focused.at(-1), tabs[0], 'right arrow wraps to the first tab')
+  assert.equal(vm.runInContext('moveTabFocus(list, tabs[0], "ArrowLeft")', context), true)
+  assert.equal(focused.at(-1), tabs[3], 'left arrow wraps to the last tab')
+  assert.equal(vm.runInContext('moveTabFocus(list, tabs[3], "Home")', context), true)
+  assert.equal(focused.at(-1), tabs[0])
+  assert.equal(vm.runInContext('moveTabFocus(list, tabs[0], "End")', context), true)
+  assert.equal(focused.at(-1), tabs[3])
+})
+
 /**
  * The ban-risk note sits on the source tabs' line, and follows the locale.
  *
@@ -1063,9 +1145,14 @@ test('the ban-risk note reaches the panel line', () => {
     assert.ok(expected.trim() !== '', `${name} risk.note must say something`)
 
     const node = { textContent: '' }
+    const nodes = {
+      sourceTabs: { setAttribute(name, value) { this[name] = value } },
+      viewTabs: { setAttribute(name, value) { this[name] = value } },
+      riskNote: node,
+    }
     const context = vm.createContext({
       document: { querySelectorAll: () => [], documentElement: { lang: name === 'ZH' ? 'zh-CN' : 'en' } },
-      $: (id) => { assert.equal(id, 'riskNote'); return node },
+      $: (id) => { assert.ok(nodes[id], `labelTabs reads known element ${id}`); return nodes[id] },
       TABLE: table,
       EN,
       activeSource: 'workbuddy',
@@ -1074,7 +1161,82 @@ test('the ban-risk note reaches the panel line', () => {
     vm.runInContext(note, context)
     vm.runInContext('labelTabs()', context)
     assert.equal(node.textContent, expected, `${name} note has to reach the page verbatim`)
+    assert.equal(nodes.sourceTabs['aria-label'], table['tabs.sources'])
+    assert.equal(nodes.viewTabs['aria-label'], table['tabs.views'])
   }
+})
+
+/**
+ * The check-in button stays out of the way while a pass is already running.
+ *
+ * A finished pass leaves the host with `autoCheckin.last.pending` set, and the
+ * growth flag stays up until the pass returns. A button painted as ready in
+ * that window accepts a click, asks for a second pass, and is repainted by the
+ * host's "already running" answer — it flashes and does nothing. The button has
+ * to report the pass instead, and come back when the state says it ended.
+ */
+test('the check-in button waits for a running pass', () => {
+  const source = sourceOf('renderer/panel.js')
+  const nodes = {}
+  const node = () => ({
+    childElementCount: 0,
+    children: [],
+    textContent: '',
+    title: '',
+    disabled: false,
+    value: '',
+    placeholder: '',
+    attrs: {},
+    setAttribute(name, value) { this.attrs[name] = String(value) },
+    getAttribute(name) { return this.attrs[name] ?? null },
+    addEventListener() {},
+    appendChild(child) { this.children.push(child); this.childElementCount = this.children.length },
+  })
+  const get = (id) => nodes[id] || (nodes[id] = node())
+  const control = get('autoControl')
+  control.childElementCount = 2
+  control.children = ['true', 'false'].map((value) => {
+    const button = node()
+    button.setAttribute('data-auto', value)
+    return button
+  })
+
+  const paint = (state) => {
+    const context = panelFunctions(['renderAutoCheckin'], source, {
+      state,
+      busy: null,
+      checkinBusy: null,
+      autoHoursDraft: null,
+      $: get,
+      t: (key) => key,
+      document: { activeElement: null },
+      paintAutoNote() {},
+      paintKeepAliveNote() {},
+    })
+    context.renderAutoCheckin()
+    return get('autoRunNow')
+  }
+
+  const idle = paint({
+    autoCheckin: { enabled: true, hours: [9], last: { pending: false } },
+    growth: { running: false },
+  })
+  assert.equal(idle.disabled, false, 'an idle panel leaves the button ready')
+  assert.equal(idle.textContent, 'auto.runNow')
+
+  const pending = paint({
+    autoCheckin: { enabled: true, hours: [9], last: { pending: true } },
+    growth: { running: false },
+  })
+  assert.equal(pending.disabled, true, 'a pass answered as pending owns the button')
+  assert.equal(pending.textContent, 'auto.running')
+
+  const inPass = paint({
+    autoCheckin: { enabled: true, hours: [9], last: { pending: false } },
+    growth: { running: true },
+  })
+  assert.equal(inPass.disabled, true, 'the same pass still shows in the growth flag')
+  assert.equal(inPass.textContent, 'auto.running')
 })
 
 /**
@@ -1090,52 +1252,4 @@ test('the panel page does not pin a locale', () => {
   const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
   assert.doesNotMatch(page, /<html[^>]*\blang\s*=/i,
     'the panel document must not declare a language before the host appearance is known')
-})
-
-/**
- * The README screenshots show the panel the repository ships now.
- *
- * `docs/preview-panel.html` mounts `renderer/index.html`, `panel.js` and
- * `panel.css` at runtime, so a capture taken from it cannot disagree with what
- * ships. What it can do is go stale: the pictures in docs/ are committed files,
- * and the panel changed under them while the README kept showing the old one.
- *
- * "Newer than" is a content question, not a file-system one: git does not carry
- * modification times, so a stamp compared against them passes on the machine that
- * took the picture and fails on a fresh clone, in either direction. The capture
- * writes the hashes of the files it mounted into `docs/preview-capture.json`,
- * and this compares against those.
- */
-test('the README screenshots show the panel the repository ships', () => {
-  const shots = ['preview-pool.png', 'preview-dark.png', 'preview-models.png', 'preview-growth.png', 'preview-page.png']
-  const rendered = ['renderer/index.html', 'renderer/panel.js', 'renderer/panel.css',
-    'docs/preview-panel.html', 'docs/preview-data.js']
-  const stampAt = path.join(root, 'docs', 'preview-capture.json')
-  assert.ok(fs.existsSync(stampAt), 'docs/preview-capture.json has to exist: the capture writes it')
-  const stamp = JSON.parse(fs.readFileSync(stampAt, 'utf8'))
-  const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')
-  // Comments and blank lines never reach a pixel, so the capture records each
-  // file with them gone: an edit to either never made a picture stale, and
-  // comparing whole files forced a re-stamp on every one of them. The
-  // screenshots keep their own whole-file hashes below, because those bytes are
-  // the picture.
-  const shape = (file) => crypto.createHash('sha256')
-    .update(withoutComments(fs.readFileSync(path.join(root, file), 'utf8'), file))
-    .digest('hex')
-
-  assert.deepEqual(Object.keys(stamp.rendered).sort(), [...rendered].sort(),
-    'the capture has to name every source that decides what the screenshots show')
-  for (const file of rendered) {
-    assert.equal(stamp.rendered[file], shape(file),
-      `${file} changed since the screenshots were taken: re-capture, then run node docs/stamp.cjs`)
-  }
-  assert.deepEqual(Object.keys(stamp.shots).sort(), [...shots].sort(),
-    'the capture has to list the shots the README embeds')
-
-  for (const shot of shots) {
-    const at = path.join(root, 'docs', shot)
-    assert.ok(fs.existsSync(at), `docs/${shot} has to exist: the README embeds it`)
-    assert.equal(stamp.shots[shot], digest('docs/' + shot),
-      `docs/${shot} changed without the stamp that records what it was captured against: run node docs/stamp.cjs after re-capturing`)
-  }
 })

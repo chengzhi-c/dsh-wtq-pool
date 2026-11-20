@@ -298,6 +298,7 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       | { ok: true; relayed: Response }
       | { ok: false; status: number; message: string; kind?: TraeUpstreamErrorKind; retryAfter?: string | null }
     > => {
+      const variant = entry?.variants?.find(row => row.function === functionName) ?? serving
       // The level the client picked is translated into Trae's own spelling from
       // what this model advertises; a level it does not advertise is left out
       // rather than sent as a spelling SOLO would ignore.
@@ -312,8 +313,8 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
         // The window has to be *stated* for that comparison to mean anything: a
         // row that names only an output budget has no default tier to exceed, and
         // reading it as 0 put the Max flag on every request to it.
-        published !== undefined && serving !== undefined
-          && serving.contextWindow !== undefined && published > serving.contextWindow,
+        published !== undefined && variant?.contextWindow !== undefined
+          && published > variant.contextWindow,
       )
       if (!result.ok) return { ok: false, status: result.status, message: result.message, kind: result.kind, retryAfter: result.retryAfter }
       // A relay failure ends the stream in a shape the client can finish on, so
@@ -325,7 +326,11 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       try {
         relayed = await openTraeResponse(result.response, model, {
           onFailure: (error: unknown) => {
-            logger?.warn?.(LOG_PREFIX + ': trae relay stream failed mid-flight', error)
+            const failure = (error as { traeFailure?: TraeFailure }).traeFailure
+            logger?.warn?.(
+              LOG_PREFIX + ': trae relay stream failed mid-flight',
+              failure?.code === undefined ? (error instanceof Error ? error.name : 'unknown error') : `code ${failure.code}`,
+            )
             // A sign-in that dies mid-turn has already proved it cannot serve,
             // and the hold is the only thing that keeps the next request from
             // paying the same round trip on it. A caller hang-up is not the
@@ -448,10 +453,6 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       return
     }
     const relayed = opened.relayed
-    if (relayed.body === null) {
-      writeOpenAIError(res, 502, 'upstream_error', 'Trae SOLO returned no stream')
-      return
-    }
     // The peek can take seconds on a slow first token; a caller who stopped
     // waiting in that window still has a response object that reports writable.
     // Cancel the bridge too: its push loop is parked on this stream's queue and
@@ -483,7 +484,7 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       // one warning per cancelled turn buried everything worth reading.
       const aborted = watcher.signal.aborted || (error instanceof Error && error.name === 'AbortError')
       if (!aborted) {
-        logger?.warn?.(LOG_PREFIX + ': trae relay stream failed mid-flight', error)
+        logger?.warn?.(LOG_PREFIX + ': trae relay stream failed mid-flight', error instanceof Error ? error.name : 'unknown error')
       }
       if (res.writable) res.end()
     })
