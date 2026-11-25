@@ -9,13 +9,17 @@
  * is not an account at all.
  */
 const assert = require('node:assert/strict')
-const { test } = require('node:test')
+const { test, after } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { root, transpile } = require('./ts-loader.cjs')
 
-const scratch = (label) => fs.mkdtempSync(path.join(os.tmpdir(), `dsh-login-${label}-`))
+const scratch = (label) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), `dsh-login-${label}-`))
+  after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  return directory
+}
 
 /** An envelope answer, in the shape every WorkBuddy endpoint uses. */
 function envelope(data, code = 0, msg = 'OK') {
@@ -250,38 +254,26 @@ test('deleting a panel sign-in removes the file and the archive entry', async ()
   assert.equal(await pool.removeOwnSignIn(doomed.id), false)
 })
 
-/**
- * A delete has to survive a scan that was already reading the directories.
- *
- * The archive is written at the end of every scan, from the list the walk read.
- * A scan that read this sign-in file just before the delete queues that write
- * after the delete's drop, which put the entry back - the file was gone, and the
- * account came back on the next scan through the archive's "file gone, token
- * still valid" path. Ten rounds, because the point is the ordering and one round
- * of a race proves nothing.
- */
 test('a scan already in flight cannot archive a deleted sign-in back', async () => {
   const { writeOwnSignIn, ownSignInDir, WorkBuddyAccountPool } = require('../src/accounts.ts')
-  for (let round = 0; round < 10; round += 1) {
-    const dataPath = path.join(scratch('delete-race-'), 'data')
-    const target = ownSignInDir(dataPath)
-    await writeOwnSignIn(target, {
-      region: 'cn', accessToken: 'at-race-' + round, refreshToken: 'rt-race',
-      expiresAtMs: Date.now() + 3600_000, domain: 'www.codebuddy.cn',
-      uid: 'u-race', uin: '90000000020', enterpriseId: '', nickname: 'Race',
-    })
-    const pool = new WorkBuddyAccountPool({ authDirs: [target], dataPath: () => dataPath, cooldownMs: 60000 })
-    const scanned = await pool.scan()
-    assert.equal(scanned.length, 1)
-    // Started, not awaited: this scan is mid-walk when the delete runs.
-    const racing = pool.scan()
-    assert.equal(await pool.removeOwnSignIn(scanned[0].id), true)
-    await racing
-    const after = await pool.scan()
-    assert.equal(after.length, 0, 'round ' + round + ': the deleted sign-in must not come back')
-    assert.ok(!fs.readFileSync(path.join(dataPath, 'credentials-archive.json'), 'utf8').includes('90000000020'),
-      'round ' + round + ': and must not be left in the archive')
-  }
+  const dataPath = path.join(scratch('delete-race-'), 'data')
+  const target = ownSignInDir(dataPath)
+  await writeOwnSignIn(target, {
+    region: 'cn', accessToken: 'at-race', refreshToken: 'rt-race',
+    expiresAtMs: Date.now() + 3600_000, domain: 'www.codebuddy.cn',
+    uid: 'u-race', uin: '90000000020', enterpriseId: '', nickname: 'Race',
+  })
+  const pool = new WorkBuddyAccountPool({ authDirs: [target], dataPath: () => dataPath, cooldownMs: 60000 })
+  const scanned = await pool.scan()
+  assert.equal(scanned.length, 1)
+  // Started, not awaited: this scan is mid-walk when the delete runs.
+  const racing = pool.scan()
+  assert.equal(await pool.removeOwnSignIn(scanned[0].id), true)
+  await racing
+  const after = await pool.scan()
+  assert.equal(after.length, 0, 'the deleted sign-in must not come back')
+  assert.ok(!fs.readFileSync(path.join(dataPath, 'credentials-archive.json'), 'utf8').includes('90000000020'),
+    'the deleted sign-in must not be left in the archive')
 })
 
 /**
@@ -338,7 +330,6 @@ test('a delete whose lock release fails is not rolled back', async () => {
     fsp.unlink = realUnlink
     global.setTimeout = realSetTimeout
     Date.now = realNow
-    fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
 

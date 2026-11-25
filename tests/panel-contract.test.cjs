@@ -544,8 +544,8 @@ for (const source of ['trae', 'qoder']) {
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
     const rows = ['A', 'B', 'C'].map(label => ({ label, region: 'cn' }))
     const discover = async () => ({ credentials: rows })
-    const probe = () => new Promise(resolve => {
-      setTimeout(() => resolve({ usage: { credits: { total: 42 } } }), 8000)
+    const probe = credential => new Promise(resolve => {
+      setTimeout(() => resolve({ usage: { credits: { total: 42 } } }), credential.label === 'B' ? 16000 : 8000)
     })
     const host = loadHost({
       './trae-discovery': { discoverTraeCredentials: discover, traeRegionOfCredential: credential => credential.region },
@@ -570,6 +570,7 @@ for (const source of ['trae', 'qoder']) {
       t.mock.timers.tick(8000)
       await flush()
       assert.equal(rows[0].usage.credits.total, 42)
+      assert.equal(rows[2].usage.credits.total, 42, 'a slow account must not delay the other probes')
       t.mock.timers.tick(7000)
       await flush()
       assert.equal(answer?.show, true, 'the refresh must answer within its 15-second budget')
@@ -577,7 +578,6 @@ for (const source of ['trae', 'qoder']) {
       t.mock.timers.tick(1000)
       await flush()
       assert.equal(rows[1].usage.credits.total, 42, 'a late probe still updates the popup cache')
-      assert.equal(rows[2].usage, undefined, 'the expired budget must not start a third probe')
     } finally {
       t.mock.timers.tick(30000)
       await flush()

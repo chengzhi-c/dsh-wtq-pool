@@ -7,7 +7,7 @@
  * scratch one, so nothing here reaches the network or a real install.
  */
 const assert = require('node:assert/strict')
-const { test } = require('node:test')
+const { test, after } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -16,7 +16,11 @@ const { createRequire } = require('node:module')
 
 const { root, transpile } = require('./ts-loader.cjs')
 
-const scratch = (label) => fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), `dsh-${label}-`))
+const scratch = (label) => {
+  const directory = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), `dsh-${label}-`))
+  after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  return directory
+}
 
 /** One readable WorkBuddy sign-in file, the shape the desktop app writes. */
 function writeSignIn(dir, document = {}) {
@@ -97,18 +101,16 @@ test('a refreshed token is not swapped back for the dead one on disk', async () 
       },
     },
   })
-  try {
-    assert.equal((await pool.scan()).length, 1)
-    const id = pool.list()[0].id
-    assert.equal(pool.list()[0].credential.accessToken, 'dead-token')
-    assert.equal(await pool.refreshAccount(id), true, 'the refresh must be seen to change the token')
-    assert.equal(pool.list()[0].credential.accessToken, 'fresh-token')
-    // The rescan reads the file again, so this is the whole case.
-    assert.equal((await pool.scan()).length, 1)
-    assert.equal(pool.list()[0].credential.accessToken, 'fresh-token',
-      'a rescan must not put the revoked token back in place of the working one')
-    assert.equal(refreshes, 1, 'the scan must not need a second refresh to undo the first')
-  } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+  assert.equal((await pool.scan()).length, 1)
+  const id = pool.list()[0].id
+  assert.equal(pool.list()[0].credential.accessToken, 'dead-token')
+  assert.equal(await pool.refreshAccount(id), true, 'the refresh must be seen to change the token')
+  assert.equal(pool.list()[0].credential.accessToken, 'fresh-token')
+  // The rescan reads the file again, so this is the whole case.
+  assert.equal((await pool.scan()).length, 1)
+  assert.equal(pool.list()[0].credential.accessToken, 'fresh-token',
+    'a rescan must not put the revoked token back in place of the working one')
+  assert.equal(refreshes, 1, 'the scan must not need a second refresh to undo the first')
 })
 
 /**
@@ -128,20 +130,18 @@ test('a sealed sign-in the key cannot open keeps the account the pool already ha
   const auth = path.join(temporary, 'auth')
   const file = writeSignIn(auth)
   const pool = new WorkBuddyAccountPool({ authDirs: [auth] })
-  try {
-    assert.equal((await pool.scan()).length, 1, 'the readable snapshot must be listed')
-    // The app seals the same file while its key is unavailable.
-    fs.writeFileSync(file, JSON.stringify({
-      auth: { accessToken: { $wbEncrypted: 1, envelope: 'sealed-envelope' }, refreshToken: '', expiresAt: Date.now() + 3600000 },
-      account: { uin: 'u-1', nickname: 'Fixture' },
-    }))
-    assert.equal((await pool.scan()).length, 1,
-      'a sealed file must not erase the account the panel is showing')
-    assert.equal(pool.list()[0].credential.accessToken, 'original-token',
-      'the credential already held must stay in force until the key is back')
-    assert.equal(pool.list()[0].archived, undefined,
-      'a file this build cannot open says nothing about the account: it is not a lost sign-in')
-  } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+  assert.equal((await pool.scan()).length, 1, 'the readable snapshot must be listed')
+  // The app seals the same file while its key is unavailable.
+  fs.writeFileSync(file, JSON.stringify({
+    auth: { accessToken: { $wbEncrypted: 1, envelope: 'sealed-envelope' }, refreshToken: '', expiresAt: Date.now() + 3600000 },
+    account: { uin: 'u-1', nickname: 'Fixture' },
+  }))
+  assert.equal((await pool.scan()).length, 1,
+    'a sealed file must not erase the account the panel is showing')
+  assert.equal(pool.list()[0].credential.accessToken, 'original-token',
+    'the credential already held must stay in force until the key is back')
+  assert.equal(pool.list()[0].archived, undefined,
+    'a file this build cannot open says nothing about the account: it is not a lost sign-in')
 })
 
 test('the registry scan uses the system PowerShell and its modules', () => {
@@ -177,22 +177,20 @@ test('two sign-ins with no identity at all stay two accounts', async () => {
   const dirs = [path.join(temporary, 'one'), path.join(temporary, 'two')]
   for (const dir of dirs) writeSignIn(dir, { account: {} })
   const pool = new WorkBuddyAccountPool({ authDirs: dirs })
-  try {
-    assert.equal((await pool.scan()).length, 2,
-      'two identity-less sign-ins must not collapse into one pool entry')
-    const idOf = (dir) => workbuddyAccountId({ sourcePath: path.join(dir, 'workbuddy-desktop.info') })
-    assert.notEqual(idOf(dirs[0]), idOf(dirs[1]),
-      'the source path is the only identity these carry, so it must key them apart')
-    assert.equal(idOf(dirs[0]), workbuddyAccountId({ sourcePath: path.join(dirs[0], 'workbuddy-desktop.info') }),
-      'the same file must still key to the same account')
-    // A nickname is not an identity: two accounts can share one, and hashing it
-    // alone made the second credential overwrite the first.
-    assert.notEqual(
-      workbuddyAccountId({ nickname: 'Alice', sourcePath: path.join(dirs[0], 'a.info') }),
-      workbuddyAccountId({ nickname: 'Alice', sourcePath: path.join(dirs[1], 'b.info') }),
-      'two sign-ins with the same nickname but no uin/uid stay two accounts',
-    )
-  } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+  assert.equal((await pool.scan()).length, 2,
+    'two identity-less sign-ins must not collapse into one pool entry')
+  const idOf = (dir) => workbuddyAccountId({ sourcePath: path.join(dir, 'workbuddy-desktop.info') })
+  assert.notEqual(idOf(dirs[0]), idOf(dirs[1]),
+    'the source path is the only identity these carry, so it must key them apart')
+  assert.equal(idOf(dirs[0]), workbuddyAccountId({ sourcePath: path.join(dirs[0], 'workbuddy-desktop.info') }),
+    'the same file must still key to the same account')
+  // A nickname is not an identity: two accounts can share one, and hashing it
+  // alone made the second credential overwrite the first.
+  assert.notEqual(
+    workbuddyAccountId({ nickname: 'Alice', sourcePath: path.join(dirs[0], 'a.info') }),
+    workbuddyAccountId({ nickname: 'Alice', sourcePath: path.join(dirs[1], 'b.info') }),
+    'two sign-ins with the same nickname but no uin/uid stay two accounts',
+  )
 })
 
 /**
@@ -213,34 +211,32 @@ test('cooldown policy honours the configured window, clamps a caller reset, and 
   writeSignIn(auth)
   const configured = new WorkBuddyAccountPool({ authDirs: [auth], cooldownMs: 3 * HOUR })
   const supplied = new WorkBuddyAccountPool({ authDirs: [auth] })
-  try {
-    for (const pool of [configured, supplied]) await pool.scan()
-    const id = supplied.list()[0].id
+  for (const pool of [configured, supplied]) await pool.scan()
+  const id = supplied.list()[0].id
 
-    configured.penalize(id)
-    assert.ok(configured.list()[0].cooldownUntilMs > Date.now() + 2 * HOUR,
-      'a configured cooldown past the 2h ceiling must be honoured, not clamped to it')
+  configured.penalize(id)
+  assert.ok(configured.list()[0].cooldownUntilMs > Date.now() + 2 * HOUR,
+    'a configured cooldown past the 2h ceiling must be honoured, not clamped to it')
 
-    supplied.penalize(id, Date.now() + 5 * HOUR)
-    assert.ok(supplied.list()[0].cooldownUntilMs <= Date.now() + 2 * HOUR,
-      'a caller-supplied reset past the ceiling must be clamped')
-    assert.ok(supplied.list()[0].cooldownUntilMs > Date.now() + HOUR,
-      'the clamp must still leave the account cooling')
+  supplied.penalize(id, Date.now() + 5 * HOUR)
+  assert.ok(supplied.list()[0].cooldownUntilMs <= Date.now() + 2 * HOUR,
+    'a caller-supplied reset past the ceiling must be clamped')
+  assert.ok(supplied.list()[0].cooldownUntilMs > Date.now() + HOUR,
+    'the clamp must still leave the account cooling')
 
-    const account = supplied.list()[0]
-    account.modelCooldowns['stale-model'] = Date.now() - 1000
-    supplied.penalize(id, undefined, 'fresh-model')
-    assert.equal(account.modelCooldowns['stale-model'], undefined,
-      'a per-model cooldown that has passed must be dropped, not kept forever')
-    assert.ok(account.modelCooldowns['fresh-model'] > Date.now(),
-      'the model that was just limited must be cooling')
-    for (let index = 0; index < 200; index += 1) {
-      account.modelCooldowns[`model-${index}`] = Date.now() + 60_000 + index
-    }
-    supplied.penalize(id, undefined, 'model-199')
-    assert.equal(Object.keys(account.modelCooldowns).length, 128,
-      'the per-model map must be capped, not grown once per distinct model id')
-  } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+  const account = supplied.list()[0]
+  account.modelCooldowns['stale-model'] = Date.now() - 1000
+  supplied.penalize(id, undefined, 'fresh-model')
+  assert.equal(account.modelCooldowns['stale-model'], undefined,
+    'a per-model cooldown that has passed must be dropped, not kept forever')
+  assert.ok(account.modelCooldowns['fresh-model'] > Date.now(),
+    'the model that was just limited must be cooling')
+  for (let index = 0; index < 200; index += 1) {
+    account.modelCooldowns[`model-${index}`] = Date.now() + 60_000 + index
+  }
+  supplied.penalize(id, undefined, 'model-199')
+  assert.equal(Object.keys(account.modelCooldowns).length, 128,
+    'the per-model map must be capped, not grown once per distinct model id')
 })
 
 /**
@@ -599,7 +595,6 @@ test('a discovery answer is reused inside its TTL and dropped by a rescan', asyn
       if (restore[key] === undefined) delete process.env[key]
       else process.env[key] = restore[key]
     }
-    fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
 
@@ -615,26 +610,24 @@ test('a discovery answer is reused inside its TTL and dropped by a rescan', asyn
  */
 test('a settings document written by an earlier version still reaches the editor', async () => {
   const host = loadHost()
-  try {
-    const folded = host.internals.normalizeSelection({
-      imageModelIds: ['model-a', 'model-b', 7],
-      contextBudgets: { 'model-a': 4096, 'model-c': 0, 'model-d': 4096.5, 'model-e': 0xffffffff + 1 },
-      overrides: { 'model-a': { alias: 'Renamed' } },
-    })
-    assert.deepEqual(JSON.parse(JSON.stringify(folded)), {
-      overrides: {
-        'model-a': { alias: 'Renamed', supportsImages: true, contextWindow: 4096 },
-        'model-b': { supportsImages: true },
-      },
-    }, 'the legacy fields must be folded into the overrides the editor reads')
-    // A value no save could have produced is refused on the same terms.
-    assert.equal(folded.overrides['model-c'], undefined, 'a zero budget must be refused')
-    assert.equal(folded.overrides['model-d'], undefined, 'a fractional budget must be refused')
-    assert.equal(folded.overrides['model-e'], undefined, 'a budget past the ceiling must be refused')
-    // Controls: nothing to fold still folds to nothing.
-    assert.deepEqual(JSON.parse(JSON.stringify(host.internals.normalizeSelection({}))), {})
-    assert.deepEqual(JSON.parse(JSON.stringify(host.internals.normalizeSelection(null))), {})
-  } finally { host.cleanup() }
+  const folded = host.internals.normalizeSelection({
+    imageModelIds: ['model-a', 'model-b', 7],
+    contextBudgets: { 'model-a': 4096, 'model-c': 0, 'model-d': 4096.5, 'model-e': 0xffffffff + 1 },
+    overrides: { 'model-a': { alias: 'Renamed' } },
+  })
+  assert.deepEqual(JSON.parse(JSON.stringify(folded)), {
+    overrides: {
+      'model-a': { alias: 'Renamed', supportsImages: true, contextWindow: 4096 },
+      'model-b': { supportsImages: true },
+    },
+  }, 'the legacy fields must be folded into the overrides the editor reads')
+  // A value no save could have produced is refused on the same terms.
+  assert.equal(folded.overrides['model-c'], undefined, 'a zero budget must be refused')
+  assert.equal(folded.overrides['model-d'], undefined, 'a fractional budget must be refused')
+  assert.equal(folded.overrides['model-e'], undefined, 'a budget past the ceiling must be refused')
+  // Controls: nothing to fold still folds to nothing.
+  assert.deepEqual(JSON.parse(JSON.stringify(host.internals.normalizeSelection({}))), {})
+  assert.deepEqual(JSON.parse(JSON.stringify(host.internals.normalizeSelection(null))), {})
 })
 
 /**
@@ -683,7 +676,6 @@ test('the collected check-in slots survive a restart and stay three days deep', 
   } finally {
     await stopRegisteredService()
     await plugin.onUnload()
-    fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
 
@@ -862,7 +854,7 @@ function loadHost(overrides = {}) {
   context.exports = module.exports
   vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/host.ts'), 'utf8'))
     + '\nmodule.exports.__internals = { normalizeSelection }\n', context, { filename: 'src/host.ts' })
-  return { plugin: module.exports, internals: module.exports.__internals, cleanup: () => fs.rmSync(temporary, { recursive: true, force: true }) }
+  return { plugin: module.exports, internals: module.exports.__internals }
 }
 
 /**
@@ -934,7 +926,6 @@ test('the composer readout is told to stop polling when the feature is off', asy
       'the switched-off answer must say so, or the readout waits on a balance that will never arrive')
   } finally {
     await host.plugin.onUnload()
-    host.cleanup()
   }
 
   // The control: the same channel with the feature on answers `enabled: true`,
@@ -947,7 +938,6 @@ test('the composer readout is told to stop polling when the feature is off', asy
     assert.equal(answer.show, false, 'nothing is published for this fixture, so there is still no balance to show')
   } finally {
     await on.plugin.onUnload()
-    on.cleanup()
   }
 })
 
@@ -1103,7 +1093,6 @@ test('Qoder reads keep cached keys intact and follow a rotated wrapper with the 
       if (restore[name] === undefined) delete process.env[name]
       else process.env[name] = restore[name]
     }
-    fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
 
@@ -1393,23 +1382,19 @@ test('a Qoder claim that paid nothing carries no amount', () => {
 test('a Trae install with two sign-ins reports a fallback device id', async () => {
   const { readTraeIdentity } = require('../src/trae-identity.ts')
   const temporary = scratch('xdpool-trae-identity-')
-  try {
-    const storagePath = path.join(temporary, 'User', 'globalStorage', 'storage.json')
-    fs.mkdirSync(path.dirname(storagePath), { recursive: true })
-    fs.writeFileSync(storagePath, JSON.stringify({
-      'telemetry.machineId': 'fixture-machine',
-      'telemetry.devDeviceId': '11111111-2222-3333-4444-555555555555',
-      'iCubeAuthInfo://icube-dc:1000000000000001': '{}',
-      'iCubeAuthInfo://icube-dc:1000000000000002': '{}',
-    }))
-    const identity = await readTraeIdentity({ path: storagePath, edition: 'cn', source: 'desktop' })
-    assert.equal(identity.deviceIdIsFallback, true,
-      'two device-center ids leave no persisted device number, and the caller must be able to say so')
-    assert.notEqual(identity.deviceId, '1000000000000001',
-      'the id of one of the two accounts must not be sent as the machine\'s')
-  } finally {
-    fs.rmSync(temporary, { recursive: true, force: true })
-  }
+  const storagePath = path.join(temporary, 'User', 'globalStorage', 'storage.json')
+  fs.mkdirSync(path.dirname(storagePath), { recursive: true })
+  fs.writeFileSync(storagePath, JSON.stringify({
+    'telemetry.machineId': 'fixture-machine',
+    'telemetry.devDeviceId': '11111111-2222-3333-4444-555555555555',
+    'iCubeAuthInfo://icube-dc:1000000000000001': '{}',
+    'iCubeAuthInfo://icube-dc:1000000000000002': '{}',
+  }))
+  const identity = await readTraeIdentity({ path: storagePath, edition: 'cn', source: 'desktop' })
+  assert.equal(identity.deviceIdIsFallback, true,
+    'two device-center ids leave no persisted device number, and the caller must be able to say so')
+  assert.notEqual(identity.deviceId, '1000000000000001',
+    'the id of one of the two accounts must not be sent as the machine\'s')
 })
 
 /**
@@ -1422,15 +1407,11 @@ test('a Trae install with two sign-ins reports a fallback device id', async () =
 test('a Trae storage file that is not an object fails as unreadable', async () => {
   const { readTraeIdentity } = require('../src/trae-identity.ts')
   const temporary = scratch('xdpool-trae-storage-')
-  try {
-    const storagePath = path.join(temporary, 'User', 'globalStorage', 'storage.json')
-    fs.mkdirSync(path.dirname(storagePath), { recursive: true })
-    fs.writeFileSync(storagePath, 'null')
-    await assert.rejects(readTraeIdentity({ path: storagePath, edition: 'cn', source: 'desktop' }),
-      /not a JSON object/, 'a storage file holding null must be reported as unreadable')
-  } finally {
-    fs.rmSync(temporary, { recursive: true, force: true })
-  }
+  const storagePath = path.join(temporary, 'User', 'globalStorage', 'storage.json')
+  fs.mkdirSync(path.dirname(storagePath), { recursive: true })
+  fs.writeFileSync(storagePath, 'null')
+  await assert.rejects(readTraeIdentity({ path: storagePath, edition: 'cn', source: 'desktop' }),
+    /not a JSON object/, 'a storage file holding null must be reported as unreadable')
 })
 
 /**
@@ -1557,22 +1538,46 @@ test('a stream that ends releases its watchdog timer', async () => {
   }
 })
 
-/**
- * A `Retry-After` is validated and bounded before it is sent.
- *
- * The upstream's wait time was forwarded as it arrived. An empty string, prose
- * or a number of years is enough to park a client - or a whole model pool - for
- * as long as it chooses to honour the header.
- */
-test('a retry-after is validated and bounded before it is sent', () => {
+const NOW = Date.UTC(2026, 10, 25, 0, 0, 0)
+const RETRY_AT = 'Wed, 25 Nov 2026 00:05:00 GMT'
+
+test('Retry-After accepts HTTP dates while keeping numeric waits bounded', (t) => {
   const { retryAfterHeader } = require('../src/loopback.ts')
-  assert.equal(retryAfterHeader('120'), '120', 'a plain wait is forwarded as it is')
-  assert.equal(retryAfterHeader(42), '42', 'and so is a numeric one')
-  assert.equal(retryAfterHeader('1e9'), '7200', 'a wait of thirty years is bounded to two hours')
-  assert.equal(retryAfterHeader(''), undefined, 'an empty value is dropped rather than sent')
-  assert.equal(retryAfterHeader('soon'), undefined, 'and so is prose')
-  assert.equal(retryAfterHeader('-5'), undefined, 'a negative wait is not a wait')
-  assert.equal(retryAfterHeader(undefined), undefined, 'and an absent one is simply absent')
+  t.mock.method(Date, 'now', () => NOW)
+  for (const [value, expected] of [
+    [RETRY_AT, '300'], ['120', '120'], [42, '42'], [1.5, '2'], ['1e9', '7200'],
+    ['Wed, 25 Nov 2026 06:00:00 GMT', '7200'],
+    ['Tue, 24 Nov 2026 23:59:00 GMT', undefined],
+    ['', undefined], ['soon', undefined], ['-5', undefined], [undefined, undefined],
+  ]) assert.equal(retryAfterHeader(value), expected, String(value))
+})
+
+test('WorkBuddy preserves a rate-limit deadline sent as an HTTP date', async (t) => {
+  const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
+  t.mock.method(Date, 'now', () => NOW)
+  const client = new WorkBuddyUpstreamClient({ fetchImpl: async () => new Response('rate limited', {
+    status: 429, headers: { 'retry-after': RETRY_AT },
+  }) })
+  const result = await client.chatStream({
+    accessToken: 'fixture', refreshToken: '', domain: 'www.codebuddy.cn', expiresAtMs: 0,
+  }, '{}')
+  assert.equal(result.ok, false)
+  assert.equal(result.kind, 'soft_rate')
+  assert.equal(result.retryAfter, 300)
+})
+
+test('source accounts stay behind healthy accounts until the HTTP-date wait expires', (t) => {
+  let now = NOW
+  t.mock.method(Date, 'now', () => now)
+  const pool = sourceFailureContext(() => 60_000)
+  const accounts = [{ label: 'limited' }, { label: 'healthy' }]
+  const order = () => pool.orderSourceCredentials('trae', 'cn', accounts, account => account.label, true)
+    .map(account => account.label)
+  pool.noteSourceFailure('trae', 'cn', 'limited', RETRY_AT)
+  now += 120_000
+  assert.deepEqual(order(), ['healthy', 'limited'])
+  now += 180_000
+  assert.deepEqual(order(), ['limited', 'healthy'])
 })
 
 /**
@@ -2634,25 +2639,21 @@ test('a credential whose refresh token has expired still reaches the pool', asyn
   })
   const spentPool = new WorkBuddyAccountPool({ authDirs: [spentDir] })
   const livePool = new WorkBuddyAccountPool({ authDirs: [liveDir] })
-  try {
-    assert.equal((await spentPool.scan()).length, 1,
-      'a sign-in whose refresh token is spent must still be listed, not discarded whole')
-    const spent = spentPool.list()[0].credential
-    assert.equal(spent.accessToken, 'live-token',
-      'the access token beside a spent refresh token is still a usable sign-in')
-    assert.equal(spent.refreshToken, '',
-      'a refresh token past its own expiry renews nothing, so it must not be carried')
-    assert.equal(spent.refreshExpiresAtMs, undefined,
-      'and the expiry that disqualified it must not be published either')
-    // The control: the same file with time left on the refresh token keeps it.
-    assert.equal((await livePool.scan()).length, 1, 'the control must list the same sign-in')
-    const live = livePool.list()[0].credential
-    assert.equal(live.accessToken, 'live-token', 'the control must read the same access token')
-    assert.equal(live.refreshToken, 'refresh-me', 'a refresh token with time left is still carried')
-    assert.equal(live.refreshExpiresAtMs, future, 'and so is the expiry it carries')
-  } finally {
-    fs.rmSync(temporary, { recursive: true, force: true })
-  }
+  assert.equal((await spentPool.scan()).length, 1,
+    'a sign-in whose refresh token is spent must still be listed, not discarded whole')
+  const spent = spentPool.list()[0].credential
+  assert.equal(spent.accessToken, 'live-token',
+    'the access token beside a spent refresh token is still a usable sign-in')
+  assert.equal(spent.refreshToken, '',
+    'a refresh token past its own expiry renews nothing, so it must not be carried')
+  assert.equal(spent.refreshExpiresAtMs, undefined,
+    'and the expiry that disqualified it must not be published either')
+  // The control: the same file with time left on the refresh token keeps it.
+  assert.equal((await livePool.scan()).length, 1, 'the control must list the same sign-in')
+  const live = livePool.list()[0].credential
+  assert.equal(live.accessToken, 'live-token', 'the control must read the same access token')
+  assert.equal(live.refreshToken, 'refresh-me', 'a refresh token with time left is still carried')
+  assert.equal(live.refreshExpiresAtMs, future, 'and so is the expiry it carries')
 })
 
 /**
@@ -3292,6 +3293,7 @@ test('a WorkBuddy stream that fails mid-flight ends with a terminator', async ()
     account: { uin: 'u-1', nickname: 'Fixture' },
   }))
   const pool = new WorkBuddyAccountPool({ authDirs: [dir] })
+  const secret = 'sample.token.value'
   let sent = false
   const failing = new ReadableStream({
     pull(controller) {
@@ -3303,7 +3305,7 @@ test('a WorkBuddy stream that fails mid-flight ends with a terminator', async ()
         controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
         return
       }
-      controller.error(new Error('Bearer sample.token.value rejected'))
+      controller.error(new Error(`Bearer ${secret} rejected`))
     },
   })
   const client = {
@@ -3321,10 +3323,11 @@ test('a WorkBuddy stream that fails mid-flight ends with a terminator', async ()
       body: JSON.stringify({ model: 'hy3', messages: [{ role: 'user', content: 'hi' }] }),
     })
     const body = await answer.text()
+    assert.ok(body.includes('"content":"hi"'), 'the first content reaches the client before the failure')
     assert.match(body, /"error"\s*:\s*\{/, 'the failure must reach the client in band')
     assert.match(body, /upstream_error/, 'and it must be named as the upstream\'s doing')
     assert.match(body, /data: \[DONE\]/, 'and the stream must still carry its terminator')
-    assert.doesNotMatch(body, /eyJhbGciOi\.real\.token\.value/,
+    assert.equal(body.includes(secret), false,
       'the relayed error text is redacted before it leaves the process')
   } finally {
     await shim.close()
@@ -4879,11 +4882,7 @@ test('a nickname-only sign-in is not adopted into a new copy on every scan', asy
   }))
   const { WorkBuddyAccountPool } = require('../src/accounts.ts')
   const pool = new WorkBuddyAccountPool({ authDirs: [dir], dataPath: () => data, cooldownMs: 60_000 })
-  try {
-    assert.equal((await pool.scan()).length, 1)
-    assert.equal((await pool.scan()).length, 1,
-      'a snapshot with no uin/uid keeps serving from where it lies; it must not spawn a copy per scan')
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
-  }
+  assert.equal((await pool.scan()).length, 1)
+  assert.equal((await pool.scan()).length, 1,
+    'a snapshot with no uin/uid keeps serving from where it lies; it must not spawn a copy per scan')
 })

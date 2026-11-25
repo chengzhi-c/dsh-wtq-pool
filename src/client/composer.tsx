@@ -235,11 +235,8 @@ const PANEL_MAX_HEIGHT = 320
 /**
  * Where the popup sits, given its trigger's box.
  *
- * Anchored above the trigger and right-aligned to it - the composer row is at
- * the bottom of the window, so above is where the room is. Flipped below when
- * the trigger is near the top and the popup would not fit above it: a fixed
- * position is not scrolled into view by anything, so the rows above the trigger
- * would simply be cut off, and so would the popup's own first rows.
+ * Uses the roomier side of the trigger and caps the height to that space so
+ * the account list stays reachable in a short window.
  *
  * Right-aligned by pinning `right`, not by a width this code would have to
  * guess: the stylesheet sizes the box to its contents, so a two-column table of
@@ -252,13 +249,11 @@ const PANEL_MAX_HEIGHT = 320
  * that edge whenever the trigger sat away from the right one.
  */
 function positionStyle(rect: DOMRect): React.CSSProperties {
-  const above = rect.top - PANEL_MARGIN >= PANEL_MAX_HEIGHT
-  const right = typeof window === 'undefined'
-    ? PANEL_MARGIN
-    : Math.max(PANEL_MARGIN, window.innerWidth - rect.right)
-  const width = typeof window === 'undefined'
-    ? PANEL_MAX_WIDTH
-    : Math.max(0, Math.min(PANEL_MAX_WIDTH, window.innerWidth - right - PANEL_MARGIN))
+  const above = Math.max(0, rect.top - PANEL_MARGIN * 2)
+  const below = Math.max(0, window.innerHeight - rect.bottom - PANEL_MARGIN * 2)
+  const opensAbove = above >= below
+  const right = Math.max(PANEL_MARGIN, window.innerWidth - rect.right)
+  const width = Math.max(0, Math.min(PANEL_MAX_WIDTH, window.innerWidth - right - PANEL_MARGIN))
   // The floor is clamped the same way the cap is, so a window too narrow for it
   // narrows the box instead of pushing it off the edge.
   const floor = Math.min(PANEL_MIN_WIDTH, width)
@@ -266,8 +261,9 @@ function positionStyle(rect: DOMRect): React.CSSProperties {
     right: right + 'px',
     minWidth: floor + 'px',
     maxWidth: width + 'px',
-    top: (above ? rect.top - PANEL_MARGIN : rect.bottom + PANEL_MARGIN) + 'px',
-    transform: above ? 'translateY(-100%)' : undefined,
+    top: (opensAbove ? rect.top - PANEL_MARGIN : rect.bottom + PANEL_MARGIN) + 'px',
+    maxHeight: Math.min(PANEL_MAX_HEIGHT, opensAbove ? above : below),
+    transform: opensAbove ? 'translateY(-100%)' : undefined,
   }
 }
 

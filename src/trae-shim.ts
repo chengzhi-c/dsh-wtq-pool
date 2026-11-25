@@ -440,6 +440,7 @@ export function bridgeTraeStream(
       return
     }
     if (emittedFinishReason) return
+    upstreamDone = true
     emittedFinishReason = true
     controller.enqueue(chunk({}, openAIFinishReason(decoded.finishReason, sawToolCalls)))
   }

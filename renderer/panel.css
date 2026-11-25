@@ -101,6 +101,9 @@ html, body {
 
 body { padding-top: var(--xd-titlebar); }
 
+/* Keep wheel and touch scrolling inside the embedded panel at its boundaries. */
+html, body { overscroll-behavior-y: contain; }
+
 /* Browser-native surfaces carry the design too: selection. */
 ::selection { background: color-mix(in srgb, var(--xd-accent) 25%, transparent); }
 

@@ -261,14 +261,16 @@ test('composer limits hidden-roster warmup to its startup window', async () => {
   } finally { fixture.dispose() }
 })
 
-test('the panel measures a remounted iframe, waits for its body and caps its height', () => {
+test('the panel keeps its viewport when content grows and reloads by remounting once', () => {
   const effects = [], states = []
-  let frame, measure, PanelCard
+  const timers = []
+  let cursor = 0, frame, PanelCard
   const React = {
-    useRef(value) { frame = { current: value }; return frame },
+    useRef(value) { frame ??= { current: value }; return frame },
     useMemo: read => read(),
-    useState(value) { const index = states.push(value) - 1; return [value, next => { states[index] = typeof next === 'function' ? next(states[index]) : next }] },
-    useEffect: effect => effects.push(effect), createElement: () => null,
+    useState(value) { const index = cursor++; if (!(index in states)) states[index] = value; return [states[index], next => { states[index] = typeof next === 'function' ? next(states[index]) : next }] },
+    useEffect: effect => effects.push(effect),
+    createElement: (tag, props, ...children) => ({ tag, props, children }),
   }
   const { apply } = loadSource('src/client/index.tsx', {
     react: React,
@@ -276,29 +278,31 @@ test('the panel measures a remounted iframe, waits for its body and caps its hei
     './panel-url.ts': { panelUrl: () => '/fixture', PANEL_BASE: '/fixture' },
     '../ids.ts': { PLUGIN_NAME: 'fixture', ROW_ID: 'fixture' },
   }, {
-    document: { hidden: false, documentElement: { dataset: { base: 'light' }, lang: 'zh-CN' } },
-    window: { setInterval: callback => { measure = callback; return 1 }, clearInterval() {} },
+    document: { hidden: false, documentElement: { dataset: { base: 'light' }, lang: 'zh-CN' },
+      addEventListener() {}, removeEventListener() {} },
+    window: { setInterval: callback => { timers.push(callback); return timers.length }, clearInterval() {} },
     fetch: async () => ({ ok: true }),
   })
   apply({ effect: run => run(), locale: { register: () => () => {} },
     slots: { inject: (_key, run) => run(), register: (options, component) => { if (options.name === 'plugins.bundle.config') PanelCard = component } },
   })
-  PanelCard({ t: key => key })
+  const render = () => { cursor = 0; return PanelCard({ t: key => key }) }
+  const initial = render()
+  const initialFrame = initial.children[1]
   const cleanups = effects.map(run => run())
   try {
-    measure()
-    assert.equal(states[1], 0)
-    for (const contentDocument of [null, { body: null }]) {
-      frame.current = { contentDocument }
-      measure()
-      assert.equal(states[1], 0)
+    let navigations = 0
+    const document = { body: { scrollHeight: 5000 } }
+    if (frame) frame.current = { contentDocument: document, set src(value) { navigations++ } }
+    for (const height of [5000, 500]) {
+      document.body.scrollHeight = height
+      for (const tick of timers) tick()
+      assert.deepEqual(json(render().children[1].props.style), json(initialFrame.props.style),
+        'content changes must not stretch the frame and move confirmations outside the screen')
     }
-    frame.current = { contentDocument: { body: { scrollHeight: 500 } } }
-    measure()
-    assert.equal(states[1], 502)
-    frame.current = { contentDocument: { body: { scrollHeight: 5000 } } }
-    measure()
-    assert.equal(states[1], 1900)
+    initial.children[0].children[1].children[0].props.onClick()
+    assert.notEqual(render().children[1].props.key, initialFrame.props.key)
+    assert.equal(navigations, 0, 'remounting is the reload; do not navigate the old frame too')
   } finally { for (const cleanup of cleanups) cleanup?.() }
 })
 
@@ -340,6 +344,26 @@ function panelFixture() {
     },
   }
 }
+
+test('the panel bridge rejects invalid JSON without losing HTTP error messages', async (t) => {
+  const fixture = panelFixture()
+  t.after(() => fixture.dispose())
+  const page = await fixture.send('/panel')
+  const script = page.body.match(/<script nonce="[^"]+">([^]*?)<\/script>/)[1]
+  let response
+  const context = vm.createContext({ document: { documentElement: { dataset: {} } }, window: {}, fetch: async () => response })
+  vm.runInContext(script, context)
+  const invoke = () => context.window.pluginBridge.invoke('xd.setSource', { enabled: false })
+
+  response = new Response('{"result":{"enabled":false}}')
+  assert.deepEqual(await invoke(), { enabled: false })
+  response = new Response('<html>connection interrupted</html>')
+  await assert.rejects(invoke(), { name: 'SyntaxError' })
+  response = new Response('unauthorized', { status: 401 })
+  await assert.rejects(invoke(), /HTTP 401/)
+  response = new Response('{"error":"fixture failure"}', { status: 500 })
+  await assert.rejects(invoke(), /fixture failure/)
+})
 
 test('all panel resources and RPC reject remote peers even with absent or forged local headers', async () => {
   const fixture = panelFixture()

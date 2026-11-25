@@ -13,7 +13,7 @@
  * stands. Every upstream is a stub and every auth directory a scratch one.
  */
 const assert = require('node:assert/strict')
-const { test } = require('node:test')
+const { test, after } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -23,7 +23,11 @@ const { root, transpile } = require('./ts-loader.cjs')
 const { WorkBuddyAccountPool } = require('../src/accounts.ts')
 const { upstreamErrorKind } = require('../src/upstream.ts')
 
-const scratch = (label) => fs.mkdtempSync(path.join(os.tmpdir(), `dsh-refused-${label}-`))
+const scratch = (label) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), `dsh-refused-${label}-`))
+  after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  return directory
+}
 
 function writeSignIn(dir, uid, nickname = 'Fixture') {
   fs.mkdirSync(dir, { recursive: true })
@@ -49,28 +53,53 @@ function poolWith(dir, refreshAnswer) {
   return new WorkBuddyAccountPool({ authDirs: [dir], client })
 }
 
-test('a read the upstream refuses is retried once after a forced refresh', async () => {
+test('parallel refused reads share the renewed token and retry once each', async () => {
   const dir = scratch('retry')
   writeSignIn(dir, '90000001001')
-  const pool = poolWith(dir, () => ({ accessToken: 'fresh-token', refreshToken: 'fresh-refresh', expiresInSec: 3600 }))
+  let refreshes = 0
+  const pool = poolWith(dir, () => ({ accessToken: `fresh-${++refreshes}`, expiresInSec: 3600 }))
   const [account] = await pool.scan()
-
+  const oldToken = account.credential.accessToken
+  let release
+  const renewed = new Promise(resolve => { release = resolve })
   let calls = 0
-  const value = await pool.readAfterRefresh(account.id, async (credential) => {
+  const read = async (credential) => {
     calls += 1
-    // The first read rides the token the file holds; the retry rides the one
-    // the refresh minted, which is the whole point of the second attempt.
-    if (calls === 1) {
-      assert.equal(credential.accessToken, 'token-90000001001')
-      throw refused()
-    }
-    assert.equal(credential.accessToken, 'fresh-token')
+    if (credential.accessToken === oldToken) throw refused()
+    release()
     return { total: 4242 }
-  })
+  }
+  const values = await Promise.all([
+    pool.readAfterRefresh(account.id, read),
+    pool.readAfterRefresh(account.id, async (credential) => {
+      await renewed
+      return read(credential)
+    }),
+  ])
+  assert.deepEqual(values, [{ total: 4242 }, { total: 4242 }])
+  assert.equal(calls, 4, 'each read gets one retry')
+  assert.equal(refreshes, 1, 'a late refusal of the old token reuses the renewal')
+  assert.equal(pool.activeHold(account.id), null)
+})
 
-  assert.deepEqual(value, { total: 4242 }, 'the retry\'s answer is the caller\'s answer')
-  assert.equal(calls, 2, 'one retry, not a loop: the second refusal is the end of it')
-  assert.equal(pool.activeHold(account.id), null, 'an account the refresh saved is not held')
+test('a refused retry cannot hold a token renewed while it was pending', async () => {
+  const dir = scratch('stale-retry')
+  writeSignIn(dir, '90000001001')
+  let refreshes = 0
+  const pool = poolWith(dir, () => ({ accessToken: `fresh-${++refreshes}`, expiresInSec: 3600 }))
+  const [account] = await pool.scan()
+  let calls = 0
+  await assert.rejects(() => pool.readAfterRefresh(account.id, async (credential) => {
+    calls += 1
+    if (calls === 2) {
+      await pool.refreshAccountOutcome(account.id)
+      assert.notEqual(credential.accessToken, account.credential.accessToken)
+    }
+    throw refused()
+  }), /rejected this credential/)
+  assert.equal(calls, 2, 'the superseded retry still ends this read')
+  assert.equal(refreshes, 2)
+  assert.equal(pool.activeHold(account.id), null)
 })
 
 test('a read the refresh cannot save leaves the account held', async () => {
@@ -363,3 +392,38 @@ test('a sign-in the refresh cannot save is held and stops being read', async (t)
     fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
+
+for (const channel of ['xd.growthDetails', 'xd.growthAction']) {
+  test(`${channel} renews a refused sign-in before answering the manual request`, async (t) => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-growth-refused-'))
+    const requests = []
+    t.mock.method(globalThis, 'fetch', async (url, init) => {
+      const token = init.headers.Authorization
+      requests.push({ path: new URL(url).pathname, token })
+      if (token === 'Bearer fixture-token') return new Response('<html>unauthorized</html>', { status: 401 })
+      assert.equal(token, 'Bearer fresh-token')
+      return new Response(JSON.stringify({ code: 0, data: {
+        cells: [{ date: '2026-11-24', score: 1 }], reward_credit: 28,
+      } }), { status: 200 })
+    })
+    const { plugin, calls } = await loadHost(t, temporary)
+    try {
+      const state = await plugin.onPanelInvoke('xd.state', { wait: true })
+      const account = state.accounts.find((row) => row.region === 'cn')
+      const answer = await plugin.onPanelInvoke(channel, { id: account.id, action: 'travelClaim' })
+      if (channel === 'xd.growthDetails') {
+        assert.equal(answer.details.heatmap?.cells[0].score, 1)
+        assert.deepEqual(answer.details.errors, {})
+      } else {
+        assert.equal(answer.result.credit, 28)
+        assert.equal(requests.filter((request) => request.token === 'Bearer fresh-token').length, 1,
+          'the reward is claimed only once after the refused attempt')
+      }
+      assert.equal(calls.refresh, 1)
+      assert.ok(requests.some((request) => request.token === 'Bearer fixture-token'))
+    } finally {
+      await plugin.onUnload()
+      fs.rmSync(temporary, { recursive: true, force: true })
+    }
+  })
+}

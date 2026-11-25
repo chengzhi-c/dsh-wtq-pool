@@ -24,7 +24,7 @@ import type { ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import z from '@deepseek-ai/schemastery'
 import type { SettingsPathOp } from '@deepseek-ai/dsh-settings'
 
-import { installPi, startRegisteredService, stopRegisteredService, type ProviderDescriptor } from './pi-compat'
+import { installPi, startRegisteredService, type ProviderDescriptor } from './pi-compat'
 import { registerPanelRoutes, type WebServerSeam } from './web-panel.ts'
 import { ROW_ID } from './ids.ts'
 import { safeMessage } from './loopback'
@@ -751,14 +751,6 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
     // module-global, so it belongs to the newest activation. An older
     // teardown that stopped the service would close the gateways that one
     // just brought up; the newest activation's own teardown still runs.
-    if (token !== activationToken) return
-    // Awaited, not fired and forgotten: the engine keeps its gateways in
-    // module-global maps, so a reload that repopulates them while this teardown
-    // is still closing the old ones would have the old continuation clear the
-    // new activation's entries.
-    await stopRegisteredService()
-    // A newer activation can start while the stop above is awaited. Its
-    // gateways belong to it, so the old teardown must not run onUnload now.
     if (token !== activationToken) return
     await onUnload()
   })

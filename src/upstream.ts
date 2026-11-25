@@ -16,7 +16,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 
 import type { WorkBuddyCredential } from './accounts'
 import { zonedDay } from './checkin-time'
-import { boundedRetryAfterSeconds, redactSecrets, withRelayStream } from './loopback'
+import { retryAfterHeader, redactSecrets, withRelayStream } from './loopback'
 
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
 export type UpstreamErrorKind =
@@ -251,9 +251,8 @@ export function tokenExpiryMs(expiresInSec: number | undefined): number {
  * place a 429 window can be stated that the body parser does not cover.
  */
 export function retryAfterSeconds(headers: Headers): number | undefined {
-  const raw = headers.get('retry-after')
-  if (raw === null || raw.trim() === '') return undefined
-  return boundedRetryAfterSeconds(Number(raw.trim()))
+  const wait = retryAfterHeader(headers.get('retry-after'))
+  return wait === undefined ? undefined : Number(wait)
 }
 
 /**
@@ -2038,10 +2037,14 @@ export class WorkBuddyUpstreamClient {
     await Promise.all([
       ...Object.entries(paths).map(async ([key, path]) => {
         try { data[key] = await this.growthJson(credential, 'GET', path) }
-        catch (error) { errors[key] = redactSecrets(error instanceof Error ? error.message : String(error)) }
+        catch (error) {
+          if (upstreamErrorKind(error) === 'session_dead') throw error
+          errors[key] = redactSecrets(error instanceof Error ? error.message : String(error))
+        }
       }),
       domestic
         ? this.fetchBuddyInfo(credential).then((value) => { buddy = value }).catch((error) => {
+          if (upstreamErrorKind(error) === 'session_dead') throw error
           errors.buddy = redactSecrets(error instanceof Error ? error.message : String(error))
         })
         : Promise.resolve(),

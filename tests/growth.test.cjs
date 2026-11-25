@@ -152,6 +152,23 @@ test('reading the growth state spends nothing', async (t) => {
         tiers: 1, tierList: STREAK.tiers, makeupCards: 2, lottery: 2,
       }],
     }, 'the card reads one row per account: the streak, the cards and the draws')
+    let renewals = 0
+    t.mock.method(WorkBuddyUpstreamClient.prototype, 'refreshToken', async () => ({
+      accessToken: `renewed-${++renewals}`, refreshToken: 'renewed-refresh', expiresInSec: 86400,
+    }))
+    for (const [method, value] of [['growthStreakFull', STREAK], ['lotteryChances', 2]]) {
+      const previousToken = renewals === 0 ? 'fixture-token' : `renewed-${renewals}`
+      t.mock.method(WorkBuddyUpstreamClient.prototype, method, async (credential) => {
+        if (credential.accessToken === previousToken) throw Object.assign(new Error('session expired'), { kind: 'session_dead' })
+        return value
+      })
+      const recovered = (await plugin.onPanelInvoke('xd.growthState')).growth
+      assert.equal(recovered.failed, 0, `${method} resumes after the session is renewed`)
+      assert.equal(recovered.rows[0].days, 12)
+      assert.equal(recovered.rows[0].lottery, 2)
+    }
+    assert.equal(renewals, 2)
+    assert.deepEqual(spent.map(([name]) => name).filter((name) => MUTATING.includes(name)), [])
     t.mock.method(WorkBuddyUpstreamClient.prototype, 'lotteryChances', async () => { throw new Error('lottery unavailable') })
     const partial = (await plugin.onPanelInvoke('xd.growthState')).growth
     assert.equal(partial.failed, 1)
@@ -203,12 +220,20 @@ test('a growth read is published, and dropped when the region is switched off', 
   }
 })
 
-test('a growth run collects rewards and dispatches an idle cat', async (t) => {
+test('a growth run renews its session and collects rewards', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-'))
   const { plugin, spent } = await loadPlugin(t, temporary, {
     streak: STREAK, chances: 2, makeupCards: 2, missedYesterday: true,
     receipt: { credit: 150, energy: 8 },
     buddy: { name: 'cat' },
+  })
+  const refresh = t.mock.method(WorkBuddyUpstreamClient.prototype, 'refreshToken', async () => ({
+    accessToken: 'renewed-token', refreshToken: 'renewed-refresh', expiresInSec: 86400,
+  }))
+  const readCards = WorkBuddyUpstreamClient.prototype.makeupCards
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'makeupCards', async (credential) => {
+    if (credential.accessToken === 'fixture-token') throw Object.assign(new Error('session expired'), { kind: 'session_dead' })
+    return readCards(credential)
   })
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchTravelStatus', async () => ({ state: 'idle' }))
   const depart = t.mock.method(WorkBuddyUpstreamClient.prototype, 'departTravel', async () => {})
@@ -221,6 +246,7 @@ test('a growth run collects rewards and dispatches an idle cat', async (t) => {
     assert.equal(detail.lottery, 2, 'and both draws are spent')
     assert.equal(detail.accounts, 1)
     assert.equal(detail.failed, 0)
+    assert.equal(refresh.mock.callCount(), 1)
     // The top-level counts are the ones the check-in log has always shown, so a
     // breakdown that disagreed with them would be a second source of truth.
     assert.equal(answer.growth.streak, 1)

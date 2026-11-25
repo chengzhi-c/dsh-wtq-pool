@@ -4877,6 +4877,7 @@ function saveModels() {
   if (busy !== null) return;
   var page = modelPage();
   var submittedSlot = draftSlot;
+  var submittedKey = currentModelKey();
   var enabledModelIds = [];
   var overrides = Object.create(null);
   page.list.forEach(function (model) {
@@ -4921,7 +4922,7 @@ function saveModels() {
     draftSlot = null;
     // The edit is done: the sheet collapses with the draft it belonged to
     // instead of reopening on the rebuild and leaving the row marked as edited.
-    if (selectedSheet !== null && selectedSheet.key === currentModelKey()) selectedSheet = null;
+    if (selectedSheet !== null && selectedSheet.key === submittedKey) selectedSheet = null;
     render();
     announce(t("models.saved"));
   }).catch(function (error) {

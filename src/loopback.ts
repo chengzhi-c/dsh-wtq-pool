@@ -538,9 +538,12 @@ export function boundedRetryAfterSeconds(seconds: number): number | undefined {
  * or a number of years is dropped rather than forwarded.
  */
 export function retryAfterHeader(value: unknown): string | undefined {
-  const seconds = typeof value === 'number'
+  let seconds = typeof value === 'number'
     ? value
     : typeof value === 'string' && value.trim() !== '' ? Number(value) : Number.NaN
+  if (Number.isNaN(seconds) && typeof value === 'string') {
+    seconds = (Date.parse(value) - Date.now()) / 1000
+  }
   const bounded = boundedRetryAfterSeconds(seconds)
   return bounded === undefined ? undefined : String(bounded)
 }

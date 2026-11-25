@@ -44,6 +44,8 @@ const zh: Record<string, string> = {
   'row.desc': '将本机 WorkBuddy、Trae、Qoder 桌面登录接入统一账号池，并按设置切换账号。',
   'card.title': '账号池',
   'card.open': '重新载入面板',
+  'card.fullscreen': '全屏',
+  'card.exitFullscreen': '退出全屏',
   'card.frameTitle': '账号池面板',
   'card.missing': '面板资源缺失。重新安装插件可恢复。',
   'card.probeFailed': '面板打开失败：',
@@ -55,6 +57,8 @@ const en: Record<string, string> = {
   'row.desc': 'Connects local WorkBuddy, Trae and Qoder desktop sign-ins to one account pool and switches accounts according to its settings.',
   'card.title': 'Account pool',
   'card.open': 'Reload panel',
+  'card.fullscreen': 'Full screen',
+  'card.exitFullscreen': 'Exit full screen',
   'card.frameTitle': 'Account pool panel',
   'card.missing': 'Panel assets are missing. Reinstall the plugin to restore them.',
   'card.probeFailed': 'The panel did not open:',
@@ -77,11 +81,17 @@ interface CardProps {
  * entirely - the host supplies `view` for exactly that distinction.
  */
 function PanelCard({ t, view }: CardProps): React.ReactElement | null {
+  const card = React.useRef<HTMLElement>(null)
+  const [fullscreen, setFullscreen] = React.useState(false)
   const [generation, setGeneration] = React.useState(0)
-  const [measured, setMeasured] = React.useState(0)
   const [missing, setMissing] = React.useState(false)
   const [probeFailure, setProbeFailure] = React.useState<string | null>(null)
-  const frameRef = React.useRef<HTMLIFrameElement | null>(null)
+
+  React.useEffect(() => {
+    const sync = (): void => setFullscreen(document.fullscreenElement === card.current)
+    document.addEventListener('fullscreenchange', sync)
+    return () => document.removeEventListener('fullscreenchange', sync)
+  }, [])
 
   const appearance = React.useMemo(() => {
     if (typeof document === 'undefined') return { base: 'light', lang: 'zh-CN' }
@@ -160,65 +170,42 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
     return () => { live = false }
   }, [view, generation])
 
-  // Follow the panel's own height.
-  //
-  // The frame is same-origin (the host half serves the panel on this host), so
-  // its document can be measured directly. Watching beats measuring once: the
-  // panel redraws itself from a poll, and its pages differ in length, so a single
-  // reading at load would fix the frame to whichever view happened to be up. The
-  // panel posts nothing to its parent, so there is no event to subscribe to.
-  React.useEffect(() => {
-    if (view === 'summary') return undefined
-    const measure = () => {
-      if (document.hidden === true) return
-      const frame = frameRef.current
-      const doc = frame === null ? null : frame.contentDocument
-      // `body` is null between the new document being installed and its content
-      // arriving, and the read below has no other guard. Measured there it threw,
-      // which is a page error on every load and a skipped reading.
-      if (doc === null || doc.body === null) return
-      // `body.scrollHeight`, not `documentElement`'s: the root element's own
-      // height is at least the frame's viewport, so measuring it can only ever
-      // report a frame that never shrinks - the panel would keep the box its
-      // longest page needed.
-      const height = Math.min(FRAME_MAX_HEIGHT, doc.body.scrollHeight + FRAME_BORDER)
-      setMeasured((current) => (current === height ? current : height))
-    }
-    const timer = window.setInterval(measure, 400)
-    return () => window.clearInterval(timer)
-  }, [view, generation])
-
   if (view === 'summary') {
     return React.createElement('p', { style: SUMMARY_STYLE }, t('row.desc'))
   }
 
-  return React.createElement('section', { style: CARD_STYLE },
+  return React.createElement('section', {
+    ref: card,
+    style: fullscreen ? { ...CARD_STYLE, ...FULLSCREEN_STYLE, colorScheme: appearance.base } : CARD_STYLE,
+  },
     React.createElement('header', { style: HEAD_STYLE },
       React.createElement('div', null,
         React.createElement('strong', null, t('card.title')),
       ),
-      React.createElement('button', {
-        type: 'button',
-        style: BUTTON_STYLE,
-        onClick: () => {
-          // Reloading is the action here: it is also how the panel picks up a
-          // theme that changed while it was on screen.
-          setMeasured(0)
-          setGeneration((value) => value + 1)
-          const frame = frameRef.current
-          if (frame !== null) frame.src = panelUrl(appearance)
-        },
-      }, t('card.open')),
+      React.createElement('div', { style: ACTIONS_STYLE },
+        React.createElement('button', {
+          type: 'button',
+          style: BUTTON_STYLE,
+          onClick: () => {
+            // Reload also picks up the host's current theme.
+            setGeneration((value) => value + 1)
+          },
+        }, t('card.open')),
+        React.createElement('button', {
+          type: 'button',
+          style: BUTTON_STYLE,
+          onClick: () => fullscreen ? document.exitFullscreen() : card.current!.requestFullscreen(),
+        }, t(fullscreen ? 'card.exitFullscreen' : 'card.fullscreen')),
+      ),
     ),
     missing
       ? React.createElement('div', { style: MISSING_STYLE },
         probeFailure === null ? t('card.missing') : `${t('card.probeFailed')} ${probeFailure}`)
       : React.createElement('iframe', {
         key: generation,
-        ref: frameRef,
         title: t('card.frameTitle'),
         src: panelUrl(appearance),
-        style: measured === 0 ? FRAME_PENDING : { ...FRAME_PENDING, height: measured, minHeight: 0 },
+        style: FRAME_STYLE,
       }),
   )
 }
@@ -233,13 +220,30 @@ const CARD_STYLE: React.CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
   gap: 12,
+  height: '90dvh',
+}
+
+const FULLSCREEN_STYLE: React.CSSProperties = {
+  height: '100dvh',
+  padding: 12,
+  boxSizing: 'border-box',
+  background: 'var(--dsw-alias-bg-layer-1, Canvas)',
+  color: 'var(--dsw-alias-label-primary, CanvasText)',
 }
 
 const HEAD_STYLE: React.CSSProperties = {
   display: 'flex',
   alignItems: 'flex-start',
   justifyContent: 'space-between',
+  flexShrink: 0,
   gap: 12,
+}
+
+const ACTIONS_STYLE: React.CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  justifyContent: 'flex-end',
+  gap: 8,
 }
 
 const BUTTON_STYLE: React.CSSProperties = {
@@ -247,32 +251,17 @@ const BUTTON_STYLE: React.CSSProperties = {
   cursor: 'pointer',
 }
 
-/* The frame's box, before it has measured the panel. */
-const FRAME_PENDING: React.CSSProperties = {
+// Dialogs center in the iframe viewport, so it must stay within one screen.
+const FRAME_STYLE: React.CSSProperties = {
+  display: 'block',
   width: '100%',
-  height: '72vh',
-  minHeight: 460,
+  flex: '1 1 0',
+  minHeight: 0,
   border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,.25))',
   borderRadius: 10,
   background: 'transparent',
-  // `border-box`, so the measured height describes the whole frame: set from the
-  // panel's content alone it would leave the panel the border's worth of
-  // overflow, and the panel would grow a scrollbar for those 2px.
   boxSizing: 'border-box',
 }
-
-/* The frame's border, which `border-box` counts inside the height it is given. */
-const FRAME_BORDER = 2
-
-/* Where the frame stops growing.
- *
- * The frame is sized to the panel's own content so the page scrolls as one,
- * instead of the panel scrolling inside a box that was either too short for its
- * content or too tall for it. The cap is the height four account cards need,
- * measured in the panel at roughly 1.9k px: past it the panel keeps its own
- * scrollbar, so a machine with a dozen accounts cannot stretch the settings page
- * without bound. */
-const FRAME_MAX_HEIGHT = 1900
 
 /* The frame's box, standing in for the panel the host half did not serve.
  *
@@ -280,7 +269,7 @@ const FRAME_MAX_HEIGHT = 1900
  * card that collapsed to two lines reads as the whole plugin having failed,
  * which is a different and worse story than the one being told. */
 const MISSING_STYLE: React.CSSProperties = {
-  ...FRAME_PENDING,
+  ...FRAME_STYLE,
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',

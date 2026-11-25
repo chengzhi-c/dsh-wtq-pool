@@ -6,14 +6,18 @@
  * a stub, so nothing here reaches the network or a real install.
  */
 const assert = require('node:assert/strict')
-const { test } = require('node:test')
+const { test, after } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
 require('./ts-loader.cjs')
 
-const scratch = (label) => fs.mkdtempSync(path.join(os.tmpdir(), `dsh-hardening-${label}-`))
+const scratch = (label) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), `dsh-hardening-${label}-`))
+  after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  return directory
+}
 const encoder = new TextEncoder()
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -207,7 +211,6 @@ test('clearing the pool retires an in-flight scan before its next write', async 
       } finally {
         release()
         await scan
-        fs.rmSync(directory, { recursive: true, force: true })
       }
     })
   }
@@ -249,7 +252,6 @@ test('a new scan after clear is not joined to or released by the retired scan', 
   } finally {
     for (const release of releases) release()
     await Promise.allSettled([first, second, joined])
-    fs.rmSync(directory, { recursive: true, force: true })
   }
 })
 
@@ -280,7 +282,6 @@ for (const method of ['rescan', 'acquire']) test(`a waiting ${method} does not r
   } finally {
     release()
     await Promise.allSettled([scan, request])
-    fs.rmSync(directory, { recursive: true, force: true })
   }
 })
 
@@ -341,14 +342,12 @@ for (const existed of [true, false]) test(`a retired ${existed ? 'empty' : 'miss
     releaseRead()
     releaseWrite()
     await Promise.allSettled([scan, removing])
-    fs.rmSync(directory, { recursive: true, force: true })
   }
 })
 
-for (const mode of ['disabled', 'removed', 'model cooldown', 'all unavailable']) test(`acquire rechecks a fallback refresh after ${mode}`, async (t) => {
+for (const mode of ['disabled', 'removed', 'model cooldown', 'all unavailable']) test(`acquire rechecks a fallback refresh after ${mode}`, async () => {
   const { WorkBuddyAccountPool } = require('../src/accounts.ts')
   const directory = scratch('acquire-refresh')
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const now = Date.now()
   const authDirs = ['a', 'b', 'c'].map((name, index) => {
     const dir = path.join(directory, name)
@@ -385,7 +384,6 @@ for (const mode of ['disabled', 'removed', 'model cooldown', 'all unavailable'])
 for (const fails of [false, true]) test(`a manual rescan reads after the ${fails ? 'failed' : 'successful'} scan already running`, async (t) => {
   const { WorkBuddyAccountPool } = require('../src/accounts.ts')
   const directory = scratch('manual-rescan')
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const pool = new WorkBuddyAccountPool({ authDirs: [directory] })
   const readOnce = pool.scanOnce
   let captured

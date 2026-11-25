@@ -1011,12 +1011,15 @@ test('DSH publishes the live gateway after its preferred port is occupied', asyn
   } finally { await plugin.onUnload(); occupied.closeAllConnections(); await new Promise(resolve => occupied.close(resolve)); fs.rmSync(directory, { recursive: true, force: true }) }
 })
 
-for (const [source, terminal, expected] of [
-  ['trae', 'event: done\ndata: {}\n\n', ''],
-  ['qoder', 'data: [DONE]\n\n', ''],
-  ['trae', 'event: done\ndata: {"response":"最后一段"}\n\n', '最后一段'],
+for (const [source, kind, terminal, expected, finishReason = 'stop'] of [
+  ['trae', 'blank', 'event: done\ndata: {}\n\n', ''],
+  ['qoder', 'blank', 'data: [DONE]\n\n', ''],
+  ['trae', 'content-bearing done', 'event: done\ndata: {"response":"最后一段"}\n\n', '最后一段'],
+  ['trae', 'final text', 'event: output\ndata: {"response":"finished","finish_reason":"stop"}\n\n', 'finished'],
+  ['trae', 'final reasoning', 'event: output\ndata: {"reasoning_content":"finished","finish_reason":"length"}\n\n', 'finished', 'length'],
+  ['trae', 'final tool call', 'event: output\ndata: {"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"done","arguments":"{}"}}],"finish_reason":"stop"}\n\n', '"name":"done"', 'tool_calls'],
 ]) {
-  test(`${source} preflight completes a ${expected === '' ? 'blank' : 'content-bearing'} terminal reply without EOF`, async () => {
+  test(`${source} preflight completes a ${kind} terminal reply without EOF`, async () => {
     const open = source === 'trae' ? require('../src/trae-shim.ts').openTraeResponse : require('../src/qoder-shim.ts').openQoderResponse
     let controller, released = false, timer
     const upstream = new ReadableStream({
@@ -1028,6 +1031,7 @@ for (const [source, terminal, expected] of [
       const body = await Promise.race([read, new Promise(resolve => { timer = setTimeout(() => resolve(null), 250) })])
       assert.notEqual(body, null, 'preflight and relay must both accept a terminal marker without TCP EOF')
       if (expected !== '') assert.ok(body.includes(expected), 'the terminal event must retain its final content')
+      assert.ok(body.includes(`"finish_reason":"${finishReason}"`))
       assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1)
       await new Promise(resolve => setImmediate(resolve))
       assert.equal(released, true)

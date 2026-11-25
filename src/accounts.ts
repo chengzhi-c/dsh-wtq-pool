@@ -1989,7 +1989,6 @@ export class WorkBuddyAccountPool {
     if (account === undefined) return false
     if (!this.ownsSignIn(accountId)) return false
     const ownedPath = account.credential.sourcePath
-    if (!this.isOwnSignInPath(ownedPath)) return false
     const deletingCredential = account.credential
     const sameCredential = (credential: WorkBuddyCredential): boolean =>
       credential.accessToken === deletingCredential.accessToken
@@ -3436,18 +3435,6 @@ export class WorkBuddyAccountPool {
    * nothing about the token and must leave the account in rotation.
    */
   async refreshAccountOutcome(accountId: string): Promise<'refreshed' | 'refused' | 'failed'> {
-    return await this.refreshForRetry(accountId)
-  }
-
-  /**
-   * Refresh after a session-dead answer, keeping a refusal apart from a failure.
-   *
-   * Only the upstream turning the sign-in down justifies a hold. A timeout, a
-   * rate limit or an unreachable host says nothing about the token, and parking
-   * the account for six hours over one bad round trip took a healthy account out
-   * of rotation until a manual reset.
-   */
-  private async refreshForRetry(accountId: string): Promise<'refreshed' | 'refused' | 'failed'> {
     const account = this.accounts.find(item => item.id === accountId)
     if (account === undefined) return 'failed'
     const previous = account.credential.accessToken
@@ -3502,26 +3489,26 @@ export class WorkBuddyAccountPool {
     const account = this.accounts.find(item => item.id === accountId)
     if (account === undefined) throw new Error(`${LOG_PREFIX}: no account ${accountId} to read for`)
     if (this.activeHold(accountId)?.reason === 'session') throw new Error(REFUSED_SIGN_IN_MESSAGE)
+    let credential = account.credential
     try {
-      return await read(account.credential)
+      return await read(credential)
     } catch (error) {
       if (upstreamErrorKind(error) !== 'session_dead') throw error
-      // No retry when the refresh itself was refused: the token the read would
-      // ride is the one the upstream just turned down, so the second attempt
-      // spends a call to learn what the first one already said. A refresh that
-      // failed for any other reason leaves the account in rotation: the token
-      // may still work, and the next read decides.
-      const outcome = await this.refreshForRetry(accountId)
+      // Another read may have renewed this token while its refusal was pending.
+      const outcome = account.credential.accessToken !== credential.accessToken
+        ? 'refreshed' : await this.refreshAccountOutcome(accountId)
       if (outcome === 'refreshed') {
+        credential = account.credential
         try {
-          return await read(account.credential)
+          return await read(credential)
         } catch (retry) {
-          if (upstreamErrorKind(retry) !== 'session_dead') throw retry
-          this.holdRefusedSignIn(accountId)
+          if (upstreamErrorKind(retry) === 'session_dead' && account.credential.accessToken === credential.accessToken) {
+            this.holdRefusedSignIn(accountId)
+          }
           throw retry
         }
       }
-      if (outcome === 'refused') this.holdRefusedSignIn(accountId)
+      if (outcome === 'refused' && account.credential.accessToken === credential.accessToken) this.holdRefusedSignIn(accountId)
       throw error
     }
   }

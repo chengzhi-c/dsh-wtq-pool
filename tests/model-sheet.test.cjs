@@ -279,6 +279,20 @@ test('discarding a draft ends the session too', () => {
   assert.equal(after.classList.contains('is-editing'), false, 'and the rebuilt row is unmarked')
 })
 
+test('a model save finishing on another source keeps that source editor open', async () => {
+  const { context, model } = loadPanelWithButtons()
+  let finish
+  const saving = new Promise(resolve => { finish = resolve })
+  context.invoke = () => saving
+  context.saveModels()
+  context.activeSource = 'trae'
+  const editing = { key: context.currentModelKey(), id: model.id }
+  context.selectedSheet = editing
+  finish({ gateways: [] })
+  await saving
+  assert.equal(context.selectedSheet, editing, 'only the saved gateway may close its editor')
+})
+
 test('a late model roster read preserves saved settings and can be retried on the next visit', async () => {
   const source = fs.readFileSync(path.join(root, 'renderer/panel.js'), 'utf8')
   let finish

@@ -52,11 +52,14 @@ test('an in-band stream error never carries a credential', async () => {
     ['trae', bridgeTraeStream, 'event: output\ndata: {"response":"hello"}\n\n'],
     ['qoder', bridgeQoderStream, 'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n'],
   ]) {
+    let sent = false
     const source = new ReadableStream({
-      start(controller) {
-        controller.enqueue(encoder.encode(opening))
-        // Raised after the first output, so the bridge is past the point where
-        // a status could still carry the failure.
+      pull(controller) {
+        if (!sent) {
+          sent = true
+          controller.enqueue(encoder.encode(opening))
+          return
+        }
         controller.error(new Error(`upstream said: X-Ide-Token ${secret}`))
       },
     })
@@ -65,6 +68,7 @@ test('an in-band stream error never carries a credential', async () => {
       bridge(source, 'fixture-model', { onFailure: (error) => failures.push(error) }),
     ).text()
 
+    assert.ok(body.includes('"content":"hello"'), `${name}: the first content reaches the client before the failure`)
     assert.equal(body.includes(secret), false, `${name}: a credential leaked into the in-band error frame`)
     // A missing terminator left the caller with a stream only a timeout could
     // end, which is the whole shape of the bug.

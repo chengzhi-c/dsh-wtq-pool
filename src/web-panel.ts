@@ -308,8 +308,11 @@ window.pluginBridge = {
         lang: ${JSON.stringify(safeLang)}
       })
     }).then(function (response) {
-      return response.json().catch(function () { return {}; }).then(function (body) {
-        if (response.ok) return body && 'result' in body ? body.result : body;
+      return response.json().catch(function (error) {
+        if (response.ok) throw error;
+        return {};
+      }).then(function (body) {
+        if (response.ok) return body.result;
         throw new Error((body && body.error) || ('HTTP ' + response.status));
       });
     });
@@ -401,7 +404,7 @@ export function registerPanelRoutes(ctx: { webServer: WebServerSeam }, deps: Pan
                 },
               })
             }
-            if (channel.startsWith('xd.') === false || CHANNELS.has(channel) === false) {
+            if (!CHANNELS.has(channel)) {
               return writeJson(res, 400, { error: `unsupported channel: ${channel}` })
             }
             const payload = body['payload'] !== null && typeof body['payload'] === 'object'

@@ -57,18 +57,6 @@ const ENCODE_TABLE = (() => {
 })()
 
 /**
- * The translation for one byte.
- *
- * The `?? byte` is a type-level requirement, not a runtime one:
- * `noUncheckedIndexedAccess` types every indexed read as possibly `undefined`,
- * and every one of the 256 values is present - so the fallback is unreachable
- * and exists only to satisfy the compiler.
- */
-function encodeByteAt(byte: number): number {
-  return ENCODE_TABLE[byte] ?? byte
-}
-
-/**
  * Encode a request body the way `Encode=1` requires: base64 the bytes,
  * translate each character through the permuted alphabet, then rotate the
  * string so the last third comes first and the first third goes last.
@@ -80,9 +68,9 @@ export function encodeBody(plaintext: Buffer | string): Buffer {
   const third = Math.floor(n / 3)
   const out = Buffer.allocUnsafe(n)
   let dst = 0
-  for (let i = n - third; i < n; i++) out[dst++] = encodeByteAt(std.charCodeAt(i))
-  for (let i = third; i < n - third; i++) out[dst++] = encodeByteAt(std.charCodeAt(i))
-  for (let i = 0; i < third; i++) out[dst++] = encodeByteAt(std.charCodeAt(i))
+  for (let i = n - third; i < n; i++) out[dst++] = ENCODE_TABLE[std.charCodeAt(i)]!
+  for (let i = third; i < n - third; i++) out[dst++] = ENCODE_TABLE[std.charCodeAt(i)]!
+  for (let i = 0; i < third; i++) out[dst++] = ENCODE_TABLE[std.charCodeAt(i)]!
   return out
 }
 
