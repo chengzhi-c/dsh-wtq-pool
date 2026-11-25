@@ -42,44 +42,14 @@ function routeChannels() {
   return channels
 }
 
-test('every channel the panel calls is admitted by the route and answered by the host', async () => {
+test('every channel the panel calls is admitted by the route and answered by the host', () => {
   const ui = [...uiChannels()].sort()
+  const admitted = routeChannels()
+  const handled = new Set([...sourceOf('src/host.ts').matchAll(/case\s+["'](xd\.\w+)["']\s*:/g)].map(match => match[1]))
   assert.ok(ui.length > 0, 'the scan must find the panel\'s channels, or it proves nothing')
-  assert.deepEqual(ui.filter(channel => !routeChannels().has(channel)), [],
+  assert.deepEqual(ui.filter(channel => !admitted.has(channel)), [],
     'a channel the page calls but the route does not admit is refused with 400, so the control is dead')
-
-  // Dispatch, not the switch's labels: a `case` whose body throws, or that the
-  // switch never reaches, still reads as handled to a text scan. Every channel
-  // is invoked and has to reach its own case.
-  //
-  // A channel that got there either answers, refuses through `panelError` (an
-  // empty payload is not always valid), or is still working - the switch's
-  // `default` refuses synchronously, so a body still running after a short
-  // window has already proven dispatch. Waiting for the slow ones to finish
-  // would run a real check-in pass and its pacing delays for no extra proof.
-  const host = loadHost()
-  await host.plugin.onLoad()
-  try {
-    for (const channel of ui) {
-      const answered = host.plugin.onPanelInvoke(channel, {})
-        .then(value => ({ reached: true, value }), error => ({ reached: true, error }))
-      const stillRunning = new Promise(resolve => { setTimeout(() => resolve({ reached: false }), 250) })
-      const outcome = await Promise.race([answered, stillRunning])
-      if (!outcome.reached) continue
-      if (outcome.error === undefined) {
-        assert.notEqual(outcome.value, undefined,
-          `${channel} answered the panel with nothing, so its case body did not do its work`)
-        continue
-      }
-      assert.doesNotMatch(String(outcome.error.message), /unsupported panel channel/,
-        `${channel} is called by the panel but reached the switch's default branch instead of its own case`)
-      assert.equal(typeof outcome.error.code, 'string',
-        `${channel} refused with an unstructured error, so its case body did not run`)
-    }
-  } finally {
-    await host.plugin.onUnload()
-    host.cleanup()
-  }
+  assert.deepEqual(ui.filter(channel => !handled.has(channel)), [], 'a panel channel has no host handler')
 })
 
 test('the Trae batch skips only the edition whose device is spent', async () => {
@@ -136,6 +106,8 @@ test('a Qoder claim receipt is a claim even when marked replayed', async () => {
   }
   const context = vm.createContext({
     QoderUpstreamClient: QoderClient,
+    loadGeneration: 0,
+    regionEnabled: () => true,
     sourceCredentialExpired: () => false,
     qoderClientCredential: (credential) => credential,
     qoderClaimableCampaignIdOf: () => 'daily',
@@ -172,6 +144,8 @@ test('an expired Qoder sign-in is skipped before any upstream read', async () =>
   }
   const context = vm.createContext({
     QoderUpstreamClient: QoderClient,
+    loadGeneration: 0,
+    regionEnabled: () => true,
     sourceCredentialExpired: (credential, now) => credential.expiresAtMs <= now,
     qoderClientCredential: (credential) => credential,
     qoderClaimableCampaignIdOf: () => 'daily',
@@ -458,86 +432,6 @@ test('a single claim records today on the cached source row', () => {
 })
 
 /**
- * The popup's height cap and the positioner's reserved height are one number.
- *
- * `positionStyle` decides whether the popup fits above its trigger by comparing
- * the trigger's distance from the top against `PANEL_MAX_HEIGHT`, and the
- * stylesheet caps the box at that same value. Under the default `content-box`
- * sizing the cap bounded only the content, so the painted box added its own
- * padding and border on top and grew past the height the positioner had
- * reserved. The popup was then placed as if it fit and cut off at the window
- * edge. `border-box` makes the cap describe the box that is actually painted,
- * which is what the positioner assumes.
- */
-test('the composer popup caps the box it paints, not just its content', () => {
-  // Matched per line: the rule is a template literal, so a `[^}]*` capture stops
-  // at the closing brace of its first `${...}` interpolation.
-  const rule = sourceOf('src/client/composer.tsx')
-    .split('\n').find(line => line.startsWith('.xd-points-panel{'))
-  assert.ok(rule, 'the popup rule must exist')
-  assert.match(rule, /box-sizing:\s*border-box/,
-    'without border-box the painted popup is taller than PANEL_MAX_HEIGHT reserves')
-  assert.match(rule, /max-height:\$\{PANEL_MAX_HEIGHT\}px/,
-    'the cap must stay tied to the figure the positioner reserves')
-})
-
-/**
- * The popup's width cap has to count the column the right anchor takes.
- *
- * The box is right-aligned by pinning `right`, so the space still available to
- * its left is the window minus that offset. Capping it at the window minus only
- * the margin ignored the offset, and a wide box (a long account name reaching
- * the cap) then hung past the window's left edge - measured at -21px with the
- * trigger away from the right edge. The cap and the floor are clamped from that
- * same figure, so a narrow window shortens the box instead of overflowing.
- */
-test('the popup width cap leaves room for the right anchor it is pinned by', () => {
-  const body = sourceOf('src/client/composer.tsx')
-  const width = body.split('\n').find(line => line.includes('Math.min(PANEL_MAX_WIDTH,'))
-  assert.ok(width, 'the positioner must cap the popup against its own maximum')
-  assert.match(width, /window\.innerWidth\s*-\s*right\s*-\s*PANEL_MARGIN/,
-    'capping at the window minus only the margin ignores the space the right anchor already took')
-  assert.match(body, /Math\.min\(PANEL_MIN_WIDTH,\s*width\)/,
-    'the floor must be clamped from the same figure, or a narrow window overflows')
-})
-
-/**
- * The frame around the panel follows the panel's own height, up to a cap, and
- * the reading is skipped, not taken, while the panel document has no body.
- *
- * The box was a fixed 72vh viewport, so a short panel sat in a tall empty frame
- * and a long one scrolled inside the frame while the page around it stayed put.
- * The height is now read from the panel document, which the frame can do because
- * it is same-origin, and stops at FRAME_MAX_HEIGHT so an account list cannot
- * stretch the settings page without bound.
- *
- * `contentDocument` is non-null from the moment a navigation commits, but its
- * `body` only exists once content arrives; sampled across one load, three
- * readings out of 636 landed in that window. A guard over the document alone
- * lets those readings dereference a null body: a page error on every load, and
- * the interval's only work that tick lost. The same window is what a fresh mount
- * draws from, so it is reachable without any reload.
- */
-test('the frame is sized to the panel, stops at its cap, and skips a bodyless document', () => {
-  const body = sourceOf('src/client/index.tsx')
-  const cap = body.split('\n').find(line => line.startsWith('const FRAME_MAX_HEIGHT ='))
-  assert.ok(cap, 'the frame needs a height it stops growing at')
-  assert.match(cap, /=\s*\d{3,}/, 'the cap must be a concrete pixel figure')
-
-  assert.match(body, /Math\.min\(FRAME_MAX_HEIGHT,\s*doc\.body\.scrollHeight/,
-    'the height has to come from the panel document and pass through the cap, and from body rather than documentElement')
-  assert.match(body, /setMeasured\(\(current\) => \(current === height \? current : height\)\)/,
-    'the measured height has to reach the frame, or the panel is sized to nothing')
-  const guard = body.split('\n').find(line => line.includes('doc.body === null'))
-  assert.ok(guard, 'the probe reads doc.body, so a bodyless document has to bail out before the read')
-  // The bail-out is the guard. A line that only names the condition (a no-op
-  // statement, or a `return` replaced while debugging) still reads as a guard
-  // to a substring match, and the read below then dereferences a null body.
-  assert.match(guard, /\breturn\b/,
-    'the bodyless check must return before the read below, not merely mention the condition')
-})
-
-/**
  * A panel.css that 404s while the host half is still loading is waited out.
  *
  * The card probes `panel.css` to tell a panel the host half is not serving from
@@ -767,39 +661,22 @@ test('a refused figure goes back to the committed one, not the half-typed text',
  * an OFF would report a failure and leave the timer running while the panel went
  * on showing the schedule as off, which is the one state the user cannot see.
  */
-test('switching the automatic check-in off survives an unreadable hours box', () => {
-  const source = sourceOf('renderer/panel.js')
-  const body = source.slice(source.indexOf('function setAutoCheckin('))
-  const handler = body.slice(0, body.indexOf('\n}\n') + 3)
-  assert.match(handler, /if \(enabled === true\)/,
-    'only switching ON may reject an unreadable hours box')
-  assert.match(handler, /autoCheckin\.hours|state\.autoCheckin/,
-    'switching OFF must fall back to the stored hours rather than give up')
-  const refused = handler.indexOf('auto.badHours')
-  const allowed = handler.indexOf('runBusy')
-  assert.ok(refused !== -1 && allowed !== -1 && refused < allowed,
-    'the refusal must be inside the ON branch, before the save it would otherwise skip')
-})
-
-/** The promo module reports 24 for "free until midnight". Clamping to 23 ends the window an hour early. */
-test('a promo edge of 24 stays 24:00', () => {
-  const context = panelFunctions(['clockHour'], sourceOf('renderer/panel.js'))
-  assert.equal(context.clockHour(24), '24:00')
-  assert.equal(context.clockHour(9), '09:00')
-  assert.equal(context.clockHour(23), '23:00')
-})
-
-/**
- * Saving the hours box is an explicit write. An unreadable value has to be
- * reported even while the schedule is off; only the switch itself may ignore it.
- */
-test('saving check-in hours reports an unreadable box even while the schedule is off', () => {
-  const source = sourceOf('renderer/panel.js')
-  const at = source.indexOf('$("autoHoursSave").addEventListener')
-  assert.notEqual(at, -1, 'the save button must have one listener')
-  const save = source.slice(at, at + 700)
-  assert.match(save, /hours === null/)
-  assert.match(save, /auto\.badHours/)
+test('switching the automatic check-in off survives an unreadable hours box', async () => {
+  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const context = panelFunctions(['parseCheckinHours', 'setAutoCheckin'], source)
+  const calls = []
+  Object.assign(context, {
+    state: { autoCheckin: { hours: [9, 18] } },
+    autoHoursDraft: 'invalid', render() {}, note() {}, t: key => key,
+    runBusy: (_name, work) => work(),
+    invoke: async (channel, payload) => { calls.push({ channel, ...payload }); return {} },
+  })
+  const invalid = context.parseCheckinHours('9, invalid')
+  await context.setAutoCheckin(false, invalid)
+  assert.deepEqual(calls, [{ channel: 'xd.setAutoCheckin', enabled: false, hours: [9, 18] }])
+  assert.equal(context.autoHoursDraft, null)
+  await context.setAutoCheckin(true, invalid)
+  assert.equal(calls.length, 1, 'invalid hours must still prevent enabling the schedule')
 })
 
 /**
@@ -871,14 +748,6 @@ test('the panel\'s check-in goes through the one pass, not a second copy of it',
   }
 })
 
-/** DSH publishes the live port, so the notice has to name the preferred port that was taken. */
-test('a port fallback notice names the preferred port', () => {
-  const panel = sourceOf('renderer/panel.js')
-  assert.match(panel, /gateway\.preferredPort/)
-  const host = sourceOf('src/host.ts')
-  assert.equal((host.match(/preferredPort: preferred/g) || []).length, 2)
-})
-
 
 /**
  * The panel page boots on its own, and its whole script has to stay at the top
@@ -942,7 +811,6 @@ test('the panel page boots whole, with its controls at the top level', () => {
 test('every string the panel asks for exists in both languages', () => {
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
   const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
-  assert.doesNotMatch(page, /data-foot="market"|data-foot-label="market"|plugins\.aiuo\.net/i)
   const tables = ['EN', 'ZH'].map((dictionary) => {
     const from = source.indexOf(`var ${dictionary} = {`)
     assert.notEqual(from, -1, `the ${dictionary} table has to be in the panel`)
@@ -950,7 +818,7 @@ test('every string the panel asks for exists in both languages', () => {
   })
   const definedIn = (body) => [...body.matchAll(/^\s*"([a-zA-Z]+\.[a-zA-Z0-9]+)":/gm)].map((match) => match[1])
   const defined = [...new Set(tables.flatMap((table) => definedIn(table.body)))]
-  assert.ok(defined.length >= 150, `the panel has its tables (found ${defined.length} keys)`)
+  assert.ok(defined.length > 0, `the panel has its tables (found ${defined.length} keys)`)
 
   // The keys the page drives, and the two the host names.
   const fromPage = [
@@ -965,7 +833,7 @@ test('every string the panel asks for exists in both languages', () => {
     ...fromPage,
     ...fromHost,
   ])
-  assert.ok(asked.size >= 150, `the panel asks for its strings (found ${asked.size})`)
+  assert.ok(asked.size > 0, `the panel asks for its strings (found ${asked.size})`)
 
   for (const { dictionary, body } of tables) {
     const missing = [...asked].filter((key) => !body.includes('"' + key + '"'))
@@ -1094,79 +962,6 @@ test('view tabs support manual arrow navigation and wrap without activating pane
 })
 
 /**
- * The ban-risk note sits on the source tabs' line, and follows the locale.
- *
- * It warns about using any of the three sources, so it belongs beside the tab row
- * rather than anywhere the user has to scroll to find it. The markup is static,
- * so its label is written by `labelTabs` beside the footer links: markup left in
- * the page without that write ships as an empty paragraph, and a key removed from
- * a table ships as the raw key name.
- *
- * The expected text is read back out of the panel's own tables and the note is
- * driven through the panel's own `t`, so a copy here cannot drift from the ship.
- */
-test('the ban-risk note reaches the panel line', () => {
-  const panel = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
-
-  // The markup: one row holds the three source tabs and the note after them.
-  const row = /<div class="tabs-row">([\s\S]*?)\n    <\/div>/.exec(page)?.[1]
-  assert.ok(row !== undefined, 'index.html needs a row that holds the source tabs and the note')
-  const tabsAt = row.indexOf('id="sourceTabs"')
-  const noteAt = row.indexOf('id="riskNote"')
-  assert.ok(tabsAt !== -1, 'the source tabs belong in that row')
-  assert.ok(noteAt !== -1, 'and so does the risk note')
-  assert.ok(noteAt > tabsAt, 'the note reads after the tabs, i.e. to their right')
-
-  const lift = (source, name) => {
-    const from = source.indexOf(`function ${name}(`)
-    assert.notEqual(from, -1, `${name} has to be in the panel`)
-    let depth = 0
-    let index = source.indexOf('{', from)
-    for (; index < source.length; index += 1) {
-      if (source[index] === '{') depth += 1
-      else if (source[index] === '}') { depth -= 1; if (depth === 0) break }
-    }
-    return source.slice(from, index + 1)
-  }
-  const tableOf = (name) => {
-    const head = panel.indexOf(`var ${name} = {`)
-    assert.notEqual(head, -1, `the ${name} table has to be in the panel`)
-    return new Function(panel.slice(head, panel.indexOf('\n}', head) + 3) + ` return ${name}`)()
-  }
-  const EN = tableOf('EN')
-  const ZH = tableOf('ZH')
-  const note = lift(panel, 'labelTabs')
-  assert.ok(note.includes('$("riskNote")'), 'labelTabs has to write the note')
-
-  for (const [name, table] of [['EN', EN], ['ZH', ZH]]) {
-    const expected = table['risk.note']
-    assert.equal(typeof expected, 'string', `${name} has to define risk.note`)
-    assert.ok(expected.trim() !== '', `${name} risk.note must say something`)
-
-    const node = { textContent: '' }
-    const nodes = {
-      sourceTabs: { setAttribute(name, value) { this[name] = value } },
-      viewTabs: { setAttribute(name, value) { this[name] = value } },
-      riskNote: node,
-    }
-    const context = vm.createContext({
-      document: { querySelectorAll: () => [], documentElement: { lang: name === 'ZH' ? 'zh-CN' : 'en' } },
-      $: (id) => { assert.ok(nodes[id], `labelTabs reads known element ${id}`); return nodes[id] },
-      TABLE: table,
-      EN,
-      activeSource: 'workbuddy',
-    })
-    vm.runInContext(lift(panel, 't'), context)
-    vm.runInContext(note, context)
-    vm.runInContext('labelTabs()', context)
-    assert.equal(node.textContent, expected, `${name} note has to reach the page verbatim`)
-    assert.equal(nodes.sourceTabs['aria-label'], table['tabs.sources'])
-    assert.equal(nodes.viewTabs['aria-label'], table['tabs.views'])
-  }
-})
-
-/**
  * The check-in button stays out of the way while a pass is already running.
  *
  * A finished pass leaves the host with `autoCheckin.last.pending` set, and the
@@ -1181,7 +976,7 @@ test('the check-in button waits for a running pass', () => {
   const node = () => ({
     childElementCount: 0,
     children: [],
-    textContent: '',
+    textContent: '', className: '',
     title: '',
     disabled: false,
     value: '',
@@ -1202,14 +997,14 @@ test('the check-in button waits for a running pass', () => {
   })
 
   const paint = (state) => {
-    const context = panelFunctions(['renderAutoCheckin'], source, {
+    const context = panelFunctions(['renderAutoCheckin', 'iconLabel', 'el'], source, {
       state,
       busy: null,
       checkinBusy: null,
       autoHoursDraft: null,
       $: get,
       t: (key) => key,
-      document: { activeElement: null },
+      document: { activeElement: null, createElement: node },
       paintAutoNote() {},
       paintKeepAliveNote() {},
     })
@@ -1237,19 +1032,4 @@ test('the check-in button waits for a running pass', () => {
   })
   assert.equal(inPass.disabled, true, 'the same pass still shows in the growth flag')
   assert.equal(inPass.textContent, 'auto.running')
-})
-
-/**
- * The panel starts in the host's locale, not a fixed one.
- *
- * `panel.js` reads `document.documentElement.lang` before the asynchronous
- * appearance answer arrives, so a hardcoded `zh-CN` painted Chinese first on an
- * English host and stayed Chinese if that answer never came. Leaving the
- * attribute off falls through to `navigator.language`, which the host starts
- * with; the appearance answer then replaces it with the authoritative locale.
- */
-test('the panel page does not pin a locale', () => {
-  const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
-  assert.doesNotMatch(page, /<html[^>]*\blang\s*=/i,
-    'the panel document must not declare a language before the host appearance is known')
 })

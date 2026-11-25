@@ -722,8 +722,8 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
             res,
             KIND_STATUS[last.kind],
             last.kind,
-            `${subject} (tried ${tried} account(s)); ` +
-              `${advice} — ${last.message.slice(0, 200)}`,
+            `${subject}; accounts tried: ${tried}; ` +
+              `${advice}. ${last.message.slice(0, 200)}`,
           )
           return
         }
@@ -1245,7 +1245,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       res,
       KIND_STATUS[last.kind],
       last.kind,
-      `workbuddy upstream ${last.kind} (http ${last.status}) after ${tried} account(s): ${last.message.slice(0, 400)}`,
+      `workbuddy upstream ${last.kind} (http ${last.status}); accounts tried: ${tried}; ${last.message.slice(0, 400)}`,
     )
   }
 

@@ -43,13 +43,14 @@
         <button type="button" class="tab" data-source="trae" aria-pressed="false">Trae</button>
         <button type="button" class="tab" data-source="qoder" aria-pressed="false">Qoder</button>
       </div>
-      <p class="tab-risk" id="riskNote"></p>
+      <div class="tabs-meta">
+        <p class="host-alert ic-info" id="hostHint" hidden></p>
+        <details class="help-note tab-risk"><summary class="ic-info" data-help-label="risk.title"></summary><p class="help-content" id="riskNote"></p></details>
+      </div>
     </div>
 
     <!-- Only appears when the host has not registered this plugin's model
          groups yet, which needs one plugin reload to clear. -->
-    <p class="hint" id="hostHint" hidden></p>
-
     <!-- Second level: the three views of the selected source. -->
     <nav class="subtabs" id="viewTabs" role="tablist" aria-label="Panel view">
       <button type="button" class="subtab active" id="view-pool" data-tab="pool" role="tab" aria-controls="poolView" aria-selected="true" tabindex="0"></button>
@@ -61,8 +62,10 @@
     <section id="poolView" class="view" role="tabpanel" aria-labelledby="view-pool">
       <div class="source-group" data-source="workbuddy">
         <div class="source-head" id="workbuddyHead"></div>
-        <div class="regions" id="regionTabs" role="group" aria-label="Region"></div>
-        <div class="strip" id="poolStrip"></div>
+        <div class="region-row">
+          <div class="regions" id="regionTabs" role="group" aria-label="Region"></div>
+          <div class="strip" id="poolStrip"></div>
+        </div>
         <div id="accounts"></div>
       </div>
       <div class="source-group" id="traeStrip" data-source="trae" hidden></div>
@@ -70,33 +73,26 @@
       <div class="card">
         <div class="card-head">
           <span class="card-title" id="composerTitle"></span>
-          <span class="muted" id="composerState"></span>
-        </div>
-        <div class="switch-row">
-          <button type="button" class="small" id="showComposerPoints"></button>
-          <span class="switch-copy">
-            <span class="switch-lead" id="composerPointsText"></span>
-            <span class="hint" id="composerPointsHint"></span>
-          </span>
+          <button type="button" class="small ic-eye" id="showComposerPoints"></button>
+          <details class="help-note"><summary class="ic-info" data-help-label="composer.title"></summary><p class="help-content" id="composerPointsHint"></p></details>
         </div>
       </div>
       <div class="card">
         <div class="card-head">
           <span class="card-title" id="autoTitle"></span>
-          <span class="muted" id="autoState"></span>
+          <div class="seg" id="autoControl" role="group"></div>
+          <details class="help-note"><summary class="ic-info" data-help-label="auto.title"></summary><p class="help-content" id="autoHint"></p></details>
         </div>
-        <div class="seg" id="autoControl" role="group"></div>
         <div class="auto-hours">
           <label class="muted" for="autoHours" id="autoHoursLabel"></label>
           <input type="text" id="autoHours" class="search" inputmode="numeric" />
-          <button type="button" id="autoHoursSave" class="small"></button>
-          <button type="button" id="autoRunNow" class="small"></button>
+          <button type="button" id="autoHoursSave" class="small ic-check"></button>
+          <button type="button" id="autoRunNow" class="small ic-play"></button>
         </div>
         <!-- Its own box, below the controls rather than beside them: the lines
              are a log of what a pass did, and sharing a row with the hour field
              made both hard to read. -->
-        <div class="hint log-box" id="autoNote"></div>
-        <p class="hint" id="autoHint"></p>
+        <details class="activity-log"><summary class="ic-activity"><span></span></summary><div class="hint log-box" id="autoNote"></div></details>
       </div>
       <!-- A card of its own: the keep-alive renews tokens rather than collecting
            rewards and has no hour to set, so sharing the check-in card made both
@@ -104,14 +100,10 @@
       <div class="card" id="keepAliveCard">
         <div class="card-head">
           <span class="card-title" id="keepAliveTitle"></span>
+          <button type="button" class="small ic-refresh" id="tokenKeepAliveRun"></button>
+          <details class="help-note"><summary class="ic-info" data-help-label="keepAlive.label"></summary><p class="help-content" id="keepAliveHint"></p></details>
         </div>
-        <div class="switch-row">
-          <button type="button" class="small" id="tokenKeepAliveRun"></button>
-          <span class="switch-copy">
-            <span class="hint" id="keepAliveHint"></span>
-          </span>
-        </div>
-        <div class="hint log-box" id="keepAliveNote"></div>
+        <details class="activity-log"><summary class="ic-activity"><span></span></summary><div class="hint log-box" id="keepAliveNote"></div></details>
       </div>
     </section>
 
@@ -170,7 +162,7 @@
           <span class="copy-hint" id="copyHint"></span>
         </div>
         <div id="findings"></div>
-        <pre id="report" class="report"></pre>
+        <details class="diagnostic-details"><summary id="reportDetails"></summary><pre id="report" class="report"></pre></details>
       </div>
     </section>
 
@@ -183,17 +175,16 @@
         <div class="card-head">
           <span class="card-title" id="growthTitle"></span>
           <span class="muted" id="growthState"></span>
+          <button type="button" class="small ghost ic-refresh" id="growthRead"></button>
+          <button type="button" class="small primary ic-play" id="growthRun"></button>
         </div>
         <div class="switch-row">
-          <button type="button" class="small" id="growthRead"></button>
-          <button type="button" class="small" id="growthRun"></button>
           <span class="switch-copy">
             <span class="switch-lead" id="growthText"></span>
-            <span class="hint" id="growthHint"></span>
           </span>
         </div>
         <div id="growthAccounts"></div>
-        <div class="hint log-box" id="growthNote"></div>
+        <details class="activity-log"><summary class="ic-activity"><span></span></summary><div class="hint log-box" id="growthNote"></div></details>
       </div>
     </section>
 

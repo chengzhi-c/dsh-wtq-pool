@@ -47,7 +47,7 @@ export class SseDecoder {
       // A lone trailing CR is held back: it may be the first half of a CRLF the
       // next chunk completes, and splitting on it early cut a line in two.
       const match = /\r\n|\n|\r/.exec(this.buffer)
-      if (match === null || match.index === undefined) break
+      if (match === null) break
       if (match[0] === '\r' && match.index + 1 === this.buffer.length) break
       const line = this.buffer.slice(0, match.index)
       if (this.onFrame !== undefined) {

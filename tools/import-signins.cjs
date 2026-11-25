@@ -48,7 +48,7 @@ registerHooks({
 })
 // The plugin's own rules, not copies of them: this script must file a sign-in
 // under the same id, name and region the pool would give it.
-const { workbuddyAccountId: accountId, writeOwnSignIn } = require('../src/accounts.ts')
+const { workbuddyAccountId: accountId, writeOwnSignIn, isFresher } = require('../src/accounts.ts')
 const { regionOf } = require('../src/upstream.ts')
 
 const ARCHIVE_FILENAME = 'credentials-archive.json'
@@ -121,13 +121,11 @@ function readSignIn(file) {
     : document
   const accessToken = typeof auth.accessToken === 'string' ? auth.accessToken : ''
   if (accessToken === '') return undefined
-  // A sealed field is the desktop app's own envelope; this tool has no key, and a
-  // half-read credential is worse than a skipped one.
-  if (typeof auth.accessToken !== 'string') return undefined
   const credential = {
     accessToken,
     refreshToken: stringOr(auth.refreshToken, ''),
     expiresAtMs: expiryToMs(auth.expiresAt ?? auth.expiresAtMs),
+    lastRefreshAtMs: expiryToMs(auth.lastRefreshTime ?? auth.lastRefreshAtMs),
     domain: stringOr(auth.domain, ''),
     uid: stringOr(identity.uid, ''),
     uin: stringOr(identity.uin, ''),
@@ -161,15 +159,18 @@ function collectFiles(from) {
   return files
 }
 
-/** `uid -> uin` for the accounts the pool already holds, so an import keeps the same id. */
-function knownIdentities(dataDir) {
-  const byUid = new Map()
+function knownSignIns(dataDir) {
+  const byUid = { cn: new Map(), global: new Map() }
+  const known = new Map()
   const archive = path.join(dataDir, ARCHIVE_FILENAME)
   if (fs.existsSync(archive)) {
     try {
       const parsed = JSON.parse(fs.readFileSync(archive, 'utf8'))
       for (const entry of parsed.entries ?? []) {
-        if (typeof entry?.uid === 'string' && typeof entry?.uin === 'string') byUid.set(entry.uid, entry.uin)
+        if (typeof entry?.id === 'string') known.set(entry.id, 'the credential archive')
+        if (typeof entry?.uid === 'string' && typeof entry.uin === 'string' && entry.uin) {
+          byUid[regionOf(entry.domain ?? '')].set(entry.uid, entry.uin)
+        }
       }
     } catch { /* an unreadable archive costs the id mapping, not the import */ }
   }
@@ -178,34 +179,12 @@ function knownIdentities(dataDir) {
     for (const name of fs.readdirSync(signIns)) {
       if (name.toLowerCase().endsWith('.info') === false) continue
       const signIn = readSignIn(path.join(signIns, name))
-      if (signIn !== undefined && signIn.uid !== '' && signIn.uin !== '') byUid.set(signIn.uid, signIn.uin)
-    }
-  }
-  return byUid
-}
-
-/** Every id the pool already has a sign-in for, from its own directory and its archive. */
-function knownIds(dataDir) {
-  const ids = new Map()
-  const archive = path.join(dataDir, ARCHIVE_FILENAME)
-  if (fs.existsSync(archive)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(archive, 'utf8'))
-      for (const entry of parsed.entries ?? []) {
-        if (typeof entry?.id === 'string') ids.set(entry.id, 'the credential archive')
-      }
-    } catch { /* same as above */ }
-  }
-  const signIns = path.join(dataDir, 'signins')
-  if (fs.existsSync(signIns)) {
-    for (const name of fs.readdirSync(signIns)) {
-      if (name.toLowerCase().endsWith('.info') === false) continue
-      const signIn = readSignIn(path.join(signIns, name))
       if (signIn === undefined) continue
-      ids.set(accountIdOf(signIn), path.join('signins', name))
+      known.set(accountIdOf(signIn), path.join(OWN_SIGN_IN_DIRNAME, name))
+      if (signIn.uid && signIn.uin) byUid[regionOf(signIn.domain)].set(signIn.uid, signIn.uin)
     }
   }
-  return ids
+  return { known, byUid }
 }
 
 async function main() {
@@ -215,31 +194,38 @@ async function main() {
     console.error('error: the data directory does not exist: ' + dataDir)
     process.exit(2)
   }
-  const byUid = knownIdentities(dataDir)
-  const known = knownIds(dataDir)
-  const signIns = path.join(dataDir, 'signins')
+  const { known, byUid } = knownSignIns(dataDir)
+  const signIns = path.join(dataDir, OWN_SIGN_IN_DIRNAME)
 
   const rows = []
-  const seen = new Set()
+  const incoming = []
   for (const file of collectFiles(options.from)) {
     const credential = readSignIn(file)
     if (credential === undefined) continue
-    // The export does not carry the numeric uin the desktop app records, so it is
-    // resolved from the accounts the pool already holds, by uid. Without this the
-    // same person would enter the pool twice, under two ids.
-    const uin = credential.uin !== '' ? credential.uin : (byUid.get(credential.uid) ?? '')
-    const resolved = { ...credential, uin }
-    const id = accountIdOf(resolved)
-    const region = regionOf(resolved.domain)
-    const label = resolved.nickname === '' ? resolved.uid : resolved.nickname
-    if (seen.has(id)) continue
-    seen.add(id)
+    const region = regionOf(credential.domain)
     if (options.region !== 'all' && region !== options.region) {
-      rows.push({ label, region, id, action: 'skipped', why: 'region filter' })
+      rows.push({ label: credential.nickname || credential.uid, region, id: accountIdOf(credential), action: 'skipped', why: 'region filter' })
       continue
     }
+    if (credential.uid && credential.uin) byUid[region].set(credential.uid, credential.uin)
+    incoming.push(credential)
+  }
+  const candidates = new Map()
+  for (const credential of incoming) {
+    const uin = credential.uin || byUid[regionOf(credential.domain)].get(credential.uid) || ''
+    const resolved = { ...credential, uin }
+    const id = accountIdOf(resolved)
+    const previous = candidates.get(id)
+    if (previous === undefined || isFresher({ ...resolved, sourcePath: previous.sourcePath }, previous, signIns)) {
+      candidates.set(id, resolved)
+    }
+  }
+  for (const [id, resolved] of candidates) {
+    const { uin } = resolved
+    const region = regionOf(resolved.domain)
+    const label = resolved.nickname === '' ? resolved.uid : resolved.nickname
     if (uin === '' && resolved.uid === '') {
-      rows.push({ label, region, id, action: 'skipped', why: 'no uid, uin or nickname to key it by' })
+      rows.push({ label, region, id, action: 'skipped', why: 'no uid or uin' })
       continue
     }
     if (known.has(id) && options.force === false) {
@@ -247,12 +233,12 @@ async function main() {
       continue
     }
     // The copy already in `signins/` for this identity, if any: a re-import must
-    // not replace a fresher token with an older one. `knownIds` is the map that
-    // already knows which file each id lives in.
+    // not replace a fresher token with an older one.
     const existingPath = known.get(id)
     if (typeof existingPath === 'string' && existingPath.startsWith(OWN_SIGN_IN_DIRNAME)) {
       const existing = readSignIn(path.join(dataDir, existingPath))
-      if (existing !== undefined && existing.expiresAtMs >= resolved.expiresAtMs) {
+      // Both copies will live in signins/, so compare them at the same source rank.
+      if (existing !== undefined && !isFresher({ ...resolved, sourcePath: existing.sourcePath }, existing, signIns)) {
         rows.push({ label, region, id, action: 'skipped', why: 'the copy on disk is at least as fresh' })
         continue
       }

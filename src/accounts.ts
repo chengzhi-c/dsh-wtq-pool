@@ -469,7 +469,7 @@ function credentialRank(credential: WorkBuddyCredential, ownDir: string): number
 }
 
 /** True when `candidate` should replace `incumbent` for the same account. */
-function isFresher(candidate: WorkBuddyCredential, incumbent: WorkBuddyCredential, ownDir: string): boolean {
+export function isFresher(candidate: WorkBuddyCredential, incumbent: WorkBuddyCredential, ownDir: string): boolean {
   const ordering = compareFreshness(candidate, incumbent, ownDir)
   if (candidate.accessToken !== incumbent.accessToken) return ordering < 0
 

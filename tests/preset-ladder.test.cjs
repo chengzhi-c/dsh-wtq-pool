@@ -38,6 +38,7 @@ function makeDom() {
       this.type = ''
     }
     appendChild(child) { this.children.push(child); return child }
+    insertBefore(child, before) { this.children.splice(this.children.indexOf(before), 0, child) }
     setAttribute(name, value) { this.attributes[name] = value }
     addEventListener(name, fn) { this.listeners[name] = fn }
     click() { if (this.listeners.click) this.listeners.click() }
@@ -60,6 +61,7 @@ function loadPanel() {
     // currentModelKey is not needed.
     selectedSheet: null,
     draft: {},
+    t: key => key, renderChosen() {}, paintSaveBar() {}, overCeilingNotice: assert.fail,
   })
   // `el` is the panel's element helper; lift it and the ladder formatter with it.
   const el = vm.runInContext(`(${lift(source, 'el')})`, context)
@@ -93,14 +95,22 @@ function loadPanel() {
     assert.notEqual(to, -1, `${name} must be a top-level array literal`)
     return vm.runInContext(`(${source.slice(from + head.length - 1, to + 2)})`, context)
   }
+  context.presetRow = presetRow
+  context.CONTEXT_WINDOW_PRESETS = presets('CONTEXT_WINDOW_PRESETS')
+  context.MAX_OUTPUT_PRESETS = presets('MAX_OUTPUT_PRESETS')
+  vm.runInContext(source.match(/^var THINKING_LEVELS = .+$/m)[0] + '\n' + source.match(/^var MAX_TOKEN_BUDGET = .+$/m)[0], context)
+  for (const name of ['iconLabel', 'helpNote', 'modelSheetBody', 'field', 'numberInput', 'outputCeiling', 'effectiveLevels', 'effectiveImages', 'checkRow']) {
+    context[name] = vm.runInContext(`(${lift(source, name)})`, context)
+  }
   return {
+    modelSheetBody: context.modelSheetBody,
     presetRow, presets, formatTokens, withinCeiling, windowCeiling,
     outputCeilingFor, clampOutput, effectiveOutput,
     draftFor, isDirty, reclampEntry, setDraft: (value) => { context.draft = value },
   }
 }
 
-const { presetRow, presets, withinCeiling, windowCeiling, outputCeilingFor, clampOutput, effectiveOutput, draftFor, isDirty, reclampEntry, setDraft } = loadPanel()
+const { modelSheetBody, presetRow, presets, withinCeiling, windowCeiling, outputCeilingFor, clampOutput, effectiveOutput, draftFor, isDirty, reclampEntry, setDraft } = loadPanel()
 const CONTEXT = presets('CONTEXT_WINDOW_PRESETS')
 const OUTPUT = presets('MAX_OUTPUT_PRESETS')
 
@@ -287,38 +297,33 @@ test('a draft carried across a refresh is clamped to the ceiling that is left', 
   assert.equal(saved.m.window, 200000, 'and what the panel shows is already the clamped value')
 })
 
-/**
- * The window controls actually clamp the output, not just the helper.
- *
- * The clamp is only worth anything if the two places a user can change the window
- * call it: the number field and the preset chips. Both were covered at the helper
- * level and not at the call site, so removing the call left every test green and
- * put the old behaviour back - a 32k output left standing under a field whose own
- * `max` had become 16k.
- */
-test('both window controls take the output ceiling with them', () => {
-  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  // Every place that writes `entry.window` from a user gesture must be followed by
-  // the clamp, or the field and its `max` disagree.
-  // The two gestures write `entry.window` from a value the user chose; the draft
-  // repair writes it from the ceiling, so it is not one of them.
-  const writes = [...source.matchAll(/entry\.window = (?:next|tokens)[^;]*;/g)].map((match) => match.index)
-  assert.equal(writes.length, 2, 'the window has exactly two input paths: the field and the chips')
-  for (const at of writes) {
-    const after = source.slice(at, at + 700)
-    assert.match(after, /clampOutput\(model, entry\)/,
-      'a window change must take the output ceiling with it: ' + source.slice(at, at + 80).replace(/\s+/g, ' '))
-  }
-  // And the chips are wired to those writes, not to a bare assignment.
-  assert.match(source, /CONTEXT_WINDOW_PRESETS,[\s\S]{0,600}?clampOutput\(model, entry\)/,
-    'the preset row is wired to the same clamp')
-  // A window the user chose also ends any hold an earlier clamp left behind. The
-  // hold is replayed the moment the ceiling allows it, so keeping it would replace
-  // the user's number with the one a lost Max tier had set aside - on the next
-  // roster refresh, with no gesture behind it.
-  for (const at of writes) {
-    const after = source.slice(at, at + 700)
-    assert.match(after, /entry\.windowHeld = null;/,
-      'a window change must drop the held figure: ' + source.slice(at, at + 80).replace(/\s+/g, ' '))
+test('model controls preserve a valid output budget and editable thinking default', () => {
+  const model = { id: 'fixture', nativeContextWindow: 128000, maxContextWindow: 1000000,
+    nativeMaxOutputTokens: 64000, maxOutputAtCeiling: 16000, nativeThinkingLevels: ['low', 'high'] }
+  const nodes = node => [node, ...node.children.flatMap(nodes)]
+  for (const gesture of ['input', 'preset']) {
+    const entry = { alias: '', window: null, output: 32000, levels: null, defaultLevel: null,
+      images: null, windowHeld: 800000, outputHeld: null }
+    const sheet = modelSheetBody(model, entry)
+    const controls = nodes(sheet)
+    const select = controls.find(node => node.tagName === 'select')
+    assert.deepEqual(select.children.map(option => option.value), ['low', 'high'])
+    select.value = 'high'
+    select.listeners.change()
+    assert.equal(entry.defaultLevel, 'high')
+    assert.equal(controls.filter(node => node.attributes['aria-label'] === 'models.maxOutput').length, 1)
+    if (gesture === 'input') {
+      const input = controls.find(node => node.attributes['aria-label'] === 'models.window')
+      input.value = '1000000'
+      input.listeners.change()
+    } else {
+      controls.find(node => node.tagName === 'button' && node.textContent === '1M').click()
+    }
+    assert.equal(entry.window, 1000000)
+    assert.equal(entry.windowHeld, null)
+    assert.equal(entry.output, 16000)
+    const output = nodes(modelSheetBody(model, entry)).find(node => node.attributes['aria-label'] === 'models.maxOutput')
+    assert.equal(output.max, '16000')
+    assert.equal(output.value, '16000')
   }
 })

@@ -20,13 +20,13 @@
       enabled: true,
       hours: [9],
       last: {
-        slot: '2026-10-10T09',
+        slot: new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }) + 'T09',
         claimed: 3,
         at: iso(-0.2),
-        travel: { departed: 2, claimed: 2, adopted: 1 },
+        travel: { departed: 2, claimed: 2, failed: 0, credit: 18 },
         growth: {
-          streak: 1, credit: 400, failed: 0,
-          detail: { accounts: 4, makeup: 1, gift: 1, compensation: 0, activity: 4, streak: 1, lottery: 2, failed: 0 },
+          streak: 1, credit: 128, failed: 0,
+          detail: { accounts: 4, makeup: 1, activity: 4, streak: 1, lottery: 2, failed: 0 },
         },
         qoder: { claimed: 1, skipped: 0, failed: 0 },
         trae: { claimed: 1, skipped: 0, failed: 0 },
@@ -45,22 +45,17 @@
     // A completed growth read, so the centre shows its figures instead of
     // asking the reader to press "read" in a still screenshot.
     growth: {
+      readEpoch: 0,
       read: {
         readAt: Date.now(),
         accounts: 5,
         failed: 0,
         rows: [
-          { id: 'wb-cn-1', label: 'lin.cn@example.com', region: 'cn', days: 12, tiers: 2, makeupCards: 2, lottery: 1, nextTier: 'Lv.4', nextTierRemaining: 3,
-            tierList: [
-              { tier: 'Lv.2', days: 30, credit: 100, energy: 20, status: 'unlocked' },
-              { tier: 'Lv.3', days: 60, credit: 200, energy: 40, status: 'locked' },
-            ] },
-          { id: 'wb-cn-2', label: 'du.cn@example.com', region: 'cn', days: 5, tiers: 1, makeupCards: 0, lottery: 1,
-            tierList: [{ tier: 'Lv.2', days: 30, credit: 100, energy: 20, status: 'locked' }] },
-          { id: 'wb-cn-3', label: 'wu.cn@example.com', region: 'cn', days: 3, tiers: 0, makeupCards: 1, lottery: 0, tierList: [] },
-          { id: 'wb-cn-4', label: 'qi.cn@example.com', region: 'cn', days: 1, tiers: 0, makeupCards: 0, lottery: 0, failed: true },
-          { id: 'wb-global-1', label: 'lin.ai@example.com', region: 'global', days: 8, tiers: 1, makeupCards: 1, lottery: 0,
-            tierList: [{ tier: 'Lv.3', days: 60, credit: 200, energy: 40, status: 'locked' }] },
+          { id: 'wb-cn-1', label: 'lin.cn@example.com', region: 'cn', makeupCards: 2, lottery: 1 },
+          { id: 'wb-cn-2', label: 'du.cn@example.com', region: 'cn', makeupCards: 0, lottery: 1 },
+          { id: 'wb-cn-3', label: 'wu.cn@example.com', region: 'cn', makeupCards: 1, lottery: 0 },
+          { id: 'wb-cn-4', label: 'qi.cn@example.com', region: 'cn', makeupCards: 0, lottery: 0, failed: true },
+          { id: 'wb-global-1', label: 'lin.ai@example.com', region: 'global', makeupCards: 1, lottery: 0 },
         ],
       },
     },
@@ -136,7 +131,7 @@
         expiresAt: iso(6),
         cooling: true,
         cooldownUntil: new Date(Date.now() + 9 * 60000).toISOString(),
-        modelCooldowns: [{ modelId: 'claude-sonnet-4.5', until: new Date(Date.now() + 5 * 60000).toISOString() }],
+        modelCooldowns: [{ modelId: 'deepseek-v4.1-flash', until: new Date(Date.now() + 5 * 60000).toISOString() }],
         rateLimitHits: 4,
         active: false,
         preferred: false,
@@ -185,70 +180,40 @@
 
     models: [
       {
-        id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5', alias: 'sonnet', region: 'cn', multiplier: 1,
-        supportsImages: true, contextWindow: 200000, maxOutputTokens: 32000,
-        nativeContextWindow: 200000, nativeMaxOutputTokens: 32000, nativeSupportsImages: true,
-        nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: true,
+        id: 'hy4flash-free', name: 'Hy4 Flash Free', region: 'cn', multiplier: 0,
+        supportsImages: true, contextWindow: 200000, maxOutputTokens: 128000,
+        nativeContextWindow: 200000, nativeMaxOutputTokens: 128000, nativeSupportsImages: true,
+        nativeThinkingLevels: ['off', 'low', 'medium', 'high', 'max'], advanced: false,
       },
       {
-        id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', alias: 'gemini', region: 'cn', multiplier: 0.5,
-        supportsImages: true, contextWindow: 1000000, maxOutputTokens: 64000,
-        nativeContextWindow: 1000000, nativeMaxOutputTokens: 64000, nativeSupportsImages: true,
+        id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', region: 'cn', multiplier: 0.15,
+        supportsImages: false, contextWindow: 200000, maxOutputTokens: 128000,
+        nativeContextWindow: 200000, nativeMaxOutputTokens: 128000, nativeSupportsImages: false,
+        nativeThinkingLevels: ['off', 'low', 'medium', 'high', 'max'], advanced: true,
+      },
+      {
+        id: 'kimi-k3.1-pro', name: 'Kimi K3.1 Pro', region: 'cn', multiplier: 0.25,
+        supportsImages: true, contextWindow: 256000, maxOutputTokens: 128000,
+        nativeContextWindow: 256000, nativeMaxOutputTokens: 128000, nativeSupportsImages: true,
         nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: false,
       },
       {
-        id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex', region: 'cn', multiplier: 0,
-        promo: { kind: 'night', untilHour: 6 },
-        supportsImages: false, contextWindow: 400000, maxOutputTokens: 128000,
-        nativeContextWindow: 400000, nativeMaxOutputTokens: 128000, nativeSupportsImages: false,
-        nativeThinkingLevels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'], advanced: false,
-      },
-      {
-        id: 'kimi-k2-thinking', name: 'Kimi K2 Thinking', alias: 'kimi', region: 'cn', multiplier: 0.2,
-        supportsImages: false, contextWindow: 256000, maxOutputTokens: 32000,
-        nativeContextWindow: 256000, maxContextWindow: 1000000, nativeMaxOutputTokens: 32000, maxOutputAtCeiling: 16000, nativeSupportsImages: false,
-        nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: true,
-      },
-      {
-        id: 'deepseek-v3.2', name: 'DeepSeek V3.2', region: 'cn', multiplier: 0.15,
-        supportsImages: false, contextWindow: 128000, maxOutputTokens: 16000,
-        nativeContextWindow: 128000, nativeMaxOutputTokens: 16000, nativeSupportsImages: false,
-        nativeThinkingLevels: [], advanced: false,
-      },
-      {
-        id: 'glm-4.6', name: 'GLM-4.6', region: 'cn', multiplier: 0,
-        promo: { kind: 'night-later', nextHour: 22 },
-        supportsImages: true, contextWindow: 200000, maxOutputTokens: 32000,
-        nativeContextWindow: 200000, nativeMaxOutputTokens: 32000, nativeSupportsImages: true,
-        nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: false,
-      },
-      {
-        id: 'claude-opus-4.1', name: 'Claude Opus 4.1', region: 'global', multiplier: 3,
-        supportsImages: true, contextWindow: 200000, maxOutputTokens: 32000,
-        nativeContextWindow: 200000, nativeMaxOutputTokens: 32000, nativeSupportsImages: true,
-        nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: false,
-      },
-      {
-        id: 'gpt-5.1', name: 'GPT-5.1', alias: 'gpt', region: 'global', multiplier: 1,
-        supportsImages: true, contextWindow: 400000, maxOutputTokens: 128000,
-        nativeContextWindow: 400000, nativeMaxOutputTokens: 128000, nativeSupportsImages: true,
-        nativeThinkingLevels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'], advanced: false,
+        id: 'deepseek-v4.1-flash-sg', name: 'DeepSeek V4.1 Flash SG', region: 'global', multiplier: 0.2,
+        supportsImages: false, contextWindow: 200000, maxOutputTokens: 128000,
+        nativeContextWindow: 200000, nativeMaxOutputTokens: 128000, nativeSupportsImages: false,
+        nativeThinkingLevels: ['off', 'low', 'medium', 'high', 'max'], advanced: false,
       },
     ],
 
     selectionByRegion: {
       cn: {
-        enabledModelIds: ['claude-sonnet-4.5', 'gemini-2.5-pro', 'gpt-5.1-codex', 'kimi-k2-thinking', 'glm-4.6'],
+        enabledModelIds: ['hy4flash-free', 'deepseek-v4.1-flash', 'kimi-k3.1-pro'],
         overrides: {
-          'claude-sonnet-4.5': {
-            alias: 'sonnet', contextWindow: 312000, maxOutputTokens: 32000, supportsImages: true,
-            thinkingLevels: ['off', 'medium', 'high'], defaultThinkingLevel: 'medium',
-          },
-          'gemini-2.5-pro': { alias: 'gemini' },
+          'deepseek-v4.1-flash': { defaultThinkingLevel: 'max' },
         },
       },
       global: {
-        enabledModelIds: ['gpt-5.1'],
+        enabledModelIds: ['deepseek-v4.1-flash-sg'],
         overrides: {},
       },
     },
@@ -280,25 +245,18 @@
       ],
       gateways: [
         {
-          region: 'cn', port: 42851, models: 2, portFallback: false, lastError: '',
+          region: 'cn', port: 42851, models: 1, portFallback: false, lastError: '',
           roster: [
-            { id: 'deepseek-v3.2', name: 'DeepSeek V3.2', alias: '', nativeContextWindow: 128000,
-              nativeMaxOutputTokens: 16000, nativeSupportsImages: false, nativeThinkingLevels: [], advanced: false },
-            { id: 'doubao-seed-1.6', name: 'Doubao Seed 1.6', alias: 'doubao', nativeContextWindow: 256000,
-              nativeMaxOutputTokens: 32000, nativeSupportsImages: true, nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: true },
-            { id: 'kimi-k2-thinking', name: 'Kimi K2 Thinking', alias: '', nativeContextWindow: 256000,
-              maxContextWindow: 1000000, nativeMaxOutputTokens: 32000, maxOutputAtCeiling: 16000,
-              nativeSupportsImages: false, nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: false },
+            { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', alias: '', nativeContextWindow: 200000,
+              nativeMaxOutputTokens: 128000, nativeSupportsImages: false,
+              nativeThinkingLevels: ['off', 'low', 'medium', 'high', 'max'], advanced: true },
           ],
-          selection: { enabledModelIds: ['deepseek-v3.2', 'doubao-seed-1.6'], overrides: { 'doubao-seed-1.6': { alias: 'doubao' } } },
+          selection: { enabledModelIds: ['deepseek-v4.1-flash'], overrides: {} },
         },
         {
-          region: 'ai', port: 42861, models: 1, portFallback: false, lastError: '',
-          roster: [
-            { id: 'gpt-5.1', name: 'GPT-5.1', alias: '', nativeContextWindow: 400000,
-              nativeMaxOutputTokens: 128000, nativeSupportsImages: true, nativeThinkingLevels: [], advanced: false },
-          ],
-          selection: { enabledModelIds: ['gpt-5.1'], overrides: {} },
+          region: 'ai', port: 42861, models: 0, portFallback: false, lastError: '',
+          roster: [],
+          selection: { enabledModelIds: [], overrides: {} },
         },
       ],
     },
@@ -328,22 +286,25 @@
       ],
       gateways: [
         {
-          region: 'cn', port: 42871, models: 1, portFallback: false, lastError: '',
+          region: 'cn', port: 42871, models: 2, portFallback: false, lastError: '',
           roster: [
-            { id: 'qwen3-coder-plus', name: 'Qwen3 Coder Plus', alias: '', nativeContextWindow: 128000,
-              nativeMaxOutputTokens: 32000, nativeSupportsImages: false, nativeThinkingLevels: [], advanced: false },
-            { id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5', alias: '', nativeContextWindow: 200000,
-              nativeMaxOutputTokens: 32000, nativeSupportsImages: true, nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: false },
+            { id: 'qmodel_latest', name: 'Qwen 3.8 Max', alias: '', nativeContextWindow: 256000,
+              nativeMaxOutputTokens: 128000, nativeSupportsImages: true,
+              nativeThinkingLevels: ['off', 'low', 'medium', 'high'], advanced: false },
+            { id: 'dfmodel', name: 'DeepSeek Flash', alias: '', nativeContextWindow: 200000,
+              nativeMaxOutputTokens: 128000, nativeSupportsImages: false,
+              nativeThinkingLevels: ['off', 'low', 'medium', 'high', 'max'], advanced: false },
           ],
-          selection: { enabledModelIds: ['qwen3-coder-plus'], overrides: {} },
+          selection: { enabledModelIds: ['qmodel_latest', 'dfmodel'], overrides: {} },
         },
         {
           region: 'global', port: 42881, models: 1, portFallback: false, lastError: '',
           roster: [
-            { id: 'gpt-5.1', name: 'GPT-5.1', alias: '', nativeContextWindow: 400000,
-              nativeMaxOutputTokens: 128000, nativeSupportsImages: true, nativeThinkingLevels: [], advanced: false },
+            { id: 'dfmodel', name: 'DeepSeek Flash', alias: '', nativeContextWindow: 200000,
+              nativeMaxOutputTokens: 128000, nativeSupportsImages: false,
+              nativeThinkingLevels: ['off', 'low', 'medium', 'high', 'max'], advanced: false },
           ],
-          selection: { enabledModelIds: ['gpt-5.1'], overrides: {} },
+          selection: { enabledModelIds: ['dfmodel'], overrides: {} },
         },
       ],
     },
@@ -358,17 +319,17 @@
     findings: [
       { id: 'plugin-enabled', ok: true, detail: 'enabled' },
       { id: 'source-workbuddy', ok: true, detail: 'on' },
-      { id: 'source-trae', ok: true, detail: 'on; 2 account(s) (cn x1, ai x1); serving cn: 2 model(s), ai: 1 model(s)' },
-      { id: 'source-qoder', ok: true, detail: 'on; 2 account(s) (cn x1, global x1); serving cn: 1 model(s), global: 1 model(s)' },
-      { id: 'accounts', ok: true, detail: '5 account(s)' },
-      { id: 'rotation', ok: true, detail: '3 of 5 account(s) can serve a request now' },
+      { id: 'source-trae', ok: true, detail: 'enabled; accounts: 2 (cn: 1, ai: 1); models served: cn: 1, ai: 0' },
+      { id: 'source-qoder', ok: true, detail: 'enabled; accounts: 2 (cn: 1, global: 1); models served: cn: 2, global: 1' },
+      { id: 'accounts', ok: true, detail: 'Accounts found: 5' },
+      { id: 'rotation', ok: true, detail: 'Ready accounts: 3/5' },
       { id: 'host-registered-providers', ok: true, detail: 'the host is serving every provider this plugin declares' },
       { id: 'at-rest-key', ok: true, detail: 'no at-rest key failure' },
       { id: 'WTQ Pool (CN): endpoint', ok: true, detail: 'listening on http://127.0.0.1:42831/v1' },
-      { id: 'WTQ Pool (CN): models', ok: true, detail: '6 model(s) in the catalog' },
+      { id: 'WTQ Pool (CN): models', ok: true, detail: 'Models: 3' },
       { id: 'WTQ Pool (CN): declared', ok: true, detail: 'registered with the running host' },
       { id: 'WTQ Pool (Global): endpoint', ok: true, detail: 'listening on http://127.0.0.1:42841/v1' },
-      { id: 'WTQ Pool (Global): models', ok: true, detail: '2 model(s) in the catalog' },
+      { id: 'WTQ Pool (Global): models', ok: true, detail: 'Models: 1' },
       { id: 'WTQ Pool (Global): declared', ok: true, detail: 'registered with the running host' },
       { id: 'WTQ Pool (CN): published address', ok: true, detail: 'matches the endpoint this gateway bound (http://127.0.0.1:42831/v1)' },
       { id: 'WTQ Pool (Global): published address', ok: true, detail: 'matches the endpoint this gateway bound (http://127.0.0.1:42841/v1)' },
@@ -389,7 +350,130 @@
     '',
   ].join('\n')
 
-  const api = { state, doctor }
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' })
+  const month = today.slice(0, 7)
+  const copy = value => JSON.parse(JSON.stringify(value))
+  const growthDetails = {}
+  const progress = [16, 9, 3, 0, 8]
+  const tiers = [
+    { tier: '7d', days: 7, credit: 0, energy: 2 },
+    { tier: '14d', days: 14, credit: 50, energy: 3 },
+    { tier: '28d', days: 28, credit: 150, energy: 5 },
+  ]
+  state.growth.read.rows.forEach((row, index) => {
+    row.days = progress[index]
+    row.tierList = tiers.map(tier => ({ ...tier, status: row.days < tier.days ? 'locked' : index === 0 && tier.days === 7 ? 'claimed' : 'unlocked' }))
+    row.tiers = row.tierList.filter(tier => tier.status === 'unlocked').length
+    const next = row.tierList.find(tier => tier.days > row.days)
+    row.nextTier = next.tier
+    row.nextTierRemaining = next.days - row.days
+    const domestic = row.region === 'cn'
+    const cells = Array.from({ length: Number(today.slice(8)) }, (_, day) => ({
+      date: month + '-' + String(day + 1).padStart(2, '0'),
+      score: day >= Number(today.slice(8)) - row.days ? 2 : day % 3 === 0 || day === Number(today.slice(8)) - row.days - 1 ? 0 : 2,
+    }))
+    growthDetails[row.id] = {
+      buddy: domestic && !row.failed ? { id: 1, name: '猫猫' } : null,
+      heatmap: { today: { date: today, score: 2, is_active: true }, cells },
+      travel: domestic ? {
+        locations: [{ id: 1, name: '咖啡馆' }, { id: 2, name: '商场店铺' }, { id: 3, name: '健身房' }, { id: 4, name: '古镇客栈' }],
+        status: { state: index === 0 ? 'arrived' : index === 1 ? 'idle' : 'traveling',
+          location: { id: 4, name: '古镇客栈' }, arrive_at: Math.floor(Date.now() / 1000) + 3600,
+          daily_limit_reached: false, reward_credit: 9 },
+      } : {},
+      lottery: { chances: row.lottery, module: { enabled: domestic } },
+      errors: row.failed ? { heatmap: '演示：账号登录已失效' } : {},
+    }
+    if (row.failed) {
+      growthDetails[row.id].heatmap = null
+      growthDetails[row.id].travel = {}
+    }
+  })
+  state.growth.read.failed = state.growth.read.rows.filter(row => row.failed).length
+
+  function growthAction({ id, action, value }) {
+    const row = state.growth.read.rows.find(item => item.id === id)
+    const details = growthDetails[id]
+    let result = {}
+    switch (action) {
+      case 'streak': {
+        const tier = row.tierList.find(item => item.tier === value)
+        if (tier.status !== 'unlocked') throw new Error('该档位当前不可领取')
+        tier.status = 'claimed'
+        row.tiers -= 1
+        row.makeupCards += 1
+        details.lottery.chances += 1
+        result = { credit_granted: tier.credit, cards_granted: 1, chances_granted: 1 }
+        break
+      }
+      case 'lottery':
+        if (details.lottery.chances <= 0) throw new Error('抽奖次数已达上限')
+        details.lottery.chances -= 1
+        result = { prize_name: '10 积分', prize_type: 'credit', credit: 10 }
+        break
+      case 'travelClaim':
+        if (details.travel.status.state !== 'arrived') throw new Error('旅行尚未到达')
+        details.travel.status.state = 'idle'
+        result = { credit: details.travel.status.reward_credit }
+        break
+      case 'travelDepart':
+        details.travel.status = { state: 'traveling', location: details.travel.locations.find(item => item.id === value),
+          arrive_at: Math.floor(Date.now() / 1000) + 3600, daily_limit_reached: true }
+        break
+      case 'makeup': {
+        const cell = details.heatmap.cells.find(item => item.date === value)
+        if (cell.score > 0 || row.makeupCards === 0) throw new Error('当前日期不可补签')
+        cell.score = 1
+        row.makeupCards -= 1
+        break
+      }
+      default: throw new Error('不支持的成长操作')
+    }
+    row.lottery = details.lottery.chances
+    const credit = result.credit_granted ?? result.reward_credit ?? result.credit ?? 0
+    const account = state.accounts.find(item => item.id === id)
+    if (account.credits) account.credits.total += credit
+    return result
+  }
+
+  async function invokeGrowth(channel, payload) {
+    if (channel === 'xd.growthState') {
+      state.growth.read.readAt = Date.now()
+      return { growth: copy(state.growth.read), readEpoch: state.growth.readEpoch }
+    }
+    if (channel === 'xd.growthDetails') return { details: copy(growthDetails[payload.id]) }
+    if (channel === 'xd.growthAction') return { result: growthAction(payload) }
+    if (channel === 'xd.growthRun') {
+      const detail = { accounts: 0, makeup: 0, activity: 0, streak: 0, lottery: 0, failed: 0 }
+      const travel = { departed: 0, claimed: 0, failed: 0, credit: 0 }
+      let credit = 0
+      for (const row of state.growth.read.rows.filter(item => !item.failed)) {
+        detail.accounts += 1
+        for (const tier of row.tierList.filter(item => item.status === 'unlocked')) {
+          credit += growthAction({ id: row.id, action: 'streak', value: tier.tier }).credit_granted
+          detail.streak += 1
+        }
+        while (growthDetails[row.id].lottery.module.enabled && row.lottery > 0) {
+          credit += growthAction({ id: row.id, action: 'lottery' }).credit
+          detail.lottery += 1
+        }
+        const trip = growthDetails[row.id].travel.status
+        if (trip?.state === 'arrived') {
+          travel.credit += growthAction({ id: row.id, action: 'travelClaim' }).credit
+          travel.claimed += 1
+        } else if (trip?.state === 'idle' && !trip.daily_limit_reached) {
+          growthAction({ id: row.id, action: 'travelDepart', value: 4 })
+          travel.departed += 1
+        }
+      }
+      const growth = { credit: credit + travel.credit, streak: detail.streak, failed: 0, detail, travel }
+      state.growth.last = { at: new Date().toISOString(), ...growth }
+      return { state: copy(state), growth }
+    }
+    throw new Error('不支持的成长操作')
+  }
+  const api = { state, doctor, invokeGrowth }
+
   if (typeof module !== 'undefined' && module.exports) module.exports = api
   if (typeof window !== 'undefined') window.__previewData = api
 })();

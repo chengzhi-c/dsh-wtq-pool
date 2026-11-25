@@ -889,3 +889,12 @@ test('a Qoder signature draws its own request id', () => {
   assert.notEqual(headers['X-Request-Id'], payload.requestId, 'the header and the signed payload do not share one id')
   assert.notEqual(call()['X-Request-Id'], headers['X-Request-Id'], 'and each request draws a new one')
 })
+
+
+test('a Trae zero expiry string stays undated instead of becoming January 2000', () => {
+  const { normalizeTraeCredential } = require('../src/trae-discovery.ts')
+  const parse = expiredAt => normalizeTraeCredential({ token: 'fixture', userId: 'fixture', expiredAt }, 'cn', 'desktop').expiresAtMs
+  for (const expiry of [0, '0', -1, '-1']) assert.equal(parse(expiry), 0)
+  assert.equal(parse('1800000000'), 1800000000000)
+  assert.equal(parse('2027-01-01T00:00:00Z'), Date.parse('2027-01-01T00:00:00Z'))
+})

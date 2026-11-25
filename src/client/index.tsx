@@ -41,22 +41,22 @@ const NAMESPACE = 'settings.dsh-wtq-pool'
 
 const zh: Record<string, string> = {
   'row.title': 'WTQ Pool',
-  'row.desc': '把本机 WorkBuddy、Trae、Qoder 的桌面登录合并成一个会自动换号的模型池。',
+  'row.desc': '将本机 WorkBuddy、Trae、Qoder 桌面登录接入统一账号池，并按设置切换账号。',
   'card.title': '账号池',
   'card.open': '重新载入面板',
   'card.frameTitle': '账号池面板',
-  'card.missing': '面板资源没有装好，重新安装这个插件即可。',
-  'card.probeFailed': '面板没有打开：',
+  'card.missing': '面板资源缺失。重新安装插件可恢复。',
+  'card.probeFailed': '面板打开失败：',
   'card.networkError': '网络连接失败',
 }
 
 const en: Record<string, string> = {
   'row.title': 'WTQ Pool',
-  'row.desc': 'Merges this machine’s WorkBuddy, Trae and Qoder desktop sign-ins into one model pool that fails over on its own.',
+  'row.desc': 'Connects local WorkBuddy, Trae and Qoder desktop sign-ins to one account pool and switches accounts according to its settings.',
   'card.title': 'Account pool',
   'card.open': 'Reload panel',
   'card.frameTitle': 'Account pool panel',
-  'card.missing': 'The panel assets are missing; reinstalling this plugin restores them.',
+  'card.missing': 'Panel assets are missing. Reinstall the plugin to restore them.',
   'card.probeFailed': 'The panel did not open:',
   'card.networkError': 'Network error',
 }
@@ -169,9 +169,9 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
   // panel posts nothing to its parent, so there is no event to subscribe to.
   React.useEffect(() => {
     if (view === 'summary') return undefined
-    const frame = frameRef.current
     const measure = () => {
       if (document.hidden === true) return
+      const frame = frameRef.current
       const doc = frame === null ? null : frame.contentDocument
       // `body` is null between the new document being installed and its content
       // arriving, and the read below has no other guard. Measured there it threw,
@@ -319,36 +319,32 @@ export function apply(ctx: XdPoolClientContext): void {
     console.error('[dsh-wtq-pool] the copy did not register (the labels fall back to their keys):', error)
   }
 
-  try {
-    const seat = (slotName: string, key: string): void => {
-      try {
-        ctx.slots.inject(slotName, () => ctx.slots.register({
-          name: slotName,
-          key,
-          locale: NAMESPACE,
-        }, PanelCard))
-      } catch (error: unknown) {
-        console.error(`[dsh-wtq-pool] the card did not mount into ${slotName} (the providers are unaffected):`, error)
-      }
-    }
-
-    seat('plugins.bundle.config', PLUGIN_NAME)
-    seat('plugins.row.config', `${PLUGIN_NAME}#${ROW_ID}`)
-
-    // The credit readout. Registered unconditionally: its gate reads the host's
-    // own selection projection and renders nothing for every other provider, so
-    // it neither competes for the composer row nor starts a poll until one of
-    // this plugin's models is selected.
+  const seat = (slotName: string, key: string): void => {
     try {
-      ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
-        name: 'conversation.input.left',
-        id: COMPOSER_SLOT_ID,
-        order: 4,
-      }, ComposerPoints))
+      ctx.slots.inject(slotName, () => ctx.slots.register({
+        name: slotName,
+        key,
+        locale: NAMESPACE,
+      }, PanelCard))
     } catch (error: unknown) {
-      console.error('[dsh-wtq-pool] the composer readout did not mount (the providers are unaffected):', error)
+      console.error(`[dsh-wtq-pool] the card did not mount into ${slotName} (the providers are unaffected):`, error)
     }
+  }
+
+  seat('plugins.bundle.config', PLUGIN_NAME)
+  seat('plugins.row.config', `${PLUGIN_NAME}#${ROW_ID}`)
+
+  // The credit readout. Registered unconditionally: its gate reads the host's
+  // own selection projection and renders nothing for every other provider, so
+  // it neither competes for the composer row nor starts a poll until one of
+  // this plugin's models is selected.
+  try {
+    ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
+      name: 'conversation.input.left',
+      id: COMPOSER_SLOT_ID,
+      order: 4,
+    }, ComposerPoints))
   } catch (error: unknown) {
-    console.error('[dsh-wtq-pool] the cards did not mount (the providers are unaffected):', error)
+    console.error('[dsh-wtq-pool] the composer readout did not mount (the providers are unaffected):', error)
   }
 }

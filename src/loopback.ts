@@ -14,11 +14,11 @@
  * and had already drifted on the one detail that decides whether teardown
  * finishes at all.
  *
- * `readJsonBody`, `answerRequest`'s `answerFailure` parameter, the optional
- * `res.on?.()` and the exported `BodyTooLargeError` have no caller in the
+ * `readJsonBody`, `answerRequest`'s `answerFailure` parameter and the exported
+ * `BodyTooLargeError` have no caller in the
  * PI-Desktop build: they exist for the DSH web panel, which that build does not
  * ship, and they arrived here because this module is kept byte-identical across
- * the two. If the two ever stop being synced, those four are the first things to
+ * the two. If the two ever stop being synced, those three are the first things to
  * delete.
  *
  * @module dsh-wtq-pool/loopback
@@ -86,18 +86,9 @@ export function isJsonContentType(req: IncomingMessage): boolean {
 }
 
 /**
- * Whether a chat request's bearer may reach the gateway.
- *
- * These endpoints are registered with `authKind: 'none'`, so the host sends no
- * `Authorization` header at all or echoes the sentinel
- * `Bearer dsh-no-auth`. A provider row the user added by hand — which is
- * how a reasoning menu can be attached to these models at all, because the
- * host discards `thinkingLevels` from a plugin declaration — is created as
- * `api_key_and_base_url` and therefore always sends `Bearer <its own key>`.
- * Refusing that shape would leave the workaround with a 401.
- *
- * The header is not a credential for this endpoint: the real token comes from
- * the pool. The loopback bind and the Host / Origin guards are what bound it.
+ * Host-managed connections may omit authorization or use a sentinel; manually
+ * configured providers send their own bearer. Vendor credentials come from
+ * the pool, while the loopback Host / Origin guards restrict access.
  */
 export function bearerAccepted(req: IncomingMessage): boolean {
   const header = req.headers.authorization
@@ -642,10 +633,7 @@ export async function answerRequest(
   /** How a caught failure is answered; the default is the OpenAI error shape. */
   answerFailure?: (res: ServerResponse, error: unknown) => void,
 ): Promise<void> {
-  // The optional call is deliberate: the panel contract test answers through a
-  // response object that implements only the write half, and a real
-  // ServerResponse always carries `on`.
-  res.on?.('error', (error: unknown) => {
+  res.on('error', (error: unknown) => {
     log?.warn?.(LOG_PREFIX + ': response socket closed mid-write', error)
   })
   try {

@@ -40,18 +40,20 @@ export interface WorkBuddyModelInfo {
   supportsImages: boolean
 }
 
-/** Static fallback used before the first live catalog fetch. */
-export const FALLBACK_WORKBUDDY_MODELS: readonly WorkBuddyModelInfo[] = [
-  { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
-  { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
-  { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
-  { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: false },
-  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
-  { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
-  { id: 'kimi-k3', name: 'Kimi-K3', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
-  { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
-  { id: 'hy3', name: 'Hy3', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
+/** Static fallback used before the first live catalog fetch in China. */
+export const FALLBACK_WORKBUDDY_MODELS_CN: readonly WorkBuddyModelInfo[] = [
+  { id: 'hy4flash-free', name: 'Hy4 Flash Free', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: true },
+  { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: false },
+  { id: 'kimi-k3.1-pro', name: 'Kimi K3.1 Pro', contextWindow: 256_000, maxOutputTokens: 128_000, supportsImages: true },
 ]
+
+/** Static fallback used before the first live catalog fetch globally. */
+export const FALLBACK_WORKBUDDY_MODELS_GLOBAL: readonly WorkBuddyModelInfo[] = [
+  { id: 'deepseek-v4.1-flash-sg', name: 'DeepSeek V4.1 Flash SG', contextWindow: 200_000, maxOutputTokens: 128_000, supportsImages: false },
+]
+
+/** The China fallback under the original export name. */
+export const FALLBACK_WORKBUDDY_MODELS = FALLBACK_WORKBUDDY_MODELS_CN
 
 /**
  * One model's user-editable fields, exactly as the panel's editor writes them.
@@ -73,10 +75,14 @@ export interface ModelOverride {
 
 /** Live catalog with a static fallback behind it. */
 export class WorkBuddyCatalog {
-  private models: readonly WorkBuddyModelInfo[] = FALLBACK_WORKBUDDY_MODELS
+  private models: readonly WorkBuddyModelInfo[]
   private live = false
   /** User's model selection. Empty object = follow the catalog unfiltered. */
   private selection: ModelSelection = {}
+
+  constructor(region: 'cn' | 'global' = 'cn') {
+    this.models = region === 'global' ? FALLBACK_WORKBUDDY_MODELS_GLOBAL : FALLBACK_WORKBUDDY_MODELS_CN
+  }
 
   /**
    * Whether the roster in force came from the upstream.
@@ -227,8 +233,13 @@ export function toModelInfo(model: WorkBuddyUpstreamModel): WorkBuddyModelInfo {
   }
 }
 
-/** Map the live upstream list, falling back to the static list when empty. */
-export function catalogFromUpstream(models: readonly WorkBuddyUpstreamModel[]): readonly WorkBuddyModelInfo[] {
-  if (models.length === 0) return FALLBACK_WORKBUDDY_MODELS
+/** Map the live upstream list, falling back to the region's static list when empty. */
+export function catalogFromUpstream(
+  models: readonly WorkBuddyUpstreamModel[],
+  region: 'cn' | 'global' = 'cn',
+): readonly WorkBuddyModelInfo[] {
+  if (models.length === 0) {
+    return region === 'global' ? FALLBACK_WORKBUDDY_MODELS_GLOBAL : FALLBACK_WORKBUDDY_MODELS_CN
+  }
   return models.map(toModelInfo)
 }

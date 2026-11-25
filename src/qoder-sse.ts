@@ -154,11 +154,9 @@ export function unwrapFailure(frame: unknown): { code: string; detail: string; s
  * not lost when the outer sentence is the one worth showing.
  */
 export function retryAfterSecondsOf(frame: unknown): number {
-  const seen = new Set<object>()
   let node: unknown = frame
   for (let depth = 0; depth < 8; depth++) {
-    if (!isPlainObject(node) || seen.has(node)) break
-    seen.add(node)
+    if (!isPlainObject(node)) break
     const direct = node['retryAfterSeconds']
     if (typeof direct === 'number' && Number.isFinite(direct) && direct > 0) return direct
     const message = node['message'] ?? node['errorMessage']
@@ -275,7 +273,7 @@ export class QoderFrameDecoder {
     // still be in the next chunk.
     for (;;) {
       const match = /\r\n|\n|\r/.exec(this.buffer)
-      if (match === null || match.index === undefined) break
+      if (match === null) break
       if (match[0] === '\r' && match.index + 1 === this.buffer.length) break
       const line = this.buffer.slice(0, match.index).trim()
       this.buffer = this.buffer.slice(match.index + match[0].length)

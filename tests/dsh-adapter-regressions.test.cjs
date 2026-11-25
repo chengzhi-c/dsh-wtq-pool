@@ -9,6 +9,7 @@ const { createServer, request } = require('node:http')
 const ts = require('typescript')
 const { SettingsForms } = require('@deepseek-ai/dsh-settings')
 const { WebServer } = require('@deepseek-ai/dsh-host-webserver')
+const { Service } = require('@deepseek-ai/cordis')
 
 const root = path.resolve(__dirname, '..')
 const json = value => JSON.parse(JSON.stringify(value))
@@ -129,7 +130,9 @@ test('DSH settings replace patched dictionaries, preserve other settings, and su
     creditReserves: { 'fixture-a': 100, 'fixture-b': 200 },
     preferredAccountIds: { cn: 'fixture-a', global: 'fixture-b' },
     preferredSourceAccounts: { 'trae:cn': 'fixture-a', 'qoder:global': 'fixture-b' },
-    modelSelection: { cn: { listedIds: ['m'], overrides: { m: { alias: 'custom', contextWindow: 8192 } } },
+    modelSelection: { cn: { listedIds: ['m', '__proto__'], overrides: {
+      m: { alias: 'custom', contextWindow: 8192 }, ['__proto__']: { alias: 'ordinary-model' },
+    } },
       global: { overrides: { stale: { alias: 'remove-me' } } } },
   }
   const cleared = { creditReserves: {}, preferredAccountIds: {}, preferredSourceAccounts: {},
@@ -168,10 +171,10 @@ test('settings writes carry options.id, the name the settings service resolves e
 })
 
 async function composerFixture(documents) {
-  const effects = [], cleanups = [], states = [], timers = new Map(), calls = []
+  const effects = [], cleanups = [], states = [], refs = [], timers = new Map(), calls = []
   let now = 0, nextTimer = 0
   const React = {
-    useRef: value => ({ current: value }),
+    useRef(value) { const ref = { current: value }; refs.push(ref); return ref },
     useState(value) { const index = states.push(value) - 1; return [value, next => { states[index] = next }] },
     useEffect: callback => effects.push(callback), createElement: () => null,
   }
@@ -184,7 +187,8 @@ async function composerFixture(documents) {
     },
     fetch: async (_url, init) => {
       calls.push(JSON.parse(init.body))
-      return { ok: true, json: async () => ({ result: documents[Math.min(calls.length - 1, documents.length - 1)] }) }
+      const result = documents[Math.min(calls.length - 1, documents.length - 1)]
+      return { ok: true, json: async () => ({ result: await result }) }
     },
   })
   ComposerPoints({ useProjection: () => ({ next: { provider: 'fixture-p', model: 'fixture-m' } }) })
@@ -192,6 +196,7 @@ async function composerFixture(documents) {
   const flush = () => new Promise(resolve => setImmediate(resolve))
   await flush()
   return { states, timers, calls,
+    async restart() { refs.at(-1).current(); await flush() },
     async tick(elapsed) {
       const [id, timer] = timers.entries().next().value
       timers.delete(id)
@@ -202,6 +207,23 @@ async function composerFixture(documents) {
     dispose() { for (const cleanup of cleanups) cleanup() },
   }
 }
+
+test('composer ignores an older poll after a manual restart', async () => {
+  for (const failed of [false, true]) {
+    let resolve, reject
+    const older = new Promise((yes, no) => { resolve = yes; reject = no })
+    const latest = { show: true, ours: true, total: 42, accounts: [] }
+    const fixture = await composerFixture([older, latest])
+    try {
+      await fixture.restart()
+      if (failed) reject(new Error('older poll failed'))
+      else resolve({ ...latest, total: 1 })
+      await new Promise(done => setImmediate(done))
+      assert.deepEqual(json(fixture.states[0]), latest)
+      assert.equal(fixture.timers.size, 1)
+    } finally { fixture.dispose() }
+  }
+})
 
 test('composer polls a hidden plugin roster after five seconds, then settles on a balance', async () => {
   const visible = { show: true, ours: true, total: 42, accounts: [] }
@@ -239,6 +261,47 @@ test('composer limits hidden-roster warmup to its startup window', async () => {
   } finally { fixture.dispose() }
 })
 
+test('the panel measures a remounted iframe, waits for its body and caps its height', () => {
+  const effects = [], states = []
+  let frame, measure, PanelCard
+  const React = {
+    useRef(value) { frame = { current: value }; return frame },
+    useMemo: read => read(),
+    useState(value) { const index = states.push(value) - 1; return [value, next => { states[index] = typeof next === 'function' ? next(states[index]) : next }] },
+    useEffect: effect => effects.push(effect), createElement: () => null,
+  }
+  const { apply } = loadSource('src/client/index.tsx', {
+    react: React,
+    './composer.tsx': { composerEn: {}, composerZh: {} },
+    './panel-url.ts': { panelUrl: () => '/fixture', PANEL_BASE: '/fixture' },
+    '../ids.ts': { PLUGIN_NAME: 'fixture', ROW_ID: 'fixture' },
+  }, {
+    document: { hidden: false, documentElement: { dataset: { base: 'light' }, lang: 'zh-CN' } },
+    window: { setInterval: callback => { measure = callback; return 1 }, clearInterval() {} },
+    fetch: async () => ({ ok: true }),
+  })
+  apply({ effect: run => run(), locale: { register: () => () => {} },
+    slots: { inject: (_key, run) => run(), register: (options, component) => { if (options.name === 'plugins.bundle.config') PanelCard = component } },
+  })
+  PanelCard({ t: key => key })
+  const cleanups = effects.map(run => run())
+  try {
+    measure()
+    assert.equal(states[1], 0)
+    for (const contentDocument of [null, { body: null }]) {
+      frame.current = { contentDocument }
+      measure()
+      assert.equal(states[1], 0)
+    }
+    frame.current = { contentDocument: { body: { scrollHeight: 500 } } }
+    measure()
+    assert.equal(states[1], 502)
+    frame.current = { contentDocument: { body: { scrollHeight: 5000 } } }
+    measure()
+    assert.equal(states[1], 1900)
+  } finally { for (const cleanup of cleanups) cleanup?.() }
+})
+
 function panelFixture() {
   // The drain-grace timers the shared body reader arms are Node's, so the
   // sandbox that loads it has to carry them.
@@ -257,7 +320,7 @@ function panelFixture() {
       return { enabled }
     },
   })
-  return { base: PANEL_BASE, calls, dispose,
+  return { base: PANEL_BASE, calls, dispose, ledger,
     route: pathname => WebServer.prototype.match.call(ledger, pathname),
     async send(suffix, { address = '127.0.0.1', headers = {}, body } = {}) {
       const req = new EventEmitter()
@@ -267,8 +330,8 @@ function panelFixture() {
         // A refused body is drained through the socket's own `destroy`, which a
         // real IncomingMessage always carries.
         destroy() {} })
-      const res = { status: undefined, body: '', writeHead(status) { this.status = status },
-        end(chunk) { this.body = chunk === undefined ? '' : String(chunk) } }
+      const res = Object.assign(new EventEmitter(), { status: undefined, body: '', writeHead(status) { this.status = status },
+        end(chunk) { this.body = chunk === undefined ? '' : String(chunk) } })
       const pending = this.route(PANEL_BASE + suffix).handler(req, res)
       if (body !== undefined) req.emit('data', Buffer.from(JSON.stringify(body)))
       req.emit('end')
@@ -296,6 +359,48 @@ test('all panel resources and RPC reject remote peers even with absent or forged
     }
     assert.deepEqual(fixture.calls, [], 'remote requests must never reach the pool')
   } finally { fixture.dispose() }
+})
+
+test('the current DSH web server authenticates panel assets and growth actions', async () => {
+  const fixture = panelFixture()
+  const releases = []
+  const peer = { signal: new AbortController().signal }
+  const server = Object.assign(Object.create(WebServer.prototype), fixture.ledger, {
+    config: { host: '127.0.0.1', port: 0 }, upgrades: new Map(),
+    upgradedSockets: new Set(), tlsConnections: new Set(),
+    ctx: {
+      effect: async callback => { releases.push(await callback()) },
+      waterfall: (_subject, _name, ...args) => args.at(-1)(),
+      bail: (_subject, _name, request, policy) => {
+        assert.equal(policy, 'required')
+        return request.headers.cookie === 'session=fixture' ? { kind: 'allow', peer } : { kind: 'deny', status: 401 }
+      },
+      logger: { warn: assert.fail, error: assert.fail },
+    },
+  })
+  try {
+    await server[Service.init]()
+    const base = server.getOrigin() + fixture.base
+    const denied = await fetch(base + '/panel')
+    assert.equal(denied.status, 401)
+    assert.equal(await denied.text(), 'unauthorized')
+    for (const asset of ['/panel', '/panel.css', '/panel.js']) {
+      const response = await fetch(base + asset, { headers: { cookie: 'session=fixture' } })
+      assert.equal(response.status, 200)
+      await response.arrayBuffer()
+    }
+    for (const channel of ['xd.growthDetails', 'xd.growthAction']) {
+      const response = await fetch(base + '/invoke', { method: 'POST',
+        headers: { cookie: 'session=fixture', 'content-type': 'application/json' },
+        body: JSON.stringify({ channel, payload: { accountId: 'fixture', action: 'login-reward' } }) })
+      assert.equal(response.status, 200)
+      assert.deepEqual(await response.json(), { result: { enabled: true } })
+    }
+    assert.deepEqual(fixture.calls.map(call => call.channel), ['xd.growthDetails', 'xd.growthAction'])
+  } finally {
+    fixture.dispose()
+    for (const release of releases.reverse()) await release()
+  }
 })
 
 test('loopback IPv4, IPv6 and mapped peers can read assets and state and mutate the pool', async () => {
@@ -518,6 +623,27 @@ test('a host edit that raced a failed write is not mistaken for its echo', async
   } finally { await state.dispose() }
 })
 
+test('an older activation cannot deliver settings events into its replacement', async () => {
+  for (const pendingWrite of [false, true]) {
+    const activate = indexFixture()
+    let applied = 0, release
+    const first = activate({ mutate: async () => {
+      first.volatileListeners[0]()
+      first.volatileListeners[0]()
+      await new Promise(resolve => { release = resolve })
+    } })
+    first.bridge.onSettingsChanged(() => { applied++ })
+    const writing = pendingWrite ? first.bridge.setSettings({ showComposerPoints: true }) : Promise.resolve()
+    const second = activate()
+    try {
+      if (pendingWrite) release()
+      else first.volatileListeners[0]()
+      await writing
+      assert.equal(applied, 0)
+    } finally { await first.dispose(); await second.dispose() }
+  }
+})
+
 /**
  * Every panel route guards the socket it answers on.
  *
@@ -583,7 +709,7 @@ test('a settings key named __proto__ cannot shadow the config', async () => {
     const config = state.unwrapVolatileDeep(planted)
     assert.equal(config.enabled, undefined, 'the planted field must not shadow a real one')
     assert.equal(config.sourceTrae, true, 'the rest of the document still reads')
-    assert.equal(Object.hasOwn(config, '__proto__'), false, 'the planted key is not carried either')
+    assert.equal(Object.hasOwn(config, '__proto__'), true, 'the key stays an ordinary own property')
   } finally {
     await state.dispose()
   }

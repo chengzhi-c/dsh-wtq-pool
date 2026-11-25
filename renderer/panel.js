@@ -32,88 +32,81 @@ var EN = {
   "tabs.sources": "Account source",
   "tabs.views": "Plugin views",
   "tabs.regions": "Account region",
+  "activity.title": "Recent results",
+  "risk.title": "Account usage",
   "risk.note": "Unofficial clients may trigger account restrictions. Follow each vendor's terms of service.",
-  "host.missing": "The host has not registered {count} model group(s) from this plugin yet: reload the plugin.",
+  "host.missing": "Unsynced model groups: {count}. Reload the plugin.",
   "btn.rescan": "Detect accounts again",
   "btn.reset": "Clear all cooldowns",
   "btn.refresh": "Refresh",
   "btn.checkin": "Check in",
   "btn.checkinDone": "Checked in today",
   "btn.save": "Save",
-  "btn.discard": "Discard",
+  "btn.discard": "Discard changes",
   "btn.doctor": "Run connection check",
   "btn.copy": "Copy report",
-  "copy.ok": "copied",
-  "copy.failedSelected": "copy failed - report selected, press Ctrl+C",
-  "copy.failed": "copy failed",
+  "copy.ok": "Copied",
+  "copy.failedSelected": "Copy failed. The report is selected; press Ctrl+C.",
+  "copy.failed": "Copy failed",
   "region.cn": "China",
   "region.park": "Disable {region}",
   "region.unpark": "Enable {region}",
   "region.parked": "{region} disabled",
-  "region.parkedShort": "disabled",
+  "region.parkedShort": "Disabled",
   "region.global": "Global",
   "region.cnShort": "CN",
-  "pool.summary": "{count} account(s) · {cooling} cooling",
-  "pool.healthy": "Rate limits automatically switch to another available account.",
-  "pool.allCooling": "Every account is rate-limited right now; requests pause until a cooldown lifts.",
-  "pool.refused": "{count} need a new sign-in",
-  "pool.allRefused": "Every account's sign-in was refused by the upstream; add one with Add account and the pool starts working again.",
-  "pool.restricted": "{count} restricted by the upstream",
-  "pool.allRestricted": "Every account was restricted by the upstream; appeal the restriction in the WorkBuddy console, or add another account.",
-  "pool.allSwitchedOff": "Every account is switched off; switch one on to serve requests.",
+  "pool.summary": "Accounts: {count} · Cooling: {cooling}",
+  "pool.allCooling": "All accounts are rate-limited. Requests wait until an account leaves cooldown.",
+  "pool.refused": "Re-authentication required: {count}",
+  "pool.allRefused": "The upstream rejected every account sign-in. Select Add account to sign in again and restore service.",
+  "pool.restricted": "Restricted accounts: {count}",
+  "pool.allRestricted": "The upstream restricted all accounts. Appeal in the WorkBuddy console or add another account.",
+  "pool.allSwitchedOff": "All accounts are disabled. Enable at least one account to serve requests.",
   "pool.checkinAll": "Check in every account",
-  "pool.checkinAllHint": "Collect every account's daily check-in. The streak bonus is collected with it.",
+  "pool.checkinAllHint": "Collect daily check-in rewards for this source",
   "pool.checkinAllBusy": "Checking in…",
-  "pool.checkinAllDone": "Checked in {count} account(s)",
+  "pool.checkinAllDone": "Checked in: {count} accounts",
   "pool.checkinAllNone": "Every account is already checked in today",
   "pool.checkinAllFailed": "Checked in {count}, {failed} failed",
-  "pool.emptyRegion": "No {region} account is signed in yet.",
-  "pool.emptyHint": "Sign in to that edition in the WorkBuddy desktop app, then press “Detect accounts again”.",
+  "pool.emptyRegion": "No account is signed in for {region}.",
+  "pool.emptyHint": "Sign in to that edition in the WorkBuddy desktop app, then select Detect accounts again.",
   "pool.sourceOff": "The WorkBuddy source is switched off in plugin settings.",
   "login.add": "Add account",
-  "login.addHint": "Sign in to WorkBuddy in your browser. The account joins the pool the moment the browser finishes.",
-  "login.openAgain": "Open the link again",
-  "login.waiting": "Finish the sign-in in your browser; this panel picks the account up by itself.",
-  "login.timeout": "The sign-in did not finish. Start again for a new link.",
+  "login.addHint": "Sign in to WorkBuddy in the browser. The account is added after sign-in completes.",
+  "login.openAgain": "Open sign-in link",
+  "login.waiting": "Complete sign-in in the browser. The panel will add the account automatically.",
+  "login.timeout": "Sign-in did not complete. Request a new sign-in link.",
   "login.noLink": "The plugin did not return a sign-in link.",
   "login.added": "Added {name}",
   "login.addedNoName": "Account added",
   "trae.title": "Trae",
-  "trae.gateway": "{region} gateway on port {port}",
-  "trae.models": "{count} model(s)",
-  "trae.noModels": "no models published yet",
   "trae.off": "The Trae source is switched off in plugin settings.",
-  "trae.fallback": "preferred port {port} is taken; this session serves a spare port, which the provider row follows",
   "qoder.title": "Qoder",
-  "qoder.gateway": "{region} gateway on port {port}",
-  "qoder.models": "{count} model(s)",
-  "qoder.noModels": "no models published yet",
   "qoder.off": "The Qoder source is switched off in plugin settings.",
   "source.enable": "Enable {source}",
   "source.disable": "Disable {source}",
   "source.noAccounts": "no local sign-in found",
-  "source.traeSlots": "Two domestic slots only (Trae CN, TRAE SOLO CN); signing in with another account overwrites the previous one.",
-  "source.qoderSlots": "One sign-in per install; signing in with another account overwrites the previous one.",
-  "source.traeCheckin": "Daily check-in is one per device: once any account has claimed today, the other accounts show “already checked in on this device”.",
+  "source.traeSlots": "Domestic Trae has two sign-in slots: Trae CN and TRAE SOLO CN. Signing in to either slot replaces its current account.",
+  "source.qoderSlots": "Each installation stores one sign-in. Signing in to another account replaces the current account.",
+  "source.traeCheckin": "A device can claim one daily check-in. After one account claims, other accounts show “Checked in on this device”.",
   "source.expired": "token expired",
   "workbuddy.title": "WorkBuddy",
-  "models.noGateway": "This source has no gateway yet",
-  "models.noDirectory": "This source's model list could not be read",
-  "source.accountCount": "{count} account(s)",
-  "source.checkinDone": "Daily reward collected",
-  "source.checkinSkipped": "Already collected today",
+  "models.noGateway": "This source has no active gateway.",
+  "models.noDirectory": "Unable to load this source's model list.",
+  "source.accountCount": "Accounts: {count}",
+  "source.checkinDone": "Reward collected",
+  "source.checkinSkipped": "Claimed today",
   "source.planTitle": "Plan",
   "source.planTrial": "trial",
   "source.quotaUnknown": "usage unavailable",
   "source.checkedIn": "Checked in today",
-  "source.claimable": "Can claim today",
-  "source.campaignUnknown": "check-in state unavailable",
+  "source.claimable": "Available today",
+  "source.campaignUnknown": "Unable to load check-in state",
   "source.claimableAt": "Can claim after {time} Beijing time",
   "source.deviceCheckedIn": "This device checked in today",
-  "qoder.fallback": "preferred port {port} is taken; this session serves a spare port, which the provider row follows",
   "badge.next": "next up",
   "badge.cooling": "cooling",
-  "badge.revoked": "re-login needed",
+  "badge.revoked": "Sign-in required",
   "badge.healthy": "healthy",
   "acct.token": "token {time}",
   "acct.tokenExpiring": "token expires in {min} min",
@@ -124,44 +117,41 @@ var EN = {
   "acct.coolUntil": "cooling until {time}",
   "acct.holdUntil": "held until {time}",
   "acct.restrictedUntil": "restricted by the upstream until {time}",
-  "acct.restrictedHint": "The upstream restricted this account (11140: unusual activity). The pool leaves it out of rotation six hours at a time and retries afterwards; appeal it in the WorkBuddy console.",
+  "acct.restrictedHint": "The upstream restricted this account (11140: unusual activity). The pool retries every six hours. Submit an appeal in the WorkBuddy console.",
   "badge.restricted": "restricted",
-  "acct.signInRefused": "The upstream no longer accepts this account's sign-in, and its refresh token is spent. Add the account again from the panel: that sign-in is the plugin's own copy.",
-  "acct.hits": "{hits} rate-limit hit(s)",
+  "acct.signInRefused": "Sign in again using Add account.",
+  "acct.hits": "Rate limits: {hits}",
   "acct.choose": "Use credits from",
   "acct.automatic": "Automatic (follow account usage)",
-  "acct.choiceHint": "The picked account goes first; a rate limit switches account until the cooldown lifts. Automatic follows the usage mode.",
   "acct.unavailable": "Selected account unavailable (automatic fallback)",
   "acct.expired": "sign-in expired",
-  "acct.archivedHint": "No desktop sign-in file holds this account any more: the token the pool kept is what serves it, until that token expires. Signing the account in again in WorkBuddy renews it.",
+  "acct.archivedHint": "The desktop app no longer has a sign-in file for this account. The pool uses the saved token until it expires. Sign in again in WorkBuddy to renew it.",
   "acct.choiceCredits": "{label} · {credits} credits",
   "badge.preferred": "selected",
-  "acct.on": "Enabled",
   "acct.off": "Switched off",
   "acct.switchOn": "Use this account again",
   "acct.inPool": "In the rotation",
   "acct.switchOff": "Keep this account out of the pool for now",
   "acct.remove": "Remove",
-  "acct.removeHint": "Takes the account out of the pool. Restore it under “Removed accounts”.",
+  "acct.removeHint": "Removes the account from the pool. Restore it under “Removed accounts”.",
   "acct.delete": "Delete",
-  "acct.deleteHint": "Takes the account out of the pool and deletes the plugin's saved sign-in and archive; signing the account in again restores it.",
-  "acct.deleteConfirm": "Delete {name}? It leaves the pool and deletes the plugin's saved sign-in and archive; a rescan will not bring it back. Signing the account in again restores it.",
-  "acct.deleteConfirmAgain": "Press delete again to confirm",
+  "acct.deleteHint": "Removes the account from the pool and deletes the plugin's saved sign-in information and archive. Sign in again to restore it.",
+  "acct.deleteConfirm": "Delete {name}? This removes it from the pool and deletes the plugin's saved sign-in information and archive. A rescan will not restore it. Sign in again to restore the account.",
+  "acct.deleteConfirmAgain": "Click Delete again to confirm",
   "acct.stateError": "Could not change this account: {message}",
-  "pool.switchedOff": "{count} switched off",
+  "pool.switchedOff": "Disabled: {count}",
   "removed.title": "Removed accounts",
-  "removed.hint": "Out of the pool; restore one here and it rejoins rotation.",
   "removed.restore": "Restore",
   "acct.modelCool": "{model} cooling until {time}",
   "credits.title": "Credits",
-  "credits.unavailable": "Credits could not be read",
+  "credits.unavailable": "Unable to load credits",
   "credits.package": "{remain} / {size}",
   "credits.monthly": "monthly",
   "credits.refreshAt": "refreshes {time}",
   "credits.expiresAt": "expires {date}",
   "credits.validDays": "valid {days} days after claiming",
   "credits.roundExpires": "this round expires {date}",
-  "credits.noExpiry": "does not expire",
+  "credits.noExpiry": "No expiry",
   "credits.expiringSoon": "{amount} credits expire within 3 days",
   "credits.planQuota": "Plan credits",
   "credits.addOnQuota": "Add-on credits",
@@ -170,12 +160,12 @@ var EN = {
   "credits.keepAtLeast": "Keep at least",
   "credits.keepUnit": "credits",
   "credits.keepSave": "Save",
-  "credits.keepHint": "Below this balance the account is left alone and the credits stay for you.",
-  "credits.keepBadge": "keep {credits}",
+  "credits.keepHint": "The pool stops using this account when its balance reaches this value.",
+  "credits.keepBadge": "Keep ≥ {credits}",
   "checkin.title": "Daily check-in",
   "checkin.streak": "{days}-day streak",
   "checkin.daily": "+{credit} credits/day",
-  "checkin.bonus": "day {days} bonus +{credit}",
+  "checkin.bonus": "Day {days} bonus: +{credit} credits",
   "checkin.claimed": "claimed +{credit} credits",
   "checkin.claiming": "Checking in…",
   "models.serviceModels": "Models for this service",
@@ -186,133 +176,157 @@ var EN = {
   "models.deselectAll": "Deselect all",
   "models.modelConfigurations": "Model settings",
   "models.searchChosen": "Search added models…",
-  "models.noModelsChosen": "No model selected yet. Tick one in the model list.",
-  "models.noChosenMatch": "No added model matches",
+  "models.noModelsChosen": "Select at least one model.",
+  "models.noChosenMatch": "No added model matches.",
   "models.removeModel": "Remove model",
   "models.advanced": "Advanced",
   "models.alias": "Alias",
-  "models.aliasPlaceholder": "e.g. fast",
-  "models.aliasHelp": "Shown wherever the model is named; the request still uses the model ID.",
+  "models.aliasPlaceholder": "Example: fast",
+  "models.aliasHelp": "Used in the model list. Requests continue to use the model ID.",
   "models.window": "Context window",
-  "models.windowFollows": "Follows the catalog; editing pins your value.",
+  "models.windowFollows": "Follows the catalogue until you enter a custom value.",
   "models.maxOutput": "Max output",
-  "models.outputHelp": "The largest reply this model may produce.",
+  "models.outputHelp": "Maximum length of a single model reply.",
   // The ceiling is the model's own figure. The host sizes its context budget and
   // compaction threshold from the declared number, so a larger value made it
   // wait for room the upstream never had.
-  "models.overCeiling": "This model takes at most {limit}; the larger value was not applied.",
+  "models.overCeiling": "The model accepts at most {limit}. The larger value was ignored.",
   "models.levels": "Thinking levels",
   "models.defaultLevel": "Default thinking level",
   "models.capabilities": "Attachments",
   "models.imageInput": "Images",
-  "models.empty": "No model in the catalog yet.",
-  "models.noMatch": "No model matches the filter.",
-  "models.capped": "not published",
-  "models.cappedHint": "One provider publishes at most {count} models; a tick past that never reaches the model picker.",
+  "models.empty": "No models in the catalogue.",
+  "models.noMatch": "No models match the filter.",
+  "models.capped": "Not published",
+  "models.cappedHint": "Each provider publishes up to {count} models. Additional selections are not included in the model picker.",
   "models.zeroEnabled": "Enable at least one model before saving.",
   "models.dirty": "Unsaved changes",
   "models.saving": "Saving…",
   "models.saved": "Model selection saved",
   "models.saveError": "Could not save: {message}",
-  "models.reload": "The model list changed. Reload the plugin to sync it.",
-  "models.addressDrift": "The published address differs from the one this run bound. Reload the plugin.",
+  "models.reload": "The model list changed. Reload the plugin to synchronize it.",
+  "models.addressDrift": "The published address differs from the address bound in this run. Reload the plugin.",
   "dist.title": "Account usage",
   "dist.priority": "Priority",
   "dist.roundRobin": "Round-robin",
   "dist.sticky": "Per conversation",
-  "dist.expiry": "Prefer expiring credits",
-  "dist.hintPriority": "Drain one account first, then move on to the next.",
-  "dist.hintRoundRobin": "Spread the spend evenly across every account.",
-  "dist.hintSticky": "Keep one conversation on one account. A new conversation takes the next account.",
-  "dist.hintExpiry": "Use one-off credits that are about to expire before the rest.",
-  "dist.hintSourcePriority": "Keeps using one account; a picked account is always the one used.",
-  "dist.hintSourceRoundRobin": "Each request moves to the next account, spreading the spend; a picked account always wins.",
-  "dist.hintSourceExpiry": "Use one-off credits that are about to expire first. A chosen account still takes priority.",
+  "dist.expiry": "Expiring credits first",
+  "dist.hintPriority": "Use one account until its credits are exhausted, then switch.",
+  "dist.hintRoundRobin": "Distribute requests across all accounts.",
+  "dist.hintSticky": "Keep each conversation on one account. New conversations use the next account.",
+  "dist.hintExpiry": "Use credits near expiry first.",
+  "dist.hintSourcePriority": "Keep using one account. A selected account remains in use.",
+  "dist.hintSourceRoundRobin": "Distribute each request across accounts. A selected account takes priority.",
+  "dist.hintSourceExpiry": "Use credits near expiry first. A selected account takes priority.",
   "auto.title": "Daily check-in",
   "auto.on": "On",
   "auto.off": "Off",
-  "auto.hours": "Hours",
-  "auto.hoursHint": "Beijing time (UTC+8), e.g. 9 or 9,21",
-  "auto.badHours": "Hours must be whole hours 0–23, for example 9 or 9,21.",
-  "auto.hoursSave": "Save hours",
+  "auto.hours": "Beijing time",
+  "auto.hoursHint": "9,21",
+  "auto.badHours": "Enter whole hours from 0 to 23, for example 9 or 9,21.",
+  "auto.hoursSave": "Save",
   "auto.runNow": "Run now",
-  "auto.runNowHint": "Runs the same pass the scheduled hour runs, and reports what it did.",
+  "auto.runNowHint": "Run the same tasks as the scheduled check-in.",
   "auto.running": "Running…",
-  "auto.lastManual": "Last run {slot} (manual): {count} account(s)",
-  "auto.lastAuto": "Last run {slot}: {count} account(s)",
-  "auto.lastFailedAt": "Last run {slot} failed: {message}",
-  "auto.neverRun": "Has not run yet",
+  "auto.lastManual": "Last manual run at {slot} · Accounts: {count}",
+  "auto.lastAuto": "Last run at {slot} · Accounts: {count}",
+  "auto.lastFailedAt": "Last run at {slot} failed: {message}",
+  "auto.neverRun": "No runs yet",
   "auto.rowWorkbuddy": "WorkBuddy",
   "auto.rowTravel": "Travel",
   "auto.rowQoder": "Qoder",
   "auto.rowTrae": "Trae",
-  "auto.rowCounts": "{label}: {claimed} collected · {skipped} skipped · {failed} failed",
-  "auto.rowGrowth": "Streak: {streak} tier(s) · +{credit} credits · {failed} failed",
+  "auto.rowCounts": "{label}: collected {claimed} · skipped {skipped} · failed {failed}",
+  "auto.rowGrowth": "Growth: streak tiers {streak} · draws {lottery} · failed {failed}",
   "auto.rowKeepAlive": "Token keep-alive {when}: {refreshed} refreshed · {fresh} already fresh · {failed} failed · {noToken} with no refresh token",
-  "auto.rowTravelCounts": "{label}: {departed} sent · {claimed} claimed · {adopted} adopted",
-  "auto.hint": "Claims daily rewards for WorkBuddy, Trae and Qoder, and WorkBuddy streak rewards. Streak claims can use make-up cards and lottery draws. Cat travel runs for domestic accounts only. A slot already collected today is skipped; a missed slot is collected at the next start that day.",
+  "auto.rowTravelCounts": "{label}: {departed} sent · {claimed} claimed",
+  "auto.hint": "Collects WorkBuddy, Trae and Qoder check-in rewards and WorkBuddy streak rewards. Streak rewards may consume make-up cards and lottery draws. Cat travel is available for domestic accounts only. Claimed slots are skipped; missed slots are collected during a later run that day.",
   "keepAlive.runNow": "Refresh now",
   "keepAlive.running": "Refreshing…",
-  "keepAlive.label": "Token keep-alive",
-  "keepAlive.hint": "Renews sign-in tokens on demand: plugin-owned copies refresh once six hours old or close to expiry, and the result is written back into the file the plugin owns, so a refused sign-in shows up the same day. The desktop app renews the sign-in it is using.",
+  "keepAlive.label": "Refresh sign-ins",
+  "keepAlive.hint": "Renews plugin-managed sign-ins. The desktop app renews sign-ins it manages.",
+  "growth.claim": "Claim",
+  "growth.calendar": "This month",
+  "growth.loggedIn": "Logged in",
+  "growth.notLoggedIn": "Not logged in",
+  "growth.futureDay": "Upcoming",
+  "growth.makeup": "Make-up for this day",
+  "growth.makeupConfirm": "Spend one make-up card on {date}?",
+  "growth.destination": "Destination",
+  "growth.depart": "Dispatch",
+  "growth.travelSent": "Travel dispatched",
+  "growth.makeupDone": "Day made up",
+  "growth.departConfirm": "Dispatch to {place}? This uses one daily trip.",
+  "growth.travelClaim": "Claim travel credits",
+  "growth.travelLimit": "Daily travel limit reached",
+  "growth.travelArrived": "Arrived",
+  "growth.travelReady": "Ready to dispatch",
+  "growth.traveling": "Traveling · {place} · arrives {time}",
+  "growth.draw": "Draw · {count} remaining",
+  "growth.drawConfirm": "Spend one lottery chance?",
+  "growth.confirmTitle": "Confirm action",
+  "growth.confirm": "Confirm",
+  "growth.cancel": "Cancel",
+  "growth.actionDone": "Completed · +{credit} credits",
+  "growth.physicalPrize": "Add a delivery address in the official Growth Centre.",
+  "growth.runConfirm": "Run travel and growth rewards for enabled accounts? This may use a daily trip, make-up cards and all lottery chances.",
+  "auto.enableConfirm": "Enable scheduled rewards? WorkBuddy runs may send a trip, use make-up cards and use all lottery chances.",
+  "auto.runConfirm": "Run check-in and rewards now? WorkBuddy may send a trip, use make-up cards and use all lottery chances.",
   "growth.title": "Growth centre",
-  "growth.ready": "WorkBuddy",
   "growth.running": "Running…",
   "growth.read": "Read state",
   "growth.reading": "Reading…",
-  "growth.readHint": "Reads the current tiers and what is due; Run now claims them.",
+  "growth.readHint": "Refresh streak tiers and available rewards",
+  "growth.detailsFailed": "Unable to load some details",
   "growth.run": "Run now",
-  "growth.runHint": "Runs the growth stage of the scheduled check-in on its own, and reports each step.",
-  "growth.hint": "Four steps: the make-up card, the gift and compensation, the activity report, and the streak tiers with their draws. A run consumes the make-up card and the draws; the rest can run again without paying twice.",
-  "growth.stateNone": "No state read yet",
-  "growth.stateStale": "The last run made this stale; read the state again",
-  "growth.stateSummary": "{accounts} account(s) · {tiers} tier(s) to redeem · {cards} make-up card(s) · {chances} draw(s)",
-  "growth.groupCount": "{count} account(s)",
-  "growth.stateFailed": "{failed} account(s) could not be read",
-  "growth.rowSummary": "Streak {days} day(s) · next tier {tier}, {remaining} to go",
-  "growth.rowHold": "{tiers} to redeem · {cards} card(s) · {chances} draw(s)",
+  "growth.runHint": "Run travel and collect growth rewards",
+  "growth.stateNone": "State not read",
+  "growth.stateStale": "State is outdated after the last run. Read it again.",
+  "growth.stateSummary": "Accounts: {accounts} · Redeemable tiers: {tiers} · Make-up cards: {cards} · Draws: {chances}",
+  "growth.groupCount": "Accounts: {count}",
+  "growth.stateFailed": "Accounts with load errors: {failed}",
+  "growth.rowDays": "Streak: {days} days",
+  "growth.rowSummary": "Streak: {days} days · Next tier in {remaining} days",
+  "growth.rowHold": "Redeemable tiers: {tiers} · Make-up cards: {cards} · Draws: {chances}",
+  "growth.rowHoldNoLottery": "Redeemable tiers: {tiers} · Make-up cards: {cards}",
   "growth.rowTiers": "Streak tiers",
-  "growth.rowTier": "{tier} · {days} day(s) · +{credit} credits +{energy} energy · {status}",
-  "growth.tierClaimed": "claimed",
-  "growth.tierUnlocked": "ready to redeem",
-  "growth.tierLocked": "locked",
-  "growth.rowNothing": "Nothing to collect here",
-  "growth.rowFailed": "This account could not be read",
+  "growth.tierDays": "{days} days",
+  "growth.rowTier": "Day {days} · +{credit} credits +{energy} energy",
+  "growth.tierClaimed": "Claimed",
+  "growth.tierLocked": "Locked",
+  "growth.rowNothing": "No rewards available",
+  "growth.rowFailed": "Unable to load this account",
   "growth.onlyWorkbuddy": "The growth centre applies to WorkBuddy accounts.",
-  "growth.runNone": "Nothing to collect on this pass",
-  "growth.runLine": "{when}: make-up {makeup} · gift +{gift} · compensation +{compensation} · activity {activity} · tiers {streak} · draws {lottery} · +{credit} credits",
-  "growth.runFailed": "{when}: {failed} step(s) failed",
-  "growth.busy": "A check-in pass is already running; wait for it to finish",
+  "growth.runNone": "No rewards collected",
+  "growth.runLine": "{when} · +{credit} credits · make-up {makeup} · streak {streak} · draws {lottery}",
+  "growth.runFailed": "{when}: failed steps {failed}",
+  "growth.busy": "A check-in task is running. Try again when it finishes.",
   "composer.title": "Composer credits",
-  "composer.on": "On",
-  "composer.off": "Off",
-  "composer.label": "Show the active account's credits in the composer",
-  "composer.hint": "When the selected model belongs to this plugin, its account's credits appear on the left of the composer. Click to switch accounts.",
+  "composer.hint": "Shows the active account's credits on the left while a model from this plugin is selected. Click the readout to change accounts.",
   "composer.show": "Show credits",
   "composer.hide": "Hide credits",
   "check.title": "Connection check",
-  "check.empty": "Run the check to see whether a chat can reach WorkBuddy, Trae or Qoder.",
+  "check.details": "Details",
+  "check.empty": "Run the check to test connectivity to WorkBuddy, Trae and Qoder.",
   "check.pass": "PASS",
   "check.fail": "FAIL",
-  "foot.shim": "endpoint {url}",
-  "foot.shimOff": "endpoint not listening",
+  "foot.shim": "Endpoint",
+  "foot.shimOff": "Not listening",
   "foot.rosterStale": "{region} needs attention: {detail}",
-  "foot.github": "GitHub",
   "foot.npm": "npm",
+  "foot.github": "GitHub",
   "foot.docs": "Docs",
   "foot.license": "License",
-  "err.bridge": "The panel bridge is unavailable.",
-  "err.busy": "The panel is busy with another action; try again in a moment.",
-  "err.stale": "The plugin was reloading; the list below is the last document before the reload. Refresh again.",
-  "tag.free": "free",
+  "err.bridge": "The panel connection is unavailable.",
+  "err.busy": "Another panel operation is running. Try again after it finishes.",
+  "err.stale": "The plugin was reloaded. Refresh to load the current state.",
+  "tag.free": "Free",
   "tag.rate": "x{rate}",
-  "tag.promoNight": "free until {hour}",
-  "tag.promoLater": "free from {hour}",
   "state.loading": "Loading…",
-  "state.refreshing": "checking…",
-  "probe.pending": "reading…",
+  "state.refreshing": "Checking…",
+  "probe.pending": "Reading…",
   "btn.refreshing": "Refreshing…",
-  "models.staleSelection": "{region} had models that no longer exist, so every model is shown. Tick and save again.",
+  "models.staleSelection": "{region} contains selected models that are no longer available. The full model list is shown; select models and save again.",
 };
 
 var ZH = {
@@ -323,19 +337,21 @@ var ZH = {
   "tabs.sources": "账号来源",
   "tabs.views": "插件页面",
   "tabs.regions": "账号区域",
+  "activity.title": "最近结果",
+  "risk.title": "账号使用说明",
   "risk.note": "非官方客户端可能触发账号风控，请遵守厂商服务条款。",
-  "host.missing": "宿主还没有注册本插件的 {count} 个模型组：重新加载插件。",
+  "host.missing": "未同步的模型组：{count}。请重新加载插件。",
   "btn.rescan": "重新检测账号",
   "btn.reset": "清除所有冷却",
   "btn.refresh": "刷新",
   "btn.checkin": "签到",
   "btn.checkinDone": "今日已签到",
   "btn.save": "保存",
-  "btn.discard": "放弃",
+  "btn.discard": "放弃修改",
   "btn.doctor": "运行连接检查",
   "btn.copy": "复制报告",
   "copy.ok": "已复制",
-  "copy.failedSelected": "复制失败，已选中报告，按 Ctrl+C",
+  "copy.failedSelected": "复制失败。报告已选中，请按 Ctrl+C。",
   "copy.failed": "复制失败",
   "region.cn": "国内版",
   "region.park": "停用{region}",
@@ -345,62 +361,53 @@ var ZH = {
   "region.global": "国际版",
   "region.cnShort": "国内版",
   "pool.summary": "{count} 个账号 · {cooling} 个冷却中",
-  "pool.healthy": "限流时会自动切换到其他可用账号。",
-  "pool.allCooling": "所有账号当前都被限流，请求会等到有账号冷却结束。",
+  "pool.allCooling": "所有账号均已限流。请求将在有账号退出冷却后继续。",
   "pool.refused": "{count} 个需重新登录",
-  "pool.allRefused": "所有账号的登录都已被上游拒绝，用「添加账号」重新登录一个，号池就能继续用。",
+  "pool.allRefused": "上游已拒绝所有账号的登录。请点击「添加账号」重新登录，以恢复服务。",
   "pool.restricted": "{count} 个被上游限制",
-  "pool.allRestricted": "所有账号都被上游限制了；请到 WorkBuddy 官方后台申诉，或换一个账号。",
-  "pool.allSwitchedOff": "所有账号都已停用，重新启用一个即可继续服务。",
+  "pool.allRestricted": "上游已限制所有账号。请在 WorkBuddy 官方后台申诉，或添加其他账号。",
+  "pool.allSwitchedOff": "所有账号均已停用。请至少启用一个账号以继续提供服务。",
   "pool.checkinAll": "全部签到",
-  "pool.checkinAllHint": "一次领完所有账号今天的签到，连登奖励也随这一轮领取。",
+  "pool.checkinAllHint": "领取当前来源的每日签到奖励",
   "pool.checkinAllBusy": "签到中…",
   "pool.checkinAllDone": "已签到 {count} 个账号",
   "pool.checkinAllNone": "所有账号今天都已签到",
   "pool.checkinAllFailed": "已签到 {count} 个，{failed} 个失败",
-  "pool.emptyRegion": "{region}这一侧还没有登录的账号。",
-  "pool.emptyHint": "请在该版本的 WorkBuddy 桌面 App 里登录，再点「重新检测账号」。",
-  "pool.sourceOff": "WorkBuddy 来源已在插件设置里关闭。",
+  "pool.emptyRegion": "{region} 暂无登录账号。",
+  "pool.emptyHint": "请在该版本的 WorkBuddy 桌面应用中登录，然后点击「重新检测账号」。",
+  "pool.sourceOff": "WorkBuddy 来源已在插件设置中停用。",
   "login.add": "添加账号",
-  "login.addHint": "在浏览器里登录 WorkBuddy，完成后该账号即加入账号池。",
-  "login.openAgain": "再打开一次链接",
-  "login.waiting": "在浏览器里完成登录即可，面板会自己把这个账号收进来。",
-  "login.timeout": "登录没有完成。重新开始一次拿新链接。",
-  "login.noLink": "插件没有返回登录链接。",
+  "login.addHint": "在浏览器中登录 WorkBuddy。登录完成后，账号将自动加入账号池。",
+  "login.openAgain": "打开登录链接",
+  "login.waiting": "请在浏览器中完成登录。面板将自动添加该账号。",
+  "login.timeout": "登录未完成。请重新获取登录链接。",
+  "login.noLink": "未获取到登录链接。",
   "login.added": "已添加 {name}",
   "login.addedNoName": "账号已添加",
   "trae.title": "Trae",
-  "trae.gateway": "{region}网关，端口 {port}",
-  "trae.models": "{count} 个模型",
-  "trae.noModels": "还没有发布模型",
-  "trae.off": "Trae 来源已在插件设置里关闭。",
-  "trae.fallback": "首选端口 {port} 被占用，本次改听备用端口，供应商行跟随本次地址",
+  "trae.off": "Trae 来源已在插件设置中停用。",
   "qoder.title": "Qoder",
-  "qoder.gateway": "{region}网关，端口 {port}",
-  "qoder.models": "{count} 个模型",
-  "qoder.noModels": "还没有发布模型",
-  "qoder.off": "Qoder 来源已在插件设置里关闭。",
+  "qoder.off": "Qoder 来源已在插件设置中停用。",
   "source.enable": "启用{source}",
   "source.disable": "停用{source}",
-  "source.traeSlots": "国内版只有 Trae CN 与 TRAE SOLO CN 两个登录位；换号登录会覆盖前一个账号。",
-  "source.qoderSlots": "每个安装只保存一个登录；在 App 里重新登录另一个账号会覆盖前一个。",
-  "source.traeCheckin": "每日签到一台设备只能领一次：本机今天已经领过，其他账号会显示「本机今日已签到」。",
+  "source.traeSlots": "国内版 Trae 提供 Trae CN 和 TRAE SOLO CN 两个登录位。在同一登录位登录其他账号会替换当前账号。",
+  "source.qoderSlots": "每个安装仅保存一个登录。登录其他账号会替换当前账号。",
+  "source.traeCheckin": "每台设备每天只能领取一次签到奖励。一个账号领取后，其他账号将显示「本机今日已签到」。",
   "source.expired": "令牌已过期",
   "workbuddy.title": "WorkBuddy",
-  "models.noGateway": "该来源还没有网关",
-  "models.noDirectory": "该来源的模型列表读不出来",
+  "models.noGateway": "该来源没有可用网关。",
+  "models.noDirectory": "无法读取该来源的模型列表。",
   "source.accountCount": "{count} 个账号",
   "source.checkinDone": "已领取今日奖励",
   "source.planTitle": "套餐",
   "source.planTrial": "试用中",
-  "source.checkinSkipped": "今天已经领过了",
+  "source.checkinSkipped": "今日已领取",
   "source.quotaUnknown": "额度数据不可用",
   "source.checkedIn": "今日已签到",
   "source.claimable": "今日可签到",
   "source.noAccounts": "未找到本机登录",
-  "source.campaignUnknown": "签到状态读取失败",
+  "source.campaignUnknown": "无法读取签到状态",
   "source.deviceCheckedIn": "本机今日已签到",
-  "qoder.fallback": "首选端口 {port} 被占用，本次改听备用端口，供应商行跟随本次地址",
   "badge.next": "下一个",
   "source.claimableAt": "北京时间 {time} 后可签到",
   "badge.cooling": "冷却中",
@@ -415,37 +422,34 @@ var ZH = {
   "acct.coolUntil": "冷却至 {time}",
   "acct.holdUntil": "暂停至 {time}",
   "acct.restrictedUntil": "被上游限制，直至 {time}",
-  "acct.restrictedHint": "上游限制了这个账号（11140：账号存在异常行为）。号池每六小时重试一次；请到 WorkBuddy 官方后台提交申诉。",
+  "acct.restrictedHint": "上游已限制此账号（11140：账号异常）。账号池每六小时重试一次。请前往 WorkBuddy 官方后台提交申诉。",
   "badge.restricted": "已限制",
-  "acct.signInRefused": "该账号的登录已被上游拒绝，刷新令牌同样失效。在面板上「添加账号」重新登录一次：这份登录由插件自己保管。",
+  "acct.signInRefused": "请通过「添加账号」重新登录。",
   "acct.hits": "已触发 {hits} 次限流",
   "acct.choose": "使用哪个账号的额度",
   "acct.automatic": "自动选择（按使用方式）",
-  "acct.choiceHint": "优先用所选账号，限流时临时换号；自动选择则按使用方式分配。",
-  "acct.unavailable": "所选账号暂不可用（自动换号）",
+  "acct.unavailable": "所选账号暂不可用（自动切换）",
   "acct.expired": "登录已过期",
-  "acct.archivedHint": "桌面端已经没有文件持有这个账号：面板上的这份令牌就是它在用的，到期为止。在 WorkBuddy 里重新登录该账号可续期。",
+  "acct.archivedHint": "桌面应用已无此账号的登录文件。账号池将使用已保存的令牌，直至令牌过期。可在 WorkBuddy 中重新登录以续期。",
   "acct.choiceCredits": "{label} · {credits} 积分",
   "badge.preferred": "已选",
-  "acct.on": "启用中",
   "acct.off": "已停用",
   "acct.switchOn": "重新使用该账号",
   "acct.inPool": "参与轮换",
   "acct.switchOff": "暂时不使用该账号",
   "acct.remove": "移除",
-  "acct.removeHint": "把账号移出账号池；可在「已移除的账号」里恢复。",
+  "acct.removeHint": "将账号移出账号池；可在「已移除的账号」中恢复。",
   "acct.delete": "删除",
-  "acct.deleteHint": "移出账号池，并删除插件保存的登录与留档；重新登录该账号即可恢复。",
-  "acct.deleteConfirm": "要删除 {name} 吗？它会退出账号池，插件保存的登录与留档一并删除；重新扫描不会再带回，重新登录该账号即可恢复。",
-  "acct.deleteConfirmAgain": "再按一次确认删除",
+  "acct.deleteHint": "将账号移出账号池，并删除插件保存的登录信息与归档。重新登录该账号即可恢复。",
+  "acct.deleteConfirm": "删除 {name}？该账号将移出账号池，插件保存的登录信息与归档也会删除。重新扫描不会恢复该账号；重新登录后可恢复。",
+  "acct.deleteConfirmAgain": "再次点击「删除」以确认",
   "acct.stateError": "账号设置失败：{message}",
   "pool.switchedOff": "{count} 个已停用",
   "removed.title": "已移除的账号",
-  "removed.hint": "已退出账号池；在此恢复后重新参与分发。",
   "removed.restore": "恢复",
   "acct.modelCool": "{model} 冷却至 {time}",
   "credits.title": "积分",
-  "credits.unavailable": "积分读取失败",
+  "credits.unavailable": "无法读取积分",
   "credits.package": "{remain} / {size}",
   "credits.monthly": "月包",
   "credits.refreshAt": "{time} 刷新",
@@ -461,8 +465,8 @@ var ZH = {
   "credits.keepAtLeast": "至少保留",
   "credits.keepUnit": "积分",
   "credits.keepSave": "保存",
-  "credits.keepHint": "余额降到这个数就不再使用该账号，剩下的留给你自己用。",
-  "credits.keepBadge": "保留 {credits}",
+  "credits.keepHint": "余额达到此值后，账号池将停止使用该账号。",
+  "credits.keepBadge": "最低保留 {credits}",
   "checkin.title": "每日签到",
   "checkin.streak": "连签 {days} 天",
   "checkin.daily": "每天 +{credit} 积分",
@@ -477,130 +481,154 @@ var ZH = {
   "models.deselectAll": "取消全选",
   "models.modelConfigurations": "模型设置",
   "models.searchChosen": "搜索已添加模型…",
-  "models.noModelsChosen": "尚未选择模型。请在模型列表中勾选。",
-  "models.noChosenMatch": "没有匹配的已添加模型",
+  "models.noModelsChosen": "请至少选择一个模型。",
+  "models.noChosenMatch": "没有匹配的已选模型。",
   "models.removeModel": "移除模型",
   "models.advanced": "高级",
   "models.alias": "别名",
-  "models.aliasPlaceholder": "例如 fast",
-  "models.aliasHelp": "在显示模型名称的地方生效；请求仍使用模型 ID。",
+  "models.aliasPlaceholder": "例如：fast",
+  "models.aliasHelp": "用于模型列表显示；请求仍使用模型 ID。",
   "models.window": "上下文窗口",
-  "models.windowFollows": "跟随目录；手动修改后会固定为你的值。",
+  "models.windowFollows": "默认跟随模型目录；输入自定义值后固定为该值。",
   "models.maxOutput": "最大输出",
-  "models.outputHelp": "该模型单次回复的最大长度。",
-  "models.overCeiling": "该模型最多只接受 {limit}，更大的数值没有生效。",
+  "models.outputHelp": "单次模型回复的最大长度。",
+  "models.overCeiling": "该模型最多接受 {limit}。较大的数值已忽略。",
   "models.levels": "思考等级",
   "models.defaultLevel": "默认思考等级",
   "models.capabilities": "附件",
   "models.imageInput": "图片",
-  "models.empty": "目录里还没有模型。",
+  "models.empty": "模型目录中没有模型。",
   "models.noMatch": "没有匹配的模型。",
   "models.capped": "未发布",
-  "models.cappedHint": "一个模型组最多发布 {count} 个模型，多勾的不会出现在模型选择器里。",
+  "models.cappedHint": "每个提供商最多发布 {count} 个模型。超出部分不会出现在模型选择器中。",
   "models.zeroEnabled": "至少启用一个模型才能保存。",
   "models.dirty": "有未保存的修改",
   "models.saving": "保存中…",
   "models.saved": "模型选择已保存",
   "models.saveError": "保存失败：{message}",
-  "models.reload": "模型列表有变化。重新加载插件后同步。",
-  "models.addressDrift": "对外公布的地址与本次运行的地址不一致。重新加载插件。",
+  "models.reload": "模型列表已变化。请重新加载插件以同步。",
+  "models.addressDrift": "对外公布的地址与本次运行绑定的地址不一致。请重新加载插件。",
   "dist.title": "账号使用方式",
-  "dist.priority": "优先用一个",
+  "dist.priority": "优先使用",
   "dist.roundRobin": "轮流使用",
   "dist.sticky": "同一对话固定",
   "dist.expiry": "优先使用临期积分",
-  "dist.hintPriority": "先用完一个账号的额度，再换下一个。",
-  "dist.hintRoundRobin": "把消耗均摊到每个账号上。",
-  "dist.hintSticky": "同一个对话一直用一个账号，新对话才换下一个。",
+  "dist.hintPriority": "优先耗尽单个账号积分，再切换账号。",
+  "dist.hintRoundRobin": "将请求分配到各个账号。",
+  "dist.hintSticky": "同一对话固定使用一个账号；新对话使用下一个账号。",
   "dist.hintExpiry": "优先消耗即将到期的一次性积分。",
-  "dist.hintSourcePriority": "一直用同一个账号；已选具体账号时始终用它。",
-  "dist.hintSourceRoundRobin": "每个请求换下一个账号，摊平消耗；已选具体账号时以它为准。",
-  "dist.hintSourceExpiry": "优先消耗即将到期的一次性积分；已指定账号时仍以该账号为准。",
+  "dist.hintSourcePriority": "持续使用同一账号；已选账号优先。",
+  "dist.hintSourceRoundRobin": "将请求分配到各账号；已选账号优先。",
+  "dist.hintSourceExpiry": "优先使用临期积分；已选账号优先。",
   "auto.title": "自动签到",
   "auto.on": "开启",
   "auto.off": "关闭",
   "composer.title": "输入框积分",
-  "composer.on": "已开启",
-  "composer.off": "已关闭",
-  "composer.label": "在输入框工具栏显示当前账号积分",
-  "composer.hint": "开启后，选中本插件的模型时，输入框左侧显示正在使用的账号积分。点开可以换号。",
+  "composer.hint": "选中本插件模型时，输入框左侧显示当前账号积分。点击读数后可以更换账号。",
   "composer.show": "显示积分",
   "composer.hide": "隐藏积分",
-  "growth.title": "成长中心",
-  "growth.ready": "WorkBuddy",
-  "growth.running": "运行中…",
-  "growth.read": "读取状态",
-  "growth.reading": "读取中…",
-  "growth.readHint": "读取当前档位与可领取项；领取动作在「立即执行」。",
-  "growth.run": "立即执行",
-  "growth.runHint": "单独执行定时签到里的成长环节，并按步骤报告结果。",
-  "growth.hint": "四项：补签卡、礼包与补偿、活跃上报、连登档位与抽奖。补签卡与抽奖次数在执行后扣减，其余分项可重复执行，只到账一次。",
-  "growth.stateNone": "还没有读过状态",
-  "growth.stateStale": "执行后读数已过期，请重新读取",
-  "growth.stateSummary": "{accounts} 个账号 · 可兑换 {tiers} 档 · 补签卡 {cards} 张 · 抽奖 {chances} 次",
-  "growth.groupCount": "{count} 个账号",
-  "growth.stateFailed": "{failed} 个账号读不出来",
-  "growth.rowSummary": "连登 {days} 天 · 下一档 {tier}，还差 {remaining} 天",
-  "growth.rowHold": "可兑换 {tiers} 档 · 补签卡 {cards} 张 · 抽奖 {chances} 次",
-  "growth.rowTiers": "连登档位",
-  "growth.rowTier": "{tier} · {days} 天 · +{credit} 积分 +{energy} 能量 · {status}",
-  "growth.tierClaimed": "已领取",
-  "growth.tierUnlocked": "可兑换",
-  "growth.tierLocked": "未解锁",
-  "growth.rowNothing": "这里没有可领的",
-  "growth.rowFailed": "这个账号读不出来",
-  "growth.onlyWorkbuddy": "成长中心对 WorkBuddy 账号生效。",
-  "growth.runNone": "本次没有可领取的项",
-  "growth.runLine": "{when}：补签 {makeup} · 礼包 +{gift} · 补偿 +{compensation} · 活跃上报 {activity} · 档位 {streak} · 抽奖 {lottery} · 共 +{credit} 积分",
-  "growth.runFailed": "{when}：{failed} 个步骤失败",
-  "growth.busy": "签到正在跑，等它跑完",
-  "auto.hours": "时间",
-  "auto.hoursHint": "按北京时间（UTC+8），如 9 或 9,21",
+  "auto.hours": "北京时间",
+  "auto.hoursHint": "9,21",
   "auto.hoursSave": "保存时间",
   "auto.runNow": "立即运行",
-  "auto.runNowHint": "执行与定时相同的一轮，并报告结果。",
+  "auto.runNowHint": "执行与定时签到相同的任务。",
   "auto.running": "运行中…",
-  "auto.lastManual": "上次 {slot}（手动）：领取 {count} 个账号",
-  "auto.lastAuto": "上次 {slot}：领取 {count} 个账号",
-  "auto.lastFailedAt": "上次 {slot} 失败：{message}",
-  "auto.neverRun": "还没运行过",
+  "auto.lastManual": "上次手动运行（{slot}） · {count} 个账号",
+  "auto.lastAuto": "上次运行（{slot}） · {count} 个账号",
+  "auto.lastFailedAt": "上次运行（{slot}）失败：{message}",
+  "auto.neverRun": "暂无运行记录",
   "auto.rowWorkbuddy": "WorkBuddy",
   "auto.rowTravel": "猫猫旅行",
   "auto.rowQoder": "Qoder",
   "auto.rowTrae": "Trae",
   "auto.rowCounts": "{label}：领取 {claimed} · 跳过 {skipped} · 失败 {failed}",
-  "auto.rowGrowth": "连登：{streak} 档 · +{credit} 积分 · 失败 {failed}",
+  "auto.rowGrowth": "成长：连登 {streak} 档 · 抽奖 {lottery} 次 · 失败 {failed} 次",
+  "auto.rowTravelCounts": "{label}：派出 {departed} · 领奖 {claimed}",
+  "auto.hint": "按设定时间领取 WorkBuddy、Trae、Qoder 签到奖励及 WorkBuddy 连登奖励。连登奖励可能消耗补签卡和抽奖次数；猫猫旅行仅限国内账号。已领取的时段会跳过，遗漏的时段将在当天后续运行中补领。",
   "auto.rowKeepAlive": "令牌保活 {when}：刷新 {refreshed} 个 · 已是最新 {fresh} 个 · 失败 {failed} 个 · 无刷新令牌 {noToken} 个",
-  "auto.rowTravelCounts": "{label}：派出 {departed} · 领奖 {claimed} · 领养 {adopted}",
-  "auto.hint": "按时领取 WorkBuddy、Trae、Qoder 的签到奖励和 WorkBuddy 连登奖励。连登奖励可能使用补签卡和抽奖次数；猫猫旅行仅处理国内账号。当天已领取的时段会跳过，错过的时段会在当天后续运行时补领。",
   "keepAlive.runNow": "立即刷新",
   "keepAlive.running": "刷新中…",
-  "keepAlive.label": "登录令牌保活",
-  "keepAlive.hint": "按需续期登录令牌：插件自管的副本满 6 小时或临近到期即刷新，结果写回插件自己的登录文件，登录被上游拒绝时当天即可发现。桌面端正在使用的登录由桌面端续期。",
-  "auto.badHours": "时间请填 0–23 的整数小时，例如 9 或 9,21。",
+  "keepAlive.label": "登录续期",
+  "keepAlive.hint": "续期插件管理的登录。桌面应用管理的登录由原应用续期。",
+  "growth.claim": "领取",
+  "growth.calendar": "本月登录",
+  "growth.loggedIn": "已登录",
+  "growth.notLoggedIn": "未登录",
+  "growth.futureDay": "尚未到来",
+  "growth.makeup": "补签此日",
+  "growth.makeupConfirm": "消耗 1 张补签卡，补签 {date}？",
+  "growth.destination": "旅行地点",
+  "growth.depart": "派遣旅行",
+  "growth.travelSent": "已派遣旅行",
+  "growth.makeupDone": "补签完成",
+  "growth.departConfirm": "派往「{place}」？将使用 1 次今日旅行机会。",
+  "growth.travelClaim": "领取旅行积分",
+  "growth.travelLimit": "今日旅行次数已达上限",
+  "growth.travelArrived": "已到达",
+  "growth.travelReady": "待出发",
+  "growth.traveling": "旅行中 · {place} · {time} 到达",
+  "growth.draw": "抽奖 · 剩余 {count} 次",
+  "growth.drawConfirm": "将消耗 1 次抽奖机会，确认抽奖？",
+  "growth.confirmTitle": "确认操作",
+  "growth.confirm": "确认",
+  "growth.cancel": "取消",
+  "growth.actionDone": "操作完成 · +{credit} 积分",
+  "growth.physicalPrize": "请在官方成长中心填写收货地址。",
+  "growth.runConfirm": "为启用的账号执行旅行和成长奖励？可能消耗当日旅行次数、补签卡和全部抽奖次数。",
+  "auto.enableConfirm": "开启定时领取？启用 WorkBuddy 时，每轮可能派遣旅行、消耗补签卡并耗尽全部抽奖次数。",
+  "auto.runConfirm": "立即签到并领奖？WorkBuddy 可能派遣旅行、消耗补签卡并耗尽全部抽奖次数。",
+  "growth.title": "成长中心",
+  "growth.running": "运行中…",
+  "growth.read": "读取状态",
+  "growth.reading": "读取中…",
+  "growth.readHint": "刷新连登档位和可领取奖励",
+  "growth.detailsFailed": "部分详情读取失败",
+  "growth.run": "立即执行",
+  "growth.runHint": "执行猫猫旅行和成长奖励",
+  "growth.stateNone": "尚未读取状态",
+  "growth.stateStale": "上次运行后状态已过期。请重新读取。",
+  "growth.stateSummary": "{accounts} 个账号 · 可兑换 {tiers} 档 · 补签卡 {cards} 张 · 抽奖 {chances} 次",
+  "growth.groupCount": "{count} 个账号",
+  "growth.stateFailed": "{failed} 个账号的数据无法读取",
+  "growth.rowDays": "连登 {days} 天",
+  "growth.rowSummary": "连登 {days} 天 · 距下一档还差 {remaining} 天",
+  "growth.rowHold": "可兑换 {tiers} 档 · 补签卡 {cards} 张 · 抽奖 {chances} 次",
+  "growth.rowHoldNoLottery": "可兑换 {tiers} 档 · 补签卡 {cards} 张",
+  "growth.rowTiers": "连登档位",
+  "growth.tierDays": "{days} 天",
+  "growth.rowTier": "{days} 天 · +{credit} 积分 +{energy} 能量",
+  "growth.tierClaimed": "已领取",
+  "growth.tierLocked": "未解锁",
+  "growth.rowNothing": "暂无可领取项",
+  "growth.rowFailed": "无法读取此账号",
+  "growth.onlyWorkbuddy": "成长中心仅适用于 WorkBuddy 账号。",
+  "growth.runNone": "本次运行未领取到奖励",
+  "growth.runLine": "{when} · +{credit} 积分 · 补签 {makeup} · 连登 {streak} · 抽奖 {lottery}",
+  "growth.runFailed": "{when}：{failed} 个步骤失败",
+  "growth.busy": "签到任务正在运行，请等待完成。",
+  "auto.badHours": "请输入 0–23 的整数小时，例如 9 或 9,21。",
   "check.title": "连接检查",
-  "check.empty": "运行检查可以看到对话能否连上 WorkBuddy、Trae 或 Qoder。",
+  "check.details": "详细信息",
+  "check.empty": "运行连接检查，验证 WorkBuddy、Trae 和 Qoder 的连接。",
   "check.pass": "通过",
   "check.fail": "未通过",
-  "foot.shim": "端点 {url}",
-  "foot.shimOff": "端点未监听",
-  "foot.rosterStale": "{region} 需要注意：{detail}",
-  "foot.github": "GitHub",
+  "foot.shim": "端点",
+  "foot.shimOff": "未监听",
+  "foot.rosterStale": "{region} 状态异常：{detail}",
   "foot.npm": "npm",
+  "foot.github": "GitHub",
   "foot.docs": "文档",
   "foot.license": "许可",
-  "err.bridge": "面板桥不可用。",
-  "err.busy": "面板正在处理其他操作，请稍候再试。",
-  "err.stale": "插件刚刚重载，当前列表还是重载前的状态，请再刷新一次。",
+  "err.bridge": "面板连接不可用。",
+  "err.busy": "面板正在执行其他操作。请等待完成。",
+  "err.stale": "插件已重新加载。请刷新以获取当前数据。",
   "tag.free": "免费",
   "tag.rate": "x{rate}",
-  "tag.promoNight": "夜间免费 · 到 {hour}",
-  "tag.promoLater": "{hour} 起免费",
   "state.loading": "加载中…",
-  "state.refreshing": "正在检测…",
+  "state.refreshing": "检测中…",
   "probe.pending": "读取中…",
   "btn.refreshing": "刷新中…",
-  "models.staleSelection": "{region}保存的选择里有已下线的模型，现按全部模型显示。请重新勾选并保存。",
+  "models.staleSelection": "{region} 的已选模型包含已下线项。当前显示完整模型列表，请重新选择并保存。",
 };
 
 var locale = String(document.documentElement.lang || navigator.language || "zh-CN");
@@ -622,6 +650,22 @@ function el(tag, className, text) {
   if (className) node.className = className;
   if (text !== undefined && text !== null) node.textContent = String(text);
   return node;
+}
+
+function iconLabel(node, label) {
+  node.textContent = "";
+  node.className += node.className.includes("icon-only") ? "" : " icon-only";
+  node.appendChild(el("span", "sr-only", label));
+  node.title = label;
+}
+
+function helpNote(label, text) {
+  var details = el("details", "help-note");
+  var trigger = el("summary", "ic-info");
+  iconLabel(trigger, label);
+  details.appendChild(trigger);
+  details.appendChild(el("p", "help-content", text));
+  return details;
 }
 
 function clear(node) {
@@ -692,8 +736,7 @@ function tokenChip(iso) {
 }
 
 /**
- * The chips one roster row carries: what the model costs, and — when a
- * promotion covers it — whether its free window is open now or opens later.
+ * The chips one roster row carries.
  *
  * `tone` picks the colour; the caller renders each one as a badge.
  */
@@ -703,12 +746,6 @@ function tagOf(model) {
   else if (typeof model.multiplier === "number") {
     out.push({ text: t("tag.rate", { rate: model.multiplier.toFixed(2) }), tone: "" });
   }
-  var promo = model.promo;
-  if (promo && promo.kind === "night") {
-    out.push({ text: t("tag.promoNight", { hour: clockHour(promo.untilHour) }), tone: "free" });
-  } else if (promo && promo.kind === "night-later") {
-    out.push({ text: t("tag.promoLater", { hour: clockHour(promo.nextHour) }), tone: "" });
-  }
   return out;
 }
 
@@ -716,8 +753,7 @@ function tagOf(model) {
 function clockHour(hour) {
   var value = Math.round(Number(hour));
   if (!Number.isFinite(value)) return "";
-  // 24 is a real edge: the promo module reports it for "free until the end of
-  // the day". Clamping it to 23 told the user the discount stops an hour early.
+  // 24 is a valid end-of-day edge.
   value = Math.max(0, Math.min(24, value));
   return (value < 10 ? "0" : "") + value + ":00";
 }
@@ -740,7 +776,7 @@ function note(message, kind) {
     .replace(/^Error invoking remote method '[^']*':\s*/, "")
     .replace(/^Error:\s*/, "");
   bannerText = banner.textContent;
-  banner.className = kind === "warn" ? "banner warn" : "banner";
+  banner.className = kind === "warn" ? "banner warn" : kind === "success" ? "banner success" : "banner";
   show(banner, true);
 }
 
@@ -785,11 +821,7 @@ var growthReading = false;
 /** The account whose delete button is armed, and the timer that disarms it. */
 var pendingDelete = null;
 var deleteTimer = 0;
-/**
- * How many times the host has dropped the read, so a read already in flight can
- * tell that its own answer is about a pool that no longer exists.
- */
-var growthDropped = 0;
+var growthReadEpoch = 0;
 /** How long a read stays current before entering the page refreshes it. */
 var GROWTH_STALE_MS = 2 * 60 * 1000;
 
@@ -813,6 +845,10 @@ function growthStale() {
 }
 /** Which growth rows are expanded, keyed by account id. */
 var openGrowth = {};
+var growthDestinations = new Map();
+// Keep the acting account row at the same viewport offset while its details reload.
+var growthScrollReturn = null;
+var growthScrollVersion = 0;
 
 /**
  * The model sheet's draft: the edits of the models ticked on the roster.
@@ -913,9 +949,9 @@ function renderHeader() {
   if (state && state.refreshing === true) sub = sub + " · " + t("state.refreshing");
   $("barSub").textContent = sub;
 
-  $("rescanBtn").textContent = t("btn.rescan");
-  $("resetBtn").textContent = t("btn.reset");
-  $("refreshBtn").textContent = busy === "refresh" ? t("btn.refreshing") : t("btn.refresh");
+  iconLabel($("rescanBtn"), t("btn.rescan"));
+  iconLabel($("resetBtn"), t("btn.reset"));
+  iconLabel($("refreshBtn"), busy === "refresh" ? t("btn.refreshing") : t("btn.refresh"));
   $("rescanBtn").disabled = busy !== null;
   $("resetBtn").disabled = busy !== null;
   $("refreshBtn").disabled = busy !== null;
@@ -1173,10 +1209,8 @@ function renderWorkbuddyHead() {
   clear(host);
   if (state === null) return;
   var accounts = state.accounts || [];
-  var cooling = accounts.filter(isCooling).length;
-  var off = accounts.filter(function (account) { return account.disabled === true; }).length;
   host.appendChild(el("strong", null, t("workbuddy.title")));
-  host.appendChild(el("span", "muted", t("pool.summary", { count: accounts.length, cooling: cooling })));
+  host.appendChild(el("span", "muted", t("source.accountCount", { count: accounts.length })));
 
   // Collecting every reward is the reason a multi-account pool exists, so it is
   // one button rather than a click per account card. It acts on the whole pool,
@@ -1212,8 +1246,6 @@ function renderWorkbuddyHead() {
   addButton.disabled = busy !== null || checkinBusy !== null;
   addButton.addEventListener("click", loginBusy ? reopenLogin : startLogin);
   host.appendChild(addButton);
-
-  if (off > 0) host.appendChild(el("span", "muted", t("pool.switchedOff", { count: off })));
 }
 
 /** The pool's health line, minus the head row's summary and check-in button. */
@@ -1237,7 +1269,7 @@ function renderPoolStrip() {
       ? t("pool.allSwitchedOff")
       : usable <= 0
         ? (restricted > 0 && refused === 0 ? t("pool.allRestricted") : refused > 0 ? t("pool.allRefused") : t("pool.allCooling"))
-        : t("pool.healthy");
+        : "";
   if (noteText) strip.appendChild(el("span", "muted", noteText));
   if (refused > 0) strip.appendChild(el("span", "finding-fail", t("pool.refused", { count: refused })));
   if (restricted > 0) strip.appendChild(el("span", "finding-fail", t("pool.restricted", { count: restricted })));
@@ -1300,7 +1332,7 @@ function sourceAccountCard(account, kind) {
   if (account.email) head.appendChild(el("span", "muted", account.email));
   // Which app this sign-in came from: one Trae account keeps a copy in every
   // app it was signed into, and the scanner folds them into a single row.
-  if (account.app) head.appendChild(el("span", "muted", account.app));
+  if (account.app && account.app !== account.label) head.appendChild(el("span", "muted", account.app));
   head.appendChild(el("span", "region-tag", kind === "trae"
     ? (account.region === "ai" ? t("region.global") : t("region.cn"))
     : (account.region === "global" ? t("region.global") : t("region.cn"))));
@@ -1360,8 +1392,8 @@ function sourceAccountCard(account, kind) {
           : checkin.campaignsUnavailable === true ? t("source.campaignUnknown")
             : t("source.claimable")));
     if (!doneToday && checkin.active && checkin.amount > 0) {
-  row.appendChild(el("span", "muted", checkin.amount + " "
-    + (checkin.unit === undefined || checkin.unit === "credits" ? t("credits.keepUnit") : checkin.unit)));
+      row.appendChild(el("span", "muted", checkin.amount + " "
+        + (checkin.unit === undefined || checkin.unit === "credits" ? t("credits.keepUnit") : checkin.unit)));
     }
     // The per-account claim the pool's own cards have; the source-wide button in
     // the head stays the one-click path for every account of this source.
@@ -1370,8 +1402,10 @@ function sourceAccountCard(account, kind) {
       : deviceDone ? t("source.deviceCheckedIn")
         : opensLabel !== "" ? opensLabel
           : t("btn.checkin");
-    var claim = el("button", "primary small" + (busyHere ? " is-busy" : ""),
+    var checkedIn = doneToday || deviceDone;
+    var claim = el("button", "small " + (checkedIn ? "ic-check" : "primary ic-calendar") + (busyHere ? " is-busy" : ""),
       busyHere ? t("checkin.claiming") : idleLabel);
+    if (checkedIn) iconLabel(claim, idleLabel);
     claim.type = "button";
     claim.setAttribute("aria-label", (busyHere ? t("checkin.claiming") : idleLabel) + ": " + account.label);
     claim.disabled = busyHere || checkinBusy !== null || busy !== null
@@ -1464,11 +1498,9 @@ function modelPage() {
  * check-in, so they share one renderer instead of two copies kept in step.
  */
 var SOURCE_SECTIONS = {
-  trae: { title: "trae.title", off: "trae.off", gateway: "trae.gateway", models: "trae.models",
-    noModels: "trae.noModels", fallback: "trae.fallback", checkinRegions: ["cn"],
+  trae: { title: "trae.title", off: "trae.off", checkinRegions: ["cn"],
     note: "source.traeSlots", checkinNote: "source.traeCheckin" },
-  qoder: { title: "qoder.title", off: "qoder.off", gateway: "qoder.gateway", models: "qoder.models",
-    noModels: "qoder.noModels", fallback: "qoder.fallback", checkinRegions: ["cn", "global"],
+  qoder: { title: "qoder.title", off: "qoder.off", checkinRegions: ["cn", "global"],
     note: "source.qoderSlots" },
 };
 
@@ -1483,7 +1515,6 @@ function renderSourceStrip(source) {
   if (state === null) return;
   var section = SOURCE_SECTIONS[source];
   var info = state[source] || {};
-  var gateways = Array.isArray(info.gateways) ? info.gateways : [];
   var accounts = Array.isArray(info.accounts) ? info.accounts : [];
   var regions = SOURCE_REGIONS[source];
   var on = sourceOn(source);
@@ -1513,13 +1544,9 @@ function renderSourceStrip(source) {
     return;
   }
   host.appendChild(sourceRegionNav(source, regions, accounts));
-  // One short line about this source's own sign-in rules, where the accounts are.
-  if (section.note) host.appendChild(el("p", "hint", t(section.note)));
-  // The device rule is about the daily check-in; an international region has
-  // none, so the line would describe a button that is not on the page.
-  if (section.checkinNote && section.checkinRegions.indexOf(region) >= 0) {
-    host.appendChild(el("p", "hint", t(section.checkinNote)));
-  }
+  var rules = section.note ? t(section.note) : "";
+  if (section.checkinNote && section.checkinRegions.indexOf(region) >= 0) rules += "\n" + t(section.checkinNote);
+  if (rules) host.firstChild.appendChild(helpNote(t(section.title), rules));
   if (regionParked(source, region)) {
     host.appendChild(parkedRegionBlock(source, region));
     host.appendChild(sourceFoot(source));
@@ -1537,19 +1564,6 @@ function renderSourceStrip(source) {
     host.appendChild(list);
   }
 
-  // Only this region's gateway: the other one sits behind its own region tab.
-  var shown = gateways.filter(function (gateway) { return gateway.region === region; });
-  if (shown.length > 0) {
-    var foot = el("div", "source-foot");
-    shown.forEach(function (gateway) {
-      var parts = [t(section.gateway, { region: sourceRegionLabel(gateway.region), port: gateway.port }),
-        gateway.models > 0 ? t(section.models, { count: gateway.models }) : t(section.noModels)];
-      if (gateway.portFallback) parts.push(t(section.fallback, { port: gateway.preferredPort || gateway.port }));
-      if (gateway.lastError) parts.push(gateway.lastError);
-      foot.appendChild(el("span", "muted", parts.join(" · ")));
-    });
-    host.appendChild(foot);
-  }
   // The region's own switch sits at the bottom of its content.
   host.appendChild(regionFoot(source, region));
   host.appendChild(sourceFoot(source));
@@ -1745,10 +1759,14 @@ function distributionControl(source) {
   var current = (workbuddy
     ? (state && state.distribution)
     : (state && state[source] && state[source].distribution)) || "priority";
+  var hintKeys = workbuddy
+    ? { "round-robin": "dist.hintRoundRobin", expiry: "dist.hintExpiry", sticky: "dist.hintSticky" }
+    : { "round-robin": "dist.hintSourceRoundRobin", expiry: "dist.hintSourceExpiry" };
   var seg = el("div", "seg");
   modes.forEach(function (pair) {
     var button = el("button", current === pair[0] ? "active" : "", t(pair[1]));
     button.type = "button";
+    button.title = t(hintKeys[pair[0]] || (workbuddy ? "dist.hintPriority" : "dist.hintSourcePriority"));
     button.id = "distribution-" + source + "-" + pair[0];
     button.setAttribute("aria-pressed", current === pair[0] ? "true" : "false");
     button.disabled = busy !== null;
@@ -1756,10 +1774,7 @@ function distributionControl(source) {
     seg.appendChild(button);
   });
   block.appendChild(seg);
-  var hintKeys = workbuddy
-    ? { "round-robin": "dist.hintRoundRobin", expiry: "dist.hintExpiry", sticky: "dist.hintSticky" }
-    : { "round-robin": "dist.hintSourceRoundRobin", expiry: "dist.hintSourceExpiry" };
-  block.appendChild(el("p", "hint", t(hintKeys[current] || (workbuddy ? "dist.hintPriority" : "dist.hintSourcePriority"))));
+
   return block;
 }
 
@@ -1778,7 +1793,6 @@ function distributionControl(source) {
 function renderAutoCheckin() {
   $("autoTitle").textContent = t("auto.title");
   var auto = (state && state.autoCheckin) || { enabled: false, hours: [9] };
-  $("autoState").textContent = auto.enabled === true ? t("auto.on") : t("auto.off");
   var host = $("autoControl");
   // Built once; afterwards only the state moves.
   if (host.childElementCount === 0) {
@@ -1786,7 +1800,8 @@ function renderAutoCheckin() {
       var button = el("button", "", t(pair[1]));
       button.type = "button";
       button.setAttribute("data-auto", String(pair[0]));
-      button.addEventListener("click", function () {
+      button.addEventListener("click", async function () {
+        if (pair[0] && button.getAttribute("aria-pressed") !== "true" && !await confirmGrowth(t("auto.enableConfirm"))) return;
         setAutoCheckin(pair[0], parseCheckinHours($("autoHours").value));
       });
       host.appendChild(button);
@@ -1809,7 +1824,7 @@ function renderAutoCheckin() {
     input.value = autoHoursDraft !== null ? autoHoursDraft : (auto.hours || []).join(",");
   }
   var save = $("autoHoursSave");
-  save.textContent = t("auto.hoursSave");
+  iconLabel(save, t("auto.hoursSave"));
   save.disabled = busy !== null;
   // Not bound here: this button is a static node, so a listener added on every
   // render would outlive it and stack up - one click firing one request per
@@ -1853,12 +1868,11 @@ function renderAutoCheckin() {
 function renderComposerPoints() {
   var on = state !== null && state.showComposerPoints === true;
   $("composerTitle").textContent = t("composer.title");
-  $("composerState").textContent = on ? t("composer.on") : t("composer.off");
   var button = $("showComposerPoints");
   button.textContent = t(on ? "composer.hide" : "composer.show");
-  button.className = "small" + (on ? " on" : "");
+  button.className = "small ic-eye" + (on ? " on" : "");
+  button.setAttribute("aria-pressed", on ? "true" : "false");
   button.disabled = busy !== null;
-  $("composerPointsText").textContent = t("composer.label");
   $("composerPointsHint").textContent = t("composer.hint");
 }
 
@@ -1913,15 +1927,13 @@ function autoNoteRows(auto) {
   var pushTravel = function (counts) {
     if (!counts) return;
     var claimed = Number(counts.claimed) || 0;
-    var adopted = Number(counts.adopted) || 0;
     rows.push({
       text: t("auto.rowTravelCounts", {
         label: t("auto.rowTravel"),
         departed: Number(counts.departed) || 0,
         claimed: claimed,
-        adopted: adopted,
       }),
-      tone: claimed > 0 || adopted > 0 ? "ok" : "",
+      tone: claimed > 0 ? "ok" : "",
     });
   };
   if (last.workbuddy !== false
@@ -1931,14 +1943,17 @@ function autoNoteRows(auto) {
   pushTravel(last.travel);
   if (last.growth) {
     var growth = last.growth;
+    var detail = growth.detail || {};
     var streakTiers = Number(growth.streak) || 0;
+    var lottery = num(detail.lottery, 0);
+    var failed = num(detail.failed, 0) > 0 ? num(detail.failed, 0) : num(growth.failed, 0);
     rows.push({
       text: t("auto.rowGrowth", {
         streak: streakTiers,
-        credit: Number(growth.credit) || 0,
-        failed: Number(growth.failed) || 0,
+        lottery: lottery,
+        failed: failed,
       }),
-      tone: Number(growth.failed) > 0 ? "fail" : streakTiers > 0 ? "ok" : "",
+      tone: failed > 0 ? "fail" : streakTiers > 0 || lottery > 0 ? "ok" : "",
     });
   }
   push(t("auto.rowQoder"), last.qoder);
@@ -2007,7 +2022,7 @@ function paintAutoNote(host, auto) {
 }
 
 /** The tier status word, from the flat field the upstream reports it in. */
-var STATUS_KEY = { unlocked: "growth.tierUnlocked", claimed: "growth.tierClaimed", locked: "growth.tierLocked" };
+var STATUS_KEY = { claimed: "growth.tierClaimed", locked: "growth.tierLocked" };
 
 /**
  * The growth centre, on its own page beside the pool and the models.
@@ -2021,20 +2036,22 @@ function renderGrowth() {
   $("growthTitle").textContent = t("growth.title");
   var growth = (state && state.growth) || {};
   var running = growth.running === true;
-  $("growthState").textContent = running ? t("growth.running") : t("growth.ready");
+  $("growthState").textContent = running ? t("growth.running") : "";
   var read = $("growthRead");
-  read.textContent = growthReading ? t("growth.reading") : t("growth.read");
+  iconLabel(read, growthReading ? t("growth.reading") : t("growth.read"));
   read.title = t("growth.readHint");
   read.disabled = busy !== null || running || growthReading;
   var run = $("growthRun");
   run.textContent = busy === "growth" ? t("growth.running") : t("growth.run");
   run.title = t("growth.runHint");
-  run.disabled = busy !== null || running;
+  run.disabled = busy !== null || running || growthReading;
   if (running) pollGrowthRun();
   else stopGrowthPoll();
   $("growthText").textContent = growthStateText();
-  paintGrowthAccounts($("growthAccounts"));
-  $("growthHint").textContent = t("growth.hint");
+  var accounts = $("growthAccounts");
+  var keep = placeOf(accounts);
+  paintGrowthAccounts(accounts);
+  restorePlace(accounts, keep);
   paintGrowthNote($("growthNote"));
 }
 
@@ -2059,7 +2076,7 @@ function growthStateText() {
     accounts: num(growthState.accounts, 0),
     tiers: sum("tiers"),
     cards: sum("makeupCards"),
-    chances: sum("lottery"),
+    chances: rows.some(function (row) { return row.lotteryError !== undefined; }) ? "—" : sum("lottery"),
   })];
   if (num(growthState.failed, 0) > 0) {
     parts.push(t("growth.stateFailed", { failed: num(growthState.failed, 0) }));
@@ -2082,6 +2099,7 @@ function growthRow(row) {
 
   var head = el("button", "credits-head");
   head.type = "button";
+  head.id = "growth-row-" + row.id;
   head.setAttribute("aria-expanded", open ? "true" : "false");
   head.title = open ? t("credits.collapse") : t("credits.expand");
   // The realm is the group heading above the row, so the head opens with the
@@ -2089,11 +2107,23 @@ function growthRow(row) {
   // collect, or holding nothing left.
   head.appendChild(el("span", "growth-dot" + growthRowTone(row)));
   head.appendChild(el("span", "card-title", row.label));
-  head.appendChild(el("span", "count-chip", t("growth.rowHold", {
-    tiers: num(row.tiers, 0),
-    cards: num(row.makeupCards, 0),
-    chances: num(row.lottery, 0),
-  })));
+  var hasLottery = row.region === "cn";
+  var lottery = row.lotteryError === undefined ? num(row.lottery, 0) : "—";
+  var held = hasLottery
+    ? t("growth.rowHold", { tiers: num(row.tiers, 0), cards: num(row.makeupCards, 0), chances: lottery })
+    : t("growth.rowHoldNoLottery", { tiers: num(row.tiers, 0), cards: num(row.makeupCards, 0) });
+  if (row.lotteryError !== undefined) held += " · " + row.lotteryError;
+  var metrics = el("span", "growth-metrics");
+  metrics.title = held;
+  metrics.appendChild(el("span", "sr-only", held));
+  var heldMetrics = [["gift", num(row.tiers, 0)], ["calendar", num(row.makeupCards, 0)]];
+  if (hasLottery) heldMetrics.push(["dice", lottery]);
+  heldMetrics.forEach(function (item) {
+    var metric = el("span", "metric ic-" + item[0], String(item[1]));
+    metric.setAttribute("aria-hidden", "true");
+    metrics.appendChild(metric);
+  });
+  head.appendChild(metrics);
   head.appendChild(el("span", "caret", "›"));
   wrap.appendChild(head);
 
@@ -2103,9 +2133,8 @@ function growthRow(row) {
     body.appendChild(el("p", "hint warn", t("growth.rowFailed")));
   } else {
     if (num(row.days, 0) > 0 || row.nextTier) {
-      body.appendChild(el("p", "hint", t("growth.rowSummary", {
+      body.appendChild(el("span", "growth-status growth-streak ic-activity", t(row.nextTier ? "growth.rowSummary" : "growth.rowDays", {
         days: num(row.days, 0),
-        tier: row.nextTier || "-",
         remaining: num(row.nextTierRemaining, 0),
       })));
     }
@@ -2118,18 +2147,40 @@ function growthRow(row) {
       // A tier that can be redeemed now is the one line worth reading at a
       // glance, so it takes the log line's own dot and full-strength text.
       var ready = tier.status === "unlocked";
-      var line = el("p", "log-line" + (ready ? " ok" : ""));
-      line.appendChild(el("span", "growth-dot" + (ready ? " ok" : "")));
-      line.appendChild(el("span", "log-text", t("growth.rowTier", {
-        tier: tier.tier,
+      var line = el("div", "growth-tier" + (ready ? " ok" : ""));
+      var tierText = t("growth.rowTier", {
         days: num(tier.days, 0),
         credit: num(tier.credit, 0),
         energy: num(tier.energy, 0),
-        status: t(STATUS_KEY[tier.status] || "growth.tierLocked"),
-      })));
+      });
+      line.appendChild(el("strong", "", t("growth.tierDays", { days: num(tier.days, 0) })));
+      var rewards = el("span", "growth-metrics");
+      rewards.title = tierText;
+      rewards.appendChild(el("span", "sr-only", tierText));
+      [["coins", tier.credit], ["activity", tier.energy]].forEach(function (item) {
+        if (num(item[1], 0) === 0) return;
+        var metric = el("span", "metric ic-" + item[0], "+" + item[1]);
+        metric.setAttribute("aria-hidden", "true");
+        rewards.appendChild(metric);
+      });
+      line.appendChild(rewards);
+      if (!ready) {
+        var status = t(STATUS_KEY[tier.status] || "growth.tierLocked");
+        var mark = el("span", "tier-state metric ic-" + (tier.status === "claimed" ? "check" : "lock"));
+        mark.title = status;
+        mark.appendChild(el("span", "sr-only", status));
+        line.appendChild(mark);
+      }
+      if (ready) {
+        var claim = growthButton(row, t("growth.claim"), "streak", tier.tier);
+        claim.className += " tier-claim";
+        claim.setAttribute("aria-label", t("growth.claim") + " · " + tierText + " · " + row.label);
+        line.appendChild(claim);
+      }
       body.appendChild(line);
     });
   }
+  paintGrowthExtras(body, row);
   wrap.appendChild(body);
 
   head.addEventListener("click", function () {
@@ -2139,6 +2190,10 @@ function growthRow(row) {
     head.setAttribute("aria-expanded", shown ? "true" : "false");
     head.title = shown ? t("credits.collapse") : t("credits.expand");
     body.hidden = !shown;
+    if (shown) {
+      if (!row.details) loadGrowthDetails(row);
+      render();
+    }
   });
   return wrap;
 }
@@ -2191,7 +2246,7 @@ function paintGrowthAccounts(host) {
 function growthLastRun() {
   var growth = (state && state.growth) || {};
   var auto = (state && state.autoCheckin) || {};
-  var scheduled = auto.last && auto.last.growth ? { at: auto.last.at, ...auto.last.growth } : null;
+  var scheduled = auto.last && auto.last.growth ? { at: auto.last.at, ...auto.last.growth, travel: auto.last.travel } : null;
   if (!growth.last) return scheduled;
   if (!scheduled) return growth.last;
   // The scheduled pass and a manual run both leave a record. Taking
@@ -2212,27 +2267,31 @@ function paintGrowthNote(host) {
   if (run === null) return;
   var detail = run.detail || {};
   var when = formatStamp(run.at);
-  var anything = num(detail.makeup, 0) + num(detail.gift, 0) + num(detail.compensation, 0)
-    + num(detail.activity, 0) + num(detail.streak, 0) + num(detail.lottery, 0) > 0;
-  var rows = [{
-    text: anything
-      ? t("growth.runLine", {
+  var credit = num(run.credit, 0);
+  var rows = [];
+  if (credit > 0 || num(detail.makeup, 0) + num(detail.streak, 0) + num(detail.lottery, 0) > 0) {
+    rows.push({
+      text: t("growth.runLine", {
         when: when,
+        credit: credit,
         makeup: num(detail.makeup, 0),
-        gift: num(detail.gift, 0),
-        compensation: num(detail.compensation, 0),
-        activity: num(detail.activity, 0),
         streak: num(detail.streak, 0),
         lottery: num(detail.lottery, 0),
-        credit: num(run.credit, 0),
-      })
-      : t("growth.runNone"),
-    tone: anything ? "ok" : "",
-  }];
-  var failed = num(detail.failed, 0) > 0 ? num(detail.failed, 0) : num(run.failed, 0);
+      }),
+      tone: "ok",
+    });
+  }
+  var travel = run.travel || {};
+  var departed = num(travel.departed, 0);
+  var claimed = num(travel.claimed, 0);
+  if (departed > 0 || claimed > 0) {
+    rows.push({ text: t("auto.rowTravelCounts", { label: t("auto.rowTravel"), departed: departed, claimed: claimed }), tone: "ok" });
+  }
+  var failed = (num(detail.failed, 0) || num(run.failed, 0)) + num(travel.failed, 0);
   if (failed > 0) {
     rows.push({ text: t("growth.runFailed", { when: when, failed: failed }), tone: "fail" });
   }
+  if (rows.length === 0) rows.push({ text: t("growth.runNone"), tone: "" });
   rows.forEach(function (row) {
     var line = el("div", "log-line" + (row.tone ? " " + row.tone : ""));
     line.appendChild(el("span", "log-dot"));
@@ -2243,19 +2302,213 @@ function paintGrowthNote(host) {
 }
 
 /** Ask the host what the growth centre holds, claiming nothing. */
+function growthButton(row, label, action, value, confirmText) {
+  var icon = { streak: "check", travelClaim: "gift", lottery: "dice" }[action];
+  var button = el("button", (["streak", "travelClaim"].includes(action) ? "small primary" : "small") + (icon ? " ic-" + icon : ""), label);
+  button.type = "button";
+  button.disabled = busy !== null || growthReading || !!(state && state.growth && state.growth.running);
+  button.setAttribute("aria-label", label + " · " + row.label);
+  button.addEventListener("click", function () { runGrowthAction(row, action, value, confirmText); });
+  return button;
+}
+
+async function runGrowthAction(row, action, value, confirmText) {
+  if (busy !== null || growthReading) return;
+  if (confirmText && !await confirmGrowth(confirmText)) return;
+  var rowHead = document.getElementById("growth-row-" + row.id);
+  var growthReturnY = rowHead ? rowHead.getBoundingClientRect().top : 0;
+  growthScrollVersion += 1;
+  var growthReturn = { id: row.id, y: growthReturnY, version: growthScrollVersion };
+  growthScrollReturn = growthReturn;
+  var message;
+  await runBusy("growth-action", async function () {
+    try {
+      var answer = await invoke("xd.growthAction", { id: row.id, action: action, value: value });
+      var receipt = answer.result;
+      var credit = Number(receipt.credit_granted ?? receipt.reward_credit ?? receipt.credit ?? 0);
+      message = receipt.prize_name || t("growth.actionDone", { credit: credit });
+      if (action === "travelDepart") message = t("growth.travelSent");
+      if (action === "makeup") message = t("growth.makeupDone");
+      if (receipt.prize_type === "physical") message += " · " + t("growth.physicalPrize");
+    } finally {
+      growthState = null;
+      await readGrowth();
+    }
+  }).then(function () {
+    note(message, "success");
+    announce(message);
+    restoreGrowthScroll(growthReturn);
+  }).catch(function (error) {
+    note(String(error.message || error));
+    if (growthScrollReturn && growthScrollReturn.id === row.id) {
+      restoreGrowthScroll(growthScrollReturn);
+      growthScrollReturn = null;
+    }
+  });
+}
+
+function confirmGrowth(message) {
+  return new Promise(function (resolve) {
+    var dialog = el("dialog", "growth-confirm");
+    dialog.setAttribute("aria-label", t("growth.confirmTitle"));
+    dialog.appendChild(el("h2", "", t("growth.confirmTitle")));
+    dialog.appendChild(el("p", "", message));
+    var form = el("form", "growth-actions");
+    form.method = "dialog";
+    var cancel = el("button", "ghost", t("growth.cancel"));
+    cancel.value = "cancel";
+    cancel.autofocus = true;
+    var accept = el("button", "", t("growth.confirm"));
+    accept.value = "accept";
+    form.append(cancel, accept);
+    dialog.appendChild(form);
+    dialog.addEventListener("close", function () {
+      var accepted = dialog.returnValue === "accept";
+      dialog.remove();
+      resolve(accepted);
+    }, { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+  });
+}
+
+function loadGrowthDetails(row) {
+  if (row.detailsLoading) return;
+  row.detailsLoading = true;
+  var returnVersion = growthScrollReturn && growthScrollReturn.id === row.id
+    ? growthScrollReturn.version : null;
+  invoke("xd.growthDetails", { id: row.id }).then(function (answer) {
+    row.details = answer.details;
+  }).catch(function (error) {
+    row.details = { errors: { details: String(error.message || error) } };
+  }).finally(function () {
+    row.detailsLoading = false;
+    if (growthState && growthState.rows.includes(row)) render();
+    if (returnVersion !== null && growthScrollReturn
+      && growthScrollReturn.id === row.id && growthScrollReturn.version === returnVersion) {
+      restoreGrowthScroll(growthScrollReturn);
+      growthScrollReturn = null;
+    }
+  });
+}
+
+function paintGrowthExtras(body, row) {
+  if (!openGrowth["growth:" + row.id]) return;
+  if (!row.details) {
+    body.appendChild(el("p", "hint", t("growth.reading")));
+    loadGrowthDetails(row);
+    return;
+  }
+  var details = row.details;
+  var errors = details.errors || {};
+  var heading = el("div", "growth-section-head");
+  heading.appendChild(el("h3", "", t("growth.calendar")));
+  var refresh = el("button", "small ghost ic-refresh");
+  iconLabel(refresh, t("growth.read"));
+  refresh.type = "button";
+  refresh.disabled = row.detailsLoading;
+  refresh.addEventListener("click", function () { loadGrowthDetails(row); });
+  heading.appendChild(refresh);
+  body.appendChild(heading);
+  if (details.heatmap) paintGrowthCalendar(body, row, details.heatmap);
+
+  var travel = details.travel || {};
+  var trip = travel.status;
+  if (trip && details.buddy) {
+    var section = el("div", "growth-section");
+    var travelHead = el("div", "growth-section-head");
+    travelHead.appendChild(el("h3", "", t("auto.rowTravel")));
+    if (trip.state === "traveling") {
+      travelHead.appendChild(el("span", "growth-status traveling ic-route", t("growth.traveling", {
+        place: trip.location && trip.location.name || "",
+        time: trip.arrive_at ? formatStamp(new Date(Number(trip.arrive_at) * 1000).toISOString()) : "—",
+      })));
+    } else if (trip.state === "arrived") {
+      travelHead.appendChild(el("span", "growth-status arrived ic-check", t("growth.travelArrived")));
+    } else if (trip.state === "idle") {
+      if (trip.daily_limit_reached) {
+        travelHead.appendChild(el("span", "growth-status limit ic-calendar", t("growth.travelLimit")));
+      } else {
+        travelHead.appendChild(el("span", "growth-status ready ic-route", t("growth.travelReady")));
+      }
+    }
+    section.appendChild(travelHead);
+    if (trip.state === "arrived") {
+      var claim = el("div", "growth-actions growth-travel-actions");
+      claim.appendChild(growthButton(row, t("growth.travelClaim"), "travelClaim"));
+      section.appendChild(claim);
+    } else if (trip.state === "idle" && !trip.daily_limit_reached
+      && Array.isArray(travel.locations) && travel.locations.length) {
+      var controls = el("div", "growth-travel-controls");
+      var label = el("label", "growth-destination ic-pin");
+      var select = el("select", "");
+      select.id = "growth-destination-" + row.id;
+      label.htmlFor = select.id;
+      label.appendChild(el("span", "sr-only", t("growth.destination")));
+      var destination = growthDestinations.get(row.id);
+      travel.locations.forEach(function (location) {
+        var option = el("option", "", location.name);
+        option.value = location.id;
+        if (option.value === destination) option.selected = true;
+        select.appendChild(option);
+      });
+      select.addEventListener("change", function () { growthDestinations.set(row.id, select.value); });
+      var depart = el("button", "ic-send growth-depart", t("growth.depart"));
+      depart.type = "button";
+      depart.disabled = busy !== null || growthReading || !!(state && state.growth && state.growth.running);
+      depart.addEventListener("click", function () {
+        runGrowthAction(row, "travelDepart", Number(select.value),
+          t("growth.departConfirm", { place: select.selectedOptions[0].textContent }));
+      });
+      label.appendChild(select);
+      controls.append(label, depart);
+      section.appendChild(controls);
+    }
+    body.appendChild(section);
+  }
+  if (details.lottery && details.lottery.module && details.lottery.module.enabled && Number(details.lottery.chances) > 0) {
+    var actions = el("div", "growth-actions");
+    actions.appendChild(growthButton(row, t("growth.draw", { count: details.lottery.chances }), "lottery", undefined, t("growth.drawConfirm")));
+    body.appendChild(actions);
+  }
+  if (Object.keys(errors).length > 0) body.appendChild(el("p", "hint warn", t("growth.detailsFailed")));
+}
+
+function paintGrowthCalendar(host, row, heatmap) {
+  var today = heatmap.today && heatmap.today.date || new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Shanghai" });
+  var month = today.slice(0, 7);
+  var cells = new Map((heatmap.cells || []).map(function (cell) { return [cell.date.slice(0, 10), cell]; }));
+  var days = new Date(Number(month.slice(0, 4)), Number(month.slice(5)), 0).getDate();
+  var grid = el("div", "growth-calendar");
+  for (var index = 1; index <= days; index++) {
+    var date = month + "-" + String(index).padStart(2, "0");
+    var cell = cells.get(date);
+    var active = !!cell && Number(cell.score) > 0;
+    var canMakeup = !active && date < today && row.makeupCards > 0;
+    var day = canMakeup ? growthButton(row, "", "makeup", date, t("growth.makeupConfirm", { date: date })) : el("span", "");
+    day.className = "growth-day" + (active ? " logged-in" : "");
+    var status = t(active ? "growth.loggedIn" : date > today ? "growth.futureDay" : "growth.notLoggedIn");
+    day.title = date + " · " + status + (canMakeup ? " · " + t("growth.makeup") : "");
+    if (canMakeup) day.setAttribute("aria-label", day.title);
+    else day.appendChild(el("span", "sr-only", day.title));
+    grid.appendChild(day);
+  }
+  host.appendChild(grid);
+}
+
+
 function readGrowth() {
   // `growthReading` alone, not the panel-wide `busy`: a finished run re-reads
   // its own rows from inside `runBusy`, while `busy` still says "growth".
   if (growthReading) return Promise.resolve();
   growthReading = true;
-  var epoch = growthDropped;
   render();
   return invoke("xd.growthState").then(function (answer) {
     growthReading = false;
-    // Dropped while this read ran: what came back describes the pool as it was,
-    // and adopting it would put the dropped rows back with a stamp that says they
-    // are fresh.
-    growthState = epoch === growthDropped && answer && answer.growth ? answer.growth : null;
+    if (answer.readEpoch >= growthReadEpoch) {
+      growthReadEpoch = answer.readEpoch;
+      growthState = answer.growth;
+    }
     render();
   }).catch(function (error) {
     growthReading = false;
@@ -2266,7 +2519,7 @@ function readGrowth() {
 
 /** Run the growth centre on its own. */
 function runGrowth() {
-  if (busy !== null) return Promise.resolve();
+  if (busy !== null || growthReading) return Promise.resolve();
   growthPollFailures = 0;
   return runBusy("growth", function () {
     return invoke("xd.growthRun").then(function (payload) {
@@ -2349,7 +2602,6 @@ function paintAccounts(host) {
   picker.addEventListener("change", function () { setPreferredAccount(picker.value); });
   choice.appendChild(label);
   choice.appendChild(picker);
-  choice.appendChild(el("p", "hint", t("acct.choiceHint")));
   choice.appendChild(distributionControl("workbuddy"));
   host.appendChild(choice);
   if (accounts.length === 0) {
@@ -2389,11 +2641,10 @@ function renderRemoved(host) {
   head.appendChild(el("span", "card-title", t("removed.title")));
   head.appendChild(el("span", "count-chip", String(removed.length)));
   card.appendChild(head);
-  card.appendChild(el("p", "hint", t("removed.hint")));
   removed.forEach(function (entry) {
     var row = el("div", "removed-row");
     row.appendChild(el("span", "removed-label", entry.label));
-    var restore = el("button", "pane-action", t("removed.restore"));
+    var restore = el("button", "pane-action ic-rewind", t("removed.restore"));
     restore.type = "button";
     restore.disabled = busy !== null;
     restore.addEventListener("click", function () { setAccountState(entry.id, "restored"); });
@@ -2422,7 +2673,7 @@ function accountCard(account) {
   if (account.active) {
     head.appendChild(el("span", "badge next", t("badge.next")));
   }
-  if (account.preferred) head.appendChild(el("span", "badge next", t("badge.preferred")));
+  if (account.preferred && !account.active) head.appendChild(el("span", "badge next", t("badge.preferred")));
   // An archived account keeps serving, so its badge reports the same health as
   // any other; the note below the head says where its sign-in now comes from.
   head.appendChild(el("span", "badge " + (off ? "off" : refused ? "dead" : restricted || account.cooling ? "cool" : "ok"),
@@ -2455,11 +2706,11 @@ function accountCard(account) {
   toggle.title = off ? t("acct.switchOn") : t("acct.switchOff");
   toggle.disabled = rowBusy;
   toggle.appendChild(el("span", "acct-toggle-dot"));
-  toggle.appendChild(el("span", null, off ? t("acct.off") : t("acct.on")));
   toggle.addEventListener("click", function () { setAccountState(account.id, off ? "enabled" : "disabled"); });
   controls.appendChild(toggle);
 
-  var removeBtn = el("button", "acct-remove", t("acct.remove"));
+  var removeBtn = el("button", "acct-remove ic-minus");
+  iconLabel(removeBtn, t("acct.remove"));
   removeBtn.id = rowKey + "-remove";
   removeBtn.type = "button";
   removeBtn.setAttribute("aria-label", t("acct.remove") + ": " + account.label);
@@ -2481,7 +2732,8 @@ function accountCard(account) {
     // the row every 1.2-2 s, and a flag written onto the node was gone before the
     // second press arrived, so every press re-armed instead of deleting.
     var armed = pendingDelete === account.id;
-    var deleteBtn = el("button", armed ? "acct-delete confirming" : "acct-delete", t(armed ? "acct.deleteConfirmAgain" : "acct.delete"));
+    var deleteBtn = el("button", armed ? "acct-delete confirming ic-trash" : "acct-delete ic-trash", t("acct.deleteConfirmAgain"));
+    if (!armed) iconLabel(deleteBtn, t("acct.delete"));
     deleteBtn.id = rowKey + "-delete";
     deleteBtn.type = "button";
     deleteBtn.setAttribute("aria-label", t(armed ? "acct.deleteConfirmAgain" : "acct.delete") + ": " + account.label);
@@ -2529,9 +2781,9 @@ function accountCard(account) {
   head.appendChild(controls);
   card.appendChild(head);
 
-  if (archived) card.appendChild(el("div", "hint muted", t("acct.archivedHint")));
-  if (refused) card.appendChild(el("div", "hint finding-fail", t("acct.signInRefused")));
-  if (restricted) card.appendChild(el("div", "hint finding-fail", t("acct.restrictedHint")));
+  if (archived) head.appendChild(helpNote(t("risk.title"), t("acct.archivedHint")));
+  if (refused) card.appendChild(el("div", "acct-alert hint finding-fail", t("acct.signInRefused")));
+  if (restricted) card.appendChild(el("div", "acct-alert hint finding-fail", t("acct.restrictedHint")));
 
   var meta = el("div", "model-meta");
   // Not beside a badge that already says the token is expired.
@@ -2544,11 +2796,12 @@ function accountCard(account) {
   if (num(account.rateLimitHits, 0) > 0 && !refused && !restricted) {
     meta.appendChild(el("span", null, t("acct.hits", { hits: account.rateLimitHits })));
   }
+  if (!account.cooling) {
+    (account.modelCooldowns || []).forEach(function (mc) {
+      meta.appendChild(el("span", "finding-fail", t("acct.modelCool", { model: mc.modelId, time: formatStamp(mc.until) })));
+    });
+  }
   card.appendChild(meta);
-
-  (account.modelCooldowns || []).forEach(function (mc) {
-    card.appendChild(el("div", "hint", t("acct.modelCool", { model: mc.modelId, time: formatStamp(mc.until) })));
-  });
 
   // A cold cache on the fast path: the main process has not read this
   // account's billing data yet, so say so instead of showing nothing.
@@ -2605,8 +2858,23 @@ function creditsBlock(credits, key, options) {
   if (typeof credits.total === "number") {
     head.appendChild(el("span", "credit-total", formatCredits(credits.total)));
   }
+  var nearestExpiry = typeof credits.nearestExpiryMs === "number" && credits.nearestExpiryMs > Date.now()
+    ? credits.nearestExpiryMs
+    : null;
+  for (var packageIndex = 0; packageIndex < packages.length; packageIndex += 1) {
+    var pack = packages[packageIndex];
+    var packExpiry = [pack.roundExpiresAtMs, pack.expiresAtMs].find(function (value) {
+      return typeof value === "number" && value > Date.now();
+    });
+    if (packExpiry && (nearestExpiry === null || packExpiry < nearestExpiry)) nearestExpiry = packExpiry;
+  }
+  if (nearestExpiry !== null) {
+    var expirySoon = nearestExpiry - Date.now() < PACK_SOON_MS;
+    head.appendChild(el("span", "credit-expiry ic-calendar" + (expirySoon ? " soon" : ""),
+      t("credits.expiresAt", { date: formatDayStamp(nearestExpiry) })));
+  }
   if (packages.length > 0) {
-    head.appendChild(el("span", "count-chip", String(packages.length)));
+    head.appendChild(el("span", "count-chip ic-coins", String(packages.length)));
   }
   if (settings.floor) {
     var reserve = num(settings.floor.creditReserve, 0);
@@ -2664,7 +2932,8 @@ function reserveRow(account) {
   input.setAttribute("aria-label", t("credits.keepAtLeast"));
   input.disabled = busy !== null;
   var unit = el("span", "reserve-unit", t("credits.keepUnit"));
-  var button = el("button", "reserve-save", t("credits.keepSave"));
+  var button = el("button", "reserve-save ic-check");
+  iconLabel(button, t("credits.keepSave"));
   button.type = "button";
   button.id = "reserve-save-" + account.id;
 
@@ -2687,7 +2956,7 @@ function reserveRow(account) {
   wrap.appendChild(input);
   wrap.appendChild(unit);
   wrap.appendChild(button);
-  wrap.appendChild(el("p", "hint", t("credits.keepHint")));
+  wrap.appendChild(helpNote(t("credits.keepAtLeast"), t("credits.keepHint")));
   return wrap;
 }
 
@@ -2773,7 +3042,7 @@ function checkinBlock(account) {
   wrap.appendChild(el("span", "card-title", t("checkin.title")));
 
   if (checkin.streakDays > 0) wrap.appendChild(el("span", "muted", t("checkin.streak", { days: checkin.streakDays })));
-  if (checkin.dailyCredit > 0) wrap.appendChild(el("span", "muted", t("checkin.daily", { credit: checkin.dailyCredit })));
+  if (!checkin.todayCheckedIn && checkin.dailyCredit > 0) wrap.appendChild(el("span", "muted", t("checkin.daily", { credit: checkin.dailyCredit })));
   // The milestone line names the day the bonus lands on, which is what upstream
   // reports as `nextStreakDay`; the bonus is granted when that day arrives.
   if (checkin.isStreakDay && checkin.streakBonusCredit > 0) {
@@ -2784,7 +3053,8 @@ function checkinBlock(account) {
   var busyHere = checkinBusy === account.id;
   // Upstream ships the button's own label when the campaign renames it.
   var idleLabel = checkin.todayCheckedIn ? t("btn.checkinDone") : t("btn.checkin");
-  var button = el("button", "primary small" + (busyHere ? " is-busy" : ""), busyHere ? t("checkin.claiming") : idleLabel);
+  var button = el("button", "small " + (checkin.todayCheckedIn ? "ic-check" : "primary ic-calendar") + (busyHere ? " is-busy" : ""), busyHere ? t("checkin.claiming") : idleLabel);
+  if (checkin.todayCheckedIn) iconLabel(button, idleLabel);
   button.type = "button";
   button.setAttribute("aria-label", (busyHere ? t("checkin.claiming") : idleLabel) + ": " + account.label);
   // A whole-pool claim is in flight: this account is covered by it, so the
@@ -2931,6 +3201,16 @@ function pageScrollTo(top) {
   if (root) root.scrollTop = top;
 }
 
+function restoreGrowthScroll(anchor) {
+  if (!anchor) return;
+  function restore() {
+    var head = document.getElementById("growth-row-" + anchor.id);
+    if (head) pageScrollTo(pageScroll() + head.getBoundingClientRect().top - anchor.y);
+  }
+  restore();
+  requestAnimationFrame(restore);
+}
+
 /**
  * The roster view: one checkbox per model, the host's own layout.
  *
@@ -2975,7 +3255,7 @@ function renderModels() {
 
   $("modelListTitle").textContent = page.label;
   show($("modelFetchBtn"), page.source === "workbuddy");
-  $("modelFetchBtn").textContent = busy === "fetch" ? t("models.modelsLoading") : t("models.fetchModelList");
+  iconLabel($("modelFetchBtn"), busy === "fetch" ? t("models.modelsLoading") : t("models.fetchModelList"));
   $("modelFetchBtn").disabled = busy !== null;
   $("modelSearch").placeholder = t("models.searchModel");
   // A placeholder is not an accessible name: it disappears as soon as the box
@@ -3058,7 +3338,7 @@ function paintPageHint(page, published) {
 
 /** The ids the desktop will really list: the ticked ones, in roster order, capped. */
 function publishedModels(list, cap) {
-  var out = {};
+  var out = Object.create(null);
   var count = 0;
   for (var i = 0; i < list.length && (cap <= 0 || count < cap); i += 1) {
     var entry = draft[list[i].id];
@@ -3381,7 +3661,7 @@ function withinCeiling(saved, ceiling) {
 function draftFor(list, selection) {
   var enabled = selection.enabledModelIds;
   var overrides = selection.overrides || {};
-  var out = {};
+  var out = Object.create(null);
   list.forEach(function (model) {
     var saved = overrides[model.id] || {};
     out[model.id] = {
@@ -3593,7 +3873,7 @@ function presetRow(presets, value, onPick, ceiling, defaultWindow) {
   return wrap;
 }
 
-/** A labelled field with an optional "?" hint, mirroring the host's layout. */
+/** A labelled field with optional help available by pointer or keyboard. */
 function field(labelKey, helpKey, control) {
   var wrap = el("div", "field");
   var head = el("div", "field-head");
@@ -3602,10 +3882,7 @@ function field(labelKey, helpKey, control) {
   // name has to be carried by the control itself.
   control.setAttribute("aria-label", t(labelKey));
   if (helpKey) {
-    var hint = el("span", "field-help", "?");
-    hint.title = t(helpKey);
-    hint.setAttribute("aria-label", t(helpKey));
-    head.appendChild(hint);
+    head.appendChild(helpNote(t(labelKey), t(helpKey)));
   }
   wrap.appendChild(head);
   wrap.appendChild(control);
@@ -3733,6 +4010,7 @@ function modelSheetBody(model, entry) {
     defaultWrap.appendChild(el("span", "field-label", t("models.defaultLevel")));
     var defaultSelect = document.createElement("select");
     defaultSelect.className = "select";
+    defaultSelect.setAttribute("aria-label", t("models.defaultLevel"));
     THINKING_LEVELS.forEach(function (level) {
       if (levels.indexOf(level) < 0) return;
       var option = document.createElement("option");
@@ -3944,8 +4222,10 @@ function renderHostHint() {
 
 function renderDoctor() {
   $("checkTitle").textContent = t("check.title");
+  $("reportDetails").textContent = t("check.details");
+  $("reportDetails").parentElement.hidden = doctorResult === null;
   $("doctorBtn").textContent = t("btn.doctor");
-  $("copyBtn").textContent = t("btn.copy");
+  iconLabel($("copyBtn"), t("btn.copy"));
   $("doctorBtn").disabled = busy !== null;
   $("copyBtn").disabled = doctorResult === null;
 
@@ -3958,7 +4238,10 @@ function renderDoctor() {
   }
   (doctorResult.findings || []).forEach(function (finding) {
     var row = el("div", "finding");
-  row.appendChild(el("span", finding.ok ? "finding-pass" : "finding-fail", t(finding.ok ? "check.pass" : "check.fail")));
+    var mark = el("span", finding.ok ? "finding-pass ic-check" : "finding-fail ic-x");
+    mark.title = t(finding.ok ? "check.pass" : "check.fail");
+    mark.appendChild(el("span", "sr-only", mark.title));
+    row.appendChild(mark);
     row.appendChild(el("span", "finding-id", finding.id));
     row.appendChild(el("span", "finding-detail", finding.detail));
     host.appendChild(row);
@@ -3975,21 +4258,32 @@ function footerEndpoint() {
   if (activeSource === "workbuddy") {
     var shim = state.shims ? state.shims[activeRegion] : null;
     return shim && shim.running
-      ? { on: true, text: t("foot.shim", { url: shim.baseUrl }) }
+      ? { on: true, url: shim.baseUrl }
       : { on: false, text: t("foot.shimOff") };
   }
   var row = sourceGatewayRow(activeSource, activeRegionOf(activeSource));
   return row
-    ? { on: true, text: t("foot.shim", { url: "http://127.0.0.1:" + row.port + "/v1" }) }
+    ? { on: true, url: "http://127.0.0.1:" + row.port + "/v1" }
     : { on: false, text: t("foot.shimOff") };
 }
 
 function renderFooter() {
   var foot = $("foot");
+  var endpointOpen = foot.querySelector(".foot-check")?.open === true;
   clear(foot);
   if (state === null) return;
   var endpoint = footerEndpoint();
-  foot.appendChild(el("span", endpoint.on ? null : "muted", endpoint.text));
+  var endpointDetails = el("details", "foot-check");
+  endpointDetails.open = endpointOpen;
+  var endpointTrigger = el("summary", "ic-info");
+  iconLabel(endpointTrigger, t("check.title"));
+  var endpointChip = el("span", "endpoint-chip" + (endpoint.on ? "" : " off"));
+  endpointChip.append(
+    el("span", "", t("foot.shim")),
+    el("code", "", endpoint.on ? endpoint.url : endpoint.text),
+  );
+  endpointDetails.append(endpointTrigger, endpointChip);
+  foot.appendChild(endpointDetails);
   // Either the gateway could not sign in, or it is still serving a roster from
   // an earlier read. Both are worth saying out loud; the message leads with the
   // reason so it does not have to guess which of the two it is. Only the pool's
@@ -4059,31 +4353,11 @@ function adopt(next) {
   if (next && typeof next === "object") {
     state = next;
     stateRevision += 1;
-    // The host keeps the growth centre's last read, so a panel reload paints the
-    // figures instead of claiming nothing was read. A result the panel already
-    // holds is newer than the one the document carries, so it is not replaced.
-    //
-    // The host is also the one that decides a read no longer describes the pool:
-    // parking a region, switching the source off, or dropping an account all
-    // invalidate it there. Without the `else` that drop never reached the panel,
-    // which kept painting rows for accounts the user had just switched off.
-    //
-    // `read: null` is that drop. The key is always published, so its absence means
-    // this document says nothing about the growth centre and the rows on screen
-    // stay - a pass in flight publishes no read on purpose, and clearing on
-    // absence took away the figures the user was watching.
-    if (next.growth && Object.prototype.hasOwnProperty.call(next.growth, "read")) {
-      if (next.growth.read) {
-        if (growthState === null) growthState = next.growth.read;
-      } else {
-        // Taken even while a read is in flight. The read that is running was
-        // computed against the pool as it was, so its answer describes rows the
-        // host has just dropped - and the answer carries a fresh timestamp, which
-        // would then read as current for the whole throttle window and never be
-        // refreshed. `growthDropped` is what tells that read to discard itself.
-        growthState = null;
-        growthDropped += 1;
-      }
+    var growth = next.growth;
+    if (growth && growth.readEpoch >= growthReadEpoch) {
+      // A same-epoch poll may have started before the explicit read finished.
+      if (growth.readEpoch > growthReadEpoch || growthState === null) growthState = growth.read;
+      growthReadEpoch = growth.readEpoch;
     }
   }
 }
@@ -4570,12 +4844,18 @@ var modelRosterRequested = false;
 function requestModelRoster() {
   if (modelRosterRequested || bridge === null) return;
   modelRosterRequested = true;
+  var revision = stateRevision;
   invoke("xd.fetchModels").then(function (next) {
+    if (revision !== stateRevision) {
+      modelRosterRequested = false;
+      return;
+    }
     adoptAndMaybePoll(next, 0);
   }).catch(function (error) {
     // A failed read must not latch the panel onto the static fallback for the
     // rest of its life: release the guard so the next visit tries again.
     modelRosterRequested = false;
+    if (revision !== stateRevision) return;
     note(String(error && error.message ? error.message : error), "warn");
   });
 }
@@ -4598,7 +4878,7 @@ function saveModels() {
   var page = modelPage();
   var submittedSlot = draftSlot;
   var enabledModelIds = [];
-  var overrides = {};
+  var overrides = Object.create(null);
   page.list.forEach(function (model) {
     var entry = draft[model.id];
     if (!entry) return;
@@ -4679,6 +4959,7 @@ function copyReport() {
     var box = $("report");
     if (!box || typeof window.getSelection !== "function" || typeof document.createRange !== "function") return false;
     try {
+      box.parentElement.open = true;
       var range = document.createRange();
       range.selectNodeContents(box);
       var selection = window.getSelection();
@@ -4761,17 +5042,24 @@ function labelTabs() {
   for (var i = 0; i < tabs.length; i += 1) {
     var key = tabs[i].getAttribute("data-tab");
     tabs[i].textContent = t("tab." + key);
+    tabs[i].title = t("tab." + key);
     // The growth centre is WorkBuddy's alone: a tab that leads to a page
     // reading "not this source" is worse than no tab at all.
     tabs[i].hidden = key === "growth" && activeSource !== "workbuddy";
   }
   // The risk note is static markup too, on the line with the source tabs.
   $("riskNote").textContent = t("risk.note");
+  document.querySelectorAll("[data-help-label]").forEach(function (node) {
+    iconLabel(node, t(node.getAttribute("data-help-label")));
+  });
   // The footer links are static markup, so their labels follow the locale here
   // rather than through the render pass.
+  document.querySelectorAll(".activity-log > summary span").forEach(function (node) { node.textContent = t("activity.title"); });
   var labels = document.querySelectorAll(".foot-links [data-foot-label]");
   for (var j = 0; j < labels.length; j += 1) {
     labels[j].textContent = t("foot." + labels[j].getAttribute("data-foot-label"));
+    labels[j].className = "sr-only";
+    labels[j].parentElement.title = labels[j].textContent;
   }
 }
 
@@ -4830,7 +5118,9 @@ function bind() {
   });
   // The manual pass runs the same work the scheduled hour runs, so it is busy for
   // as long as that takes — the button reports it rather than sitting idle.
-  $("autoRunNow").addEventListener("click", function () {
+  $("autoRunNow").addEventListener("click", async function () {
+    if (sourceOn("workbuddy") && SOURCE_REGIONS.workbuddy.some(function (region) { return !regionParked("workbuddy", region); })
+      && !await confirmGrowth(t("auto.runConfirm"))) return;
     runBusy("checkin", function () { return invoke("xd.runCheckinNow"); })
       .then(function () { pollCheckinLog(0); })
       .catch(function () {});
@@ -4843,7 +5133,7 @@ function bind() {
   // Bound once, like the check-in button above: the render pass rebuilds most of
   // the panel, and a listener added per pass would fire one request per render.
   $("growthRead").addEventListener("click", function () { readGrowth(); });
-  $("growthRun").addEventListener("click", function () { runGrowth(); });
+  $("growthRun").addEventListener("click", async function () { if (await confirmGrowth(t("growth.runConfirm"))) runGrowth(); });
 
   // One listener for every control in the panel, rather than one per button: the
   // render pass rebuilds most of them, so per-button listeners would have to be

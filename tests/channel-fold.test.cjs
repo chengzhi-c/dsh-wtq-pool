@@ -28,39 +28,34 @@ function bodyOf(init) {
   return JSON.parse(String(init?.body ?? '{}'))
 }
 
-test('a system prompt refused in a 200 envelope is folded and retried', async () => {
-  const calls = []
-  let refused = false
-  const client = new WorkBuddyUpstreamClient({
-    fetchImpl: async (_url, init) => {
-      calls.push(bodyOf(init))
-      if (!refused) {
-        refused = true
-        return new Response(REFUSAL, { status: 200, headers: { 'content-type': 'application/json' } })
-      }
-      return new Response(SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } })
-    },
+for (const status of [200, 400]) {
+  test('HTTP ' + status + ' prompt refusal folds once, preserves instructions and reuses the accepted form', async () => {
+    const calls = []
+    const client = new WorkBuddyUpstreamClient({
+      fetchImpl: async (_url, init) => {
+        calls.push(bodyOf(init))
+        return calls.length === 1
+          ? new Response(REFUSAL, { status, headers: { 'content-type': 'application/json' } })
+          : new Response(SSE, { headers: { 'content-type': 'text/event-stream' } })
+      },
+    })
+    const system = 'You are an AI agent powered by DeepSeek Harness. HTTP ' + status
+    const prepared = JSON.stringify({
+      model: 'kimi-k3-1', stream: true,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: 'hi' }],
+    })
+    assert.equal((await client.chatStream(CN, prepared)).ok, true)
+    assert.equal(calls.length, 2)
+    const sent = calls[1].messages
+    assert.equal(sent[0].role, 'system')
+    assert.ok(sent[0].content.trim(), 'Kimi requires a nonempty system placeholder')
+    assert.equal(sent[1].role, 'user')
+    assert.equal(sent[1].content, system + '\n\nhi')
+    assert.equal((await client.chatStream(CN, prepared)).ok, true)
+    assert.equal(calls.length, 3, 'the accepted prompt does not pay another refused call')
+    assert.deepEqual(calls[2].messages, sent)
   })
-  const prepared = JSON.stringify({
-    model: 'deepseek-v4.1-flash',
-    stream: true,
-    messages: [
-      { role: 'system', content: 'A prompt refused with HTTP 200 (envelope case)' },
-      { role: 'user', content: 'hi' },
-    ],
-  })
-  const first = await client.chatStream(CN, prepared, undefined, { headersMs: 50 })
-  assert.equal(first.ok, true)
-  assert.equal(calls.length, 2, 'the 200 envelope is retried once, like the 400 shape')
-  assert.ok(calls[1].messages[0].content.trim())
-  assert.match(calls[1].messages[1].content, /envelope case/u)
-
-  calls.length = 0
-  const second = await client.chatStream(CN, prepared, undefined, { headersMs: 50 })
-  assert.equal(second.ok, true)
-  assert.equal(calls.length, 1, 'the accepted fold is remembered for the next turn')
-  assert.ok(calls[0].messages[0].content.trim())
-})
+}
 
 test('a prompt screen labeled text/plain is still folded and retried', async () => {
   const calls = []
@@ -90,68 +85,6 @@ test('a prompt screen labeled text/plain is still folded and retried', async () 
   assert.equal(result.ok, true)
   assert.equal(calls.length, 2, 'a declared small body is inspected even when labeled text/plain')
   assert.ok(calls[1].messages[0].content.trim())
-})
-
-test('a refused system prompt is folded without introducing an empty Kimi message', async () => {
-  const calls = []
-  const client = new WorkBuddyUpstreamClient({
-    fetchImpl: async (_url, init) => {
-      calls.push(bodyOf(init))
-      if (calls.length === 1) {
-        return new Response(REFUSAL, { status: 400, headers: { 'content-type': 'application/json' } })
-      }
-      return new Response(SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } })
-    },
-  })
-  const system = 'You are an AI agent powered by DeepSeek Harness. (retry case)'
-  const result = await client.chatStream(CN, JSON.stringify({
-    model: 'kimi-k3-1',
-    stream: true,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: 'hi' },
-    ],
-  }), undefined, { headersMs: 50 })
-
-  assert.equal(result.ok, true)
-  assert.equal(calls.length, 2, 'the refusal is retried once')
-  const sent = calls[1].messages
-  assert.equal(sent[0].role, 'system', 'a system turn still opens the body')
-  assert.ok(sent[0].content.trim(), 'Kimi rejects an empty system placeholder with code 11151')
-  assert.equal(sent[1].role, 'user')
-  assert.match(sent[1].content, /You are an AI agent powered by DeepSeek Harness/u,
-    'the instructions survive in the user turn')
-  assert.match(sent[1].content, /^[\s\S]*\n\nhi$/u, 'the user text follows the instructions')
-})
-
-test('an accepted fold is reused on the next turn', async () => {
-  const calls = []
-  let refused = false
-  const client = new WorkBuddyUpstreamClient({
-    fetchImpl: async (_url, init) => {
-      calls.push(bodyOf(init))
-      if (!refused) {
-        refused = true
-        return new Response(REFUSAL, { status: 400, headers: { 'content-type': 'application/json' } })
-      }
-      return new Response(SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } })
-    },
-  })
-  const prepared = JSON.stringify({
-    model: 'deepseek-v4.1-flash',
-    stream: true,
-    messages: [
-      { role: 'system', content: 'You are an AI agent powered by DeepSeek Harness. (reuse case)' },
-      { role: 'user', content: 'again' },
-    ],
-  })
-  assert.equal((await client.chatStream(CN, prepared, undefined, { headersMs: 50 })).ok, true)
-  assert.equal(calls.length, 2, 'the first turn pays the refused round trip')
-  calls.length = 0
-  assert.equal((await client.chatStream(CN, prepared, undefined, { headersMs: 50 })).ok, true)
-  assert.equal(calls.length, 1, 'the accepted prompt no longer pays a refused call')
-  assert.ok(calls[0].messages[0].content.trim())
-  assert.match(calls[0].messages[1].content, /DeepSeek Harness/u)
 })
 
 test('a retry that fails again does not poison the next turn', async () => {

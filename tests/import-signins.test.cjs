@@ -12,6 +12,7 @@ const { test } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { execFileSync } = require('node:child_process')
 require('./ts-loader.cjs')
 
 const loadTool = () => require('../tools/import-signins.cjs')
@@ -19,6 +20,47 @@ const loadTool = () => require('../tools/import-signins.cjs')
 function scratch(label) {
   return fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'import-' + label + '-'))
 }
+
+test('CLI imports preserve issue times and replace only with a fresher sign-in', () => {
+  const directory = scratch('freshness')
+  const source = path.join(directory, 'source.json')
+  const issued = 1790000000000
+  const run = (token, time, expiry) => {
+    fs.writeFileSync(source, JSON.stringify({
+      auth: { accessToken: token, refreshToken: 'refresh', domain: 'www.codebuddy.cn', expiresAt: expiry, lastRefreshTime: time },
+      account: { uin: '90000000091', uid: 'import-fixture' },
+    }))
+    return execFileSync(process.execPath, [path.join(__dirname, '../tools/import-signins.cjs'),
+      '--data', directory, '--from', source, '--force'], { encoding: 'utf8' })
+  }
+  const saved = () => JSON.parse(fs.readFileSync(path.join(directory, 'signins/workbuddy-panel-90000000091.info'), 'utf8')).auth
+  try {
+    assert.match(run('current', issued, issued + 20000), /1 to import/)
+    assert.equal(saved().lastRefreshTime, issued)
+    assert.match(run('older', issued - 1000, issued + 50000), /0 to import/)
+    assert.equal(saved().accessToken, 'current')
+    assert.match(run('newer', issued + 1000, issued + 10000), /1 to import/)
+    assert.equal(saved().accessToken, 'newer')
+    assert.equal(saved().lastRefreshTime, issued + 1000)
+    const second = path.join(directory, 'second.json')
+    const global = path.join(directory, 'global.json')
+    fs.writeFileSync(second, JSON.stringify({ ...saved(), uid: 'import-fixture', accessToken: 'newest-cn', lastRefreshTime: issued + 2000 }))
+    fs.writeFileSync(global, JSON.stringify({ ...saved(), uid: 'import-fixture', uin: '90000000091', domain: 'www.workbuddy.ai', lastRefreshTime: issued + 3000 }))
+    for (const reverse of [false, true]) {
+      const target = path.join(directory, String(reverse))
+      fs.mkdirSync(target)
+      const args = [path.join(__dirname, '../tools/import-signins.cjs'), '--data', target, '--region', 'cn',
+        '--from', ...(reverse ? [second, source, global] : [global, source, second])]
+      if (!reverse) {
+        assert.match(execFileSync(process.execPath, [...args, '--dry-run'], { encoding: 'utf8' }), /1 to import/)
+        assert.equal(fs.existsSync(path.join(target, 'signins')), false)
+      }
+      assert.match(execFileSync(process.execPath, args, { encoding: 'utf8' }), /1 to import/)
+      assert.deepEqual(fs.readdirSync(path.join(target, 'signins')), ['workbuddy-panel-90000000091.info'])
+      assert.equal(JSON.parse(fs.readFileSync(path.join(target, 'signins/workbuddy-panel-90000000091.info'))).auth.accessToken, 'newest-cn')
+    }
+  } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+})
 
 test('an expiry in seconds is converted, and one in milliseconds is left alone', () => {
   const tool = loadTool()

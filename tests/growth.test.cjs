@@ -50,11 +50,15 @@ async function loadPlugin(t, temporary, growth) {
   })
   const settings = {
     enabled: true, sourceWorkbuddy: true, sourceTrae: false, sourceQoder: false,
-    disabledRegions: ['workbuddy:global'], authFile: path.join(auth, 'login.info'),
+    disabledRegions: growth.domain === 'www.workbuddy.ai' ? [] : ['workbuddy:global'],
+    authFile: path.join(auth, 'login.info'),
     autoCheckin: { enabled: false, hours: [9] },
   }
   fs.writeFileSync(settings.authFile, JSON.stringify({
-    auth: { accessToken: 'fixture-token', refreshToken: 'fixture-refresh', expiresAt: Date.now() + 3600000 },
+    auth: {
+      accessToken: 'fixture-token', refreshToken: 'fixture-refresh', expiresAt: Date.now() + 3600000,
+      ...(growth.domain ? { domain: growth.domain } : {}),
+    },
     account: { uin: 'fixture-uin', nickname: 'Fixture' },
   }))
 
@@ -66,16 +70,15 @@ async function loadPlugin(t, temporary, growth) {
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [])
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
+  record('fetchBuddyInfo', growth.buddy ?? null)
   record('makeupCards', growth.makeupCards ?? 0)
   record('missedYesterday', growth.missedYesterday ?? false)
   record('useMakeupCard')
-  record('claimGift', growth.gift ?? 0)
-  record('claimCompensation', growth.compensation ?? 0)
   record('reportChatActivity')
   record('growthStreakFull', async () => growth.streak)
-  record('redeemStreakTier')
+  record('redeemStreakTier', growth.receipt ?? { credit: 200, energy: 10, cards: 1, chances: 1 })
   record('lotteryChances', growth.chances ?? 0)
-  record('drawLottery', { prize: 'fixture' })
+  record('drawLottery', { prize_type: 'credit', credit_granted: '10' })
   const context = vm.createContext({
     require: createRequire(path.join(root, 'src/host.ts')),
     module: { exports: {} }, exports: {}, __dirname: temporary,
@@ -99,7 +102,7 @@ const STREAK = {
 }
 
 /** The five steps, and the ones among them that spend something. */
-const MUTATING = ['useMakeupCard', 'claimGift', 'claimCompensation', 'reportChatActivity', 'redeemStreakTier', 'drawLottery']
+const MUTATING = ['useMakeupCard', 'reportChatActivity', 'redeemStreakTier', 'drawLottery']
 
 test('the streak read carries the make-up card balance with it', async () => {
   let asked = 0
@@ -127,11 +130,10 @@ test('the streak read carries the make-up card balance with it', async () => {
   assert.equal(status.tiers[1].status, 'unlocked')
   assert.equal(asked, 1)
 })
-
 test('reading the growth state spends nothing', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-'))
   const { plugin, spent } = await loadPlugin(t, temporary, {
-    streak: STREAK, chances: 2, gift: 50, compensation: 10,
+    streak: STREAK, chances: 2,
   })
   try {
     const answer = await plugin.onPanelInvoke('xd.growthState')
@@ -150,12 +152,18 @@ test('reading the growth state spends nothing', async (t) => {
         tiers: 1, tierList: STREAK.tiers, makeupCards: 2, lottery: 2,
       }],
     }, 'the card reads one row per account: the streak, the cards and the draws')
+    t.mock.method(WorkBuddyUpstreamClient.prototype, 'lotteryChances', async () => { throw new Error('lottery unavailable') })
+    const partial = (await plugin.onPanelInvoke('xd.growthState')).growth
+    assert.equal(partial.failed, 1)
+    assert.equal(partial.rows[0].failed, undefined, 'lottery failure must not hide the streak')
+    assert.deepEqual(JSON.parse(JSON.stringify(partial.rows[0].tierList)), STREAK.tiers)
+    assert.equal(partial.rows[0].lottery, undefined, 'an unread balance is not zero')
+    assert.equal(partial.rows[0].lotteryError, 'lottery unavailable')
   } finally {
     await plugin.onUnload()
     fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
-
 /**
  * A read is held, published, and dropped when the accounts change.
  *
@@ -168,12 +176,10 @@ test('reading the growth state spends nothing', async (t) => {
 test('a growth read is published, and dropped when the region is switched off', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-'))
   const { plugin } = await loadPlugin(t, temporary, {
-    streak: STREAK, chances: 2, gift: 50, compensation: 10,
+    streak: STREAK, chances: 2,
   })
   try {
     const before = await plugin.onPanelInvoke('xd.state')
-    // The key is always published; `null` is "this process has not read yet", which
-    // is what lets the panel tell it apart from a document that says nothing.
     assert.equal(before.growth.read, null, 'a process that has not read yet publishes no read')
 
     const answer = await plugin.onPanelInvoke('xd.growthState')
@@ -181,12 +187,14 @@ test('a growth read is published, and dropped when the region is switched off', 
     const after = await plugin.onPanelInvoke('xd.state')
     assert.equal(typeof after.growth.read, 'object', 'and the next document carries them')
     assert.equal(after.growth.read.rows.length, 1)
+    assert.equal(after.growth.readEpoch, answer.readEpoch)
     assert.equal(after.growth.read.readAt, answer.growth.readAt, 'stamped with when it was read')
 
     // Switching the region off changes which accounts a read returns, so the held
     // answer no longer describes the pool.
     await plugin.onPanelInvoke('xd.setRegionEnabled', { source: 'workbuddy', region: 'cn', enabled: false })
     const parked = await plugin.onPanelInvoke('xd.state')
+    assert.ok(parked.growth.readEpoch > before.growth.readEpoch)
     assert.equal(parked.growth.read, null,
       'the rows of a switched-off region are not painted as current')
   } finally {
@@ -195,18 +203,19 @@ test('a growth read is published, and dropped when the region is switched off', 
   }
 })
 
-test('a growth run reports each of the four steps on its own', async (t) => {
+test('a growth run collects rewards and dispatches an idle cat', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-'))
   const { plugin, spent } = await loadPlugin(t, temporary, {
     streak: STREAK, chances: 2, makeupCards: 2, missedYesterday: true,
-    gift: 50, compensation: 10,
+    receipt: { credit: 150, energy: 8 },
+    buddy: { name: 'cat' },
   })
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchTravelStatus', async () => ({ state: 'idle' }))
+  const depart = t.mock.method(WorkBuddyUpstreamClient.prototype, 'departTravel', async () => {})
   try {
     const answer = await plugin.onPanelInvoke('xd.growthRun')
     const detail = answer.growth.detail
     assert.equal(detail.makeup, 1, 'the make-up card is spent on the missed day')
-    assert.equal(detail.gift, 50, 'the gift pack pays on its own line')
-    assert.equal(detail.compensation, 10, 'and so does the compensation')
     assert.equal(detail.activity, 1, 'the activity report is what advances the streak')
     assert.equal(detail.streak, 1, 'one unlocked tier is redeemed')
     assert.equal(detail.lottery, 2, 'and both draws are spent')
@@ -215,9 +224,29 @@ test('a growth run reports each of the four steps on its own', async (t) => {
     // The top-level counts are the ones the check-in log has always shown, so a
     // breakdown that disagreed with them would be a second source of truth.
     assert.equal(answer.growth.streak, 1)
-    assert.equal(answer.growth.credit, 200, 'the redeemed tier\'s credits')
+    assert.equal(answer.growth.credit, 170, 'tier receipt and two lottery prizes')
     assert.ok(spent.some(([name]) => name === 'useMakeupCard'), 'the card was actually spent')
     assert.ok(spent.some(([name]) => name === 'drawLottery'), 'and the draws were actually taken')
+    assert.equal(depart.mock.callCount(), 1, 'the run sends the cat on its trip')
+    assert.equal(answer.state.growth.last.travel.departed, 1, 'the panel receives the travel result')
+  } finally {
+    await plugin.onUnload()
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('global growth skips its disabled lottery', async (t) => {
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-'))
+  const { plugin, spent } = await loadPlugin(t, temporary, {
+    domain: 'www.workbuddy.ai', streak: STREAK, chances: 2,
+  })
+  try {
+    const state = await plugin.onPanelInvoke('xd.growthState')
+    assert.equal(state.growth.rows[0].region, 'global')
+    assert.equal(state.growth.rows[0].lottery, undefined)
+    const answer = await plugin.onPanelInvoke('xd.growthRun')
+    assert.equal(answer.growth.detail.lottery, 0)
+    assert.ok(!spent.some(([name]) => name === 'lotteryChances' || name === 'drawLottery'))
   } finally {
     await plugin.onUnload()
     fs.rmSync(temporary, { recursive: true, force: true })
@@ -233,7 +262,7 @@ test('a locked tier is not a failure', async (t) => {
   try {
     const answer = await plugin.onPanelInvoke('xd.growthRun')
     assert.deepEqual({ ...answer.growth.detail }, {
-      accounts: 1, makeup: 0, gift: 0, compensation: 0, activity: 1,
+      accounts: 1, makeup: 0, activity: 1,
       streak: 0, lottery: 0, failed: 0,
     }, 'a day with nothing to collect is a clean pass, not a failed one')
   } finally {
@@ -242,30 +271,6 @@ test('a locked tier is not a failure', async (t) => {
   }
 })
 
-test('a step that throws is counted, and the rest of the pass still lands', async (t) => {
-  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-'))
-  const { plugin, spent } = await loadPlugin(t, temporary, {
-    streak: STREAK, chances: 1, gift: 0, compensation: 0,
-  })
-  // The gift endpoint answers a business error for an account with nothing
-  // waiting, which is the normal answer rather than a breakage.
-  t.mock.method(WorkBuddyUpstreamClient.prototype, 'claimGift', async () => { throw new Error('nothing waiting') })
-  try {
-    const answer = await plugin.onPanelInvoke('xd.growthRun')
-    assert.equal(answer.growth.detail.failed, 0,
-      'a refused one-off collection is the upstream saying there is nothing there')
-    // The claim in the title is that the pass keeps going: a refused gift must
-    // not cost the account its activity report, its tier or its draw.
-    assert.equal(answer.growth.detail.activity, 1, 'the activity report still runs after the refused gift')
-    assert.equal(answer.growth.detail.streak, 1, 'and the unlocked tier is still redeemed')
-    assert.equal(answer.growth.detail.lottery, 1, 'and the draw is still taken')
-    assert.equal(answer.growth.credit, 200, 'the redeemed tier\'s credits still land')
-    assert.ok(spent.some(([name]) => name === 'redeemStreakTier'), 'the tier was actually redeemed')
-  } finally {
-    await plugin.onUnload()
-    fs.rmSync(temporary, { recursive: true, force: true })
-  }
-})
 /**
  * A growth run started after a service stop still collects.
  *
@@ -278,7 +283,7 @@ test('a step that throws is counted, and the rest of the pass still lands', asyn
 test('a growth run started after a service stop still collects', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-'))
   const { plugin, spent } = await loadPlugin(t, temporary, {
-    streak: STREAK, chances: 1, gift: 50, compensation: 10,
+    streak: STREAK, chances: 1,
   })
   const { startRegisteredService, stopRegisteredService } = require('../src/pi-compat.ts')
   try {
@@ -287,7 +292,7 @@ test('a growth run started after a service stop still collects', async (t) => {
     const answer = await plugin.onPanelInvoke('xd.growthRun')
     assert.equal(answer.growth.detail.accounts, 1, 'the run still reached its account')
     assert.equal(answer.growth.detail.streak, 1, 'and redeemed the unlocked tier')
-    assert.equal(answer.growth.credit, 200, 'with the credits the tier pays')
+    assert.equal(answer.growth.credit, 210, 'with tier and lottery credits')
     assert.ok(spent.some(([name]) => name === 'redeemStreakTier'), 'the upstream was actually asked')
   } finally {
     await plugin.onUnload()
@@ -303,11 +308,10 @@ test('a growth run started after a service stop still collects', async (t) => {
  */
 test('a single claim is refused while a growth run walks the accounts', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-'))
-  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 0, gift: 0, compensation: 0 })
+  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 0 })
   const gates = []
-  t.mock.method(WorkBuddyUpstreamClient.prototype, 'claimGift', async () => {
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'reportChatActivity', async () => {
     await new Promise((resolve) => { gates.push(resolve) })
-    return 0
   })
   const until = async (ready) => { for (let i = 0; i < 200 && !ready(); i += 1) await new Promise((r) => setImmediate(r)) }
   try {
@@ -337,7 +341,7 @@ test('a single claim is refused while a growth run walks the accounts', async (t
  */
 test('a pass that starts during a single claim waits for it', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-claim-guard-'))
-  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 0, gift: 0, compensation: 0 })
+  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 0 })
   let openClaim
   const claimed = new Promise((resolve) => { openClaim = resolve })
   let entered
@@ -383,7 +387,7 @@ test('a pass that starts during a single claim waits for it', async (t) => {
  */
 test('a check-in aimed at an unknown source is refused', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-checkin-source-'))
-  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 0, gift: 0, compensation: 0 })
+  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 0 })
   try {
     await assert.rejects(plugin.onPanelInvoke('xd.checkinAll', { source: 'nobody' }),
       /source must be workbuddy, trae or qoder/,
@@ -407,7 +411,7 @@ test('a check-in aimed at an unknown source is refused', async (t) => {
  * upstream reads as a burst.
  */
 test('stopping growth sends no further mutations after an in-flight request settles', async (t) => {
-  for (const boundary of ['makeupCards', 'claimGift', 'claimCompensation', 'growthStreakFull', 'lotteryChances', 'drawLottery']) {
+  for (const boundary of ['makeupCards', 'growthStreakFull', 'lotteryChances', 'drawLottery', 'source off']) {
     await t.test(boundary, async (t) => {
       const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-stop-'))
       const { plugin, spent } = await loadPlugin(t, temporary, {
@@ -416,8 +420,9 @@ test('stopping growth sends no further mutations after an in-flight request sett
       let release, reached
       const gate = new Promise((resolve) => { release = resolve })
       const waiting = new Promise((resolve) => { reached = resolve })
-      const original = WorkBuddyUpstreamClient.prototype[boundary]
-      t.mock.method(WorkBuddyUpstreamClient.prototype, boundary, async (...args) => {
+      const method = boundary === 'source off' ? 'makeupCards' : boundary
+      const original = WorkBuddyUpstreamClient.prototype[method]
+      t.mock.method(WorkBuddyUpstreamClient.prototype, method, async (...args) => {
         const answer = await original(...args)
         reached()
         await gate
@@ -427,7 +432,8 @@ test('stopping growth sends no further mutations after an in-flight request sett
         const run = plugin.onPanelInvoke('xd.growthRun')
         await waiting
         const before = spent.length
-        await plugin.onUnload()
+        if (boundary === 'source off') await plugin.onPanelInvoke('xd.setSource', { source: 'workbuddy', enabled: false })
+        else await plugin.onUnload()
         release()
         await run
         assert.deepEqual(spent.slice(before).map(([name]) => name).filter((name) => MUTATING.includes(name)), [])
@@ -442,13 +448,12 @@ test('stopping growth sends no further mutations after an in-flight request sett
 
 test('a stale run does not clear the guard of the run that replaced it', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-growth-'))
-  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 0, gift: 0, compensation: 0 })
+  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 0 })
   // One gate per pass, opened by the test: the pass blocks on its first spending
   // step, which is what lets two of them be in flight at once.
   const gates = []
-  t.mock.method(WorkBuddyUpstreamClient.prototype, 'claimGift', async () => {
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'reportChatActivity', async () => {
     await new Promise((resolve) => { gates.push(resolve) })
-    return 0
   })
   const until = async (ready) => { for (let i = 0; i < 200 && !ready(); i += 1) await new Promise((r) => setImmediate(r)) }
   try {
@@ -535,20 +540,23 @@ function panelGrowth(names) {
     // The lifted functions read the panel's module state, which the lift cannot
     // carry: it is declared here so a row's expansion survives a re-render.
     openGrowth: {},
+    growthButton: (_row, label) => context.el("button", "small", label),
+    paintGrowthExtras() {},
+    loadGrowthDetails() {}, renderGrowth() {}, render() {},
     // The realm order the page groups by, mirroring the panel's own
     // declaration so a split test drives the real order rather than a copy.
     SOURCE_REGIONS: { workbuddy: ['cn', 'global'], trae: ['cn', 'ai'], qoder: ['cn', 'global'] },
-    STATUS_KEY: { unlocked: 'growth.tierUnlocked', claimed: 'growth.tierClaimed', locked: 'growth.tierLocked' },
+    STATUS_KEY: { claimed: 'growth.tierClaimed', locked: 'growth.tierLocked' },
     t: (key, params) => { seen.push([key, params]); return key },
     num: (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback),
     formatStamp: (iso) => String(iso || ''),
     regionLabel: (region) => String(region || ''),
     el: (tag, className, text) => ({
-      tag, className, text: text === undefined ? '' : text, children: [], attrs: {}, hidden: false, title: '', disabled: false,
+      tag, className, text: text === undefined ? '' : text, children: [], attrs: {}, listeners: {}, hidden: false, title: '', disabled: false,
       appendChild(child) { this.children.push(child) },
       setAttribute(name, value) { this.attrs[name] = String(value) },
       getAttribute(name) { return name in this.attrs ? this.attrs[name] : null },
-      addEventListener() {},
+      addEventListener(name, handler) { this.listeners[name] = handler },
     }),
     clear: (node) => { node.children.length = 0 },
     console,
@@ -564,13 +572,6 @@ function fakeLogBox() {
 
 test('the growth card reads the state it is handed', () => {
   const { context } = panelGrowth(['growthStale', 'growthStateText'])
-  context.growthState = null
-  assert.equal(context.growthStateText(), 'growth.stateNone',
-    'a card with no read behind it says so rather than showing zeros')
-  context.state = { growth: { last: { at: '2026-10-19T12:00:00.000Z' } } }
-  assert.equal(context.growthStateText(), 'growth.stateStale',
-    'a card whose figures predate the last run says to read again, not that nothing was read')
-  context.state = null
   context.growthState = {
     accounts: 3, failed: 1,
     rows: [
@@ -614,10 +615,23 @@ test('the growth page lists one expandable row per account', () => {
   assert.ok(asked.includes('growth.rowTier'), 'each unlocked tier is listed on its own line')
   assert.ok(asked.includes('growth.tierClaimed'), 'and a claimed one says so')
 
-  context.openGrowth['growth:a1'] = true
-  const opened = context.growthRow(context.growthState.rows[0])
-  assert.equal(opened.children[0].getAttribute('aria-expanded'), 'true', 'an expanded row reports it')
-  assert.equal(opened.children[1].hidden, false, 'and shows its body')
+  head.listeners.click()
+  assert.equal(context.openGrowth['growth:a1'], true)
+  assert.equal(head.getAttribute('aria-expanded'), 'true')
+  assert.equal(row.children[1].hidden, false)
+  head.listeners.click()
+  assert.equal(context.openGrowth['growth:a1'], false)
+  assert.equal(row.children[1].hidden, true)
+  const partial = context.growthRow({ ...context.growthState.rows[0], lottery: undefined, lotteryError: 'lottery unavailable' })
+  const metrics = partial.children[0].children[2]
+  assert.equal(metrics.children.at(-1).text, '—', 'the unread lottery balance stays unknown')
+  assert.ok(metrics.title.includes('lottery unavailable'))
+  const globalMetrics = host.children[3].children[0].children[2]
+  assert.equal(globalMetrics.children.filter((metric) => metric.className.startsWith('metric ')).length, 2,
+    'the global row has no lottery metric')
+  assert.ok(globalMetrics.children.every((metric) => !metric.className.includes('ic-dice')))
+  assert.ok(partial.children[1].children.some((line) => line.children.some((child) => child.className.includes('tier-claim'))),
+    'the available streak still has its claim button')
 })
 
 test('the growth page splits its rows by realm and dots each row state', () => {
@@ -659,23 +673,21 @@ test('the growth page says so when the source is not WorkBuddy', () => {
   assert.ok(seen.some(([key]) => key === 'growth.onlyWorkbuddy'))
 })
 
-test('the growth log names every step of the last run', () => {
-  const { context, seen } = panelGrowth(['growthLastRun', 'paintGrowthNote'])
+test('the growth log shows points and user actions from the last run', () => {
+  const { context, seen } = panelGrowth(['growthLastRun', 'paintGrowthNote', 'autoNoteRows'])
   context.state = { growth: { last: {
     at: '2026-10-19T12:00:00.000Z', credit: 270, failed: 0,
-    detail: { accounts: 2, makeup: 1, gift: 50, compensation: 10, activity: 2, streak: 1, lottery: 3, failed: 0 },
+    detail: { accounts: 2, makeup: 1, activity: 2, streak: 1, lottery: 3, failed: 0 },
   } } }
   const box = fakeLogBox()
   context.paintGrowthNote(box)
   assert.equal(box.children.length, 1, 'one line for a clean pass')
-  // The translator is stubbed, so what is checked is that every step's number
-  // reaches the string: a step the painter dropped is invisible either way.
   const asked = seen.find(([key]) => key === 'growth.runLine')
   assert.ok(asked !== undefined, 'the run line must be the one painted')
   assert.deepEqual({ ...asked[1] }, {
     when: '2026-10-19T12:00:00.000Z',
-    makeup: 1, gift: 50, compensation: 10, activity: 2, streak: 1, lottery: 3, credit: 270,
-  }, 'each of the five steps carries its own count into the line')
+    credit: 270, makeup: 1, streak: 1, lottery: 3,
+  })
 
   // A pass that failed a step says so on its own line: the breakdown above
   // still reads as a normal pass otherwise.
@@ -683,6 +695,11 @@ test('the growth log names every step of the last run', () => {
   context.paintGrowthNote(box)
   assert.equal(box.children.length, 2, 'a failure gets a line of its own')
   assert.equal(box.children[1].children[1].text, 'growth.runFailed')
+  const rows = context.autoNoteRows({ last: { workbuddy: false, growth: {
+    streak: 1, credit: 270, failed: 0, detail: { lottery: 3, failed: 2 },
+  } } })
+  assert.deepEqual({ ...seen.find(([key]) => key === 'auto.rowGrowth')[1] }, { streak: 1, lottery: 3, failed: 2 })
+  assert.equal(rows.at(-1).tone, 'fail')
 })
 
 test('the growth card falls back to the scheduled pass it belongs to', () => {
@@ -691,7 +708,7 @@ test('the growth card falls back to the scheduled pass it belongs to', () => {
   // is where a user who never pressed the card's own button still sees it.
   context.state = { autoCheckin: { last: { at: '2026-10-19T09:00:00.000Z', growth: {
     credit: 200, failed: 0,
-    detail: { accounts: 1, makeup: 0, gift: 0, compensation: 0, activity: 1, streak: 1, lottery: 0, failed: 0 },
+    detail: { accounts: 1, makeup: 0, activity: 1, streak: 1, lottery: 0, failed: 0 },
   } } } }
   const box = fakeLogBox()
   context.paintGrowthNote(box)
@@ -710,9 +727,9 @@ test('the growth card falls back to the scheduled pass it belongs to', () => {
 function panelGrowthRun(answers) {
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
   const parts = []
-  for (const name of ['runBusy', 'runGrowth', 'readGrowth', 'adopt']) {
-    const from = source.indexOf(`function ${name}(`)
-    assert.notEqual(from, -1, `${name} must exist in the panel`)
+  for (const declaration of ['function runBusy', 'function runGrowth', 'function readGrowth', 'function adopt', 'async function runGrowthAction']) {
+    const from = source.indexOf(`${declaration}(`)
+    assert.notEqual(from, -1, `${declaration} must exist in the panel`)
     let depth = 0
     let index = source.indexOf('{', from)
     for (; index < source.length; index += 1) {
@@ -730,14 +747,18 @@ function panelGrowthRun(answers) {
     growthReading: false,
     // The panel counts the host's drops so a read in flight can discard its own
     // answer; the lifted functions read it from here.
-    growthDropped: 0,
+    growthReadEpoch: 0,
     // `adopt` bumps the revision the refresh poll watches, so the counter it
     // writes has to exist here as well.
     stateRevision: 0,
     activeSource: 'workbuddy',
     openGrowth: {},
+    growthScrollReturn: null,
+    growthScrollVersion: 0,
+    growthButton: () => ({ tag: "button", text: "claim" }),
+    paintGrowthExtras() {},
     console,
-    document: { activeElement: null },
+    document: { activeElement: null, getElementById: () => null },
     t: (key) => key,
     // `runBusy` clears the banner with a null of its own, so only a real
     // message counts as something reported.
@@ -745,6 +766,7 @@ function panelGrowthRun(answers) {
     announce: (message) => said.push(['announce', message]),
     notePress: () => {},
     render: () => {},
+    restoreGrowthScroll: () => {},
     pollCheckinLog: () => {},
     invoke: (channel) => {
       calls.push(channel)
@@ -763,11 +785,24 @@ const ROW = {
   tiers: 1, makeupCards: 0, lottery: 0, tierList: [],
 }
 
+test('a streak claim waits for an active read and clears a stale tier if its own refresh fails', async () => {
+  const answers = { 'xd.growthState': { growth: { rows: [ROW] }, readEpoch: 0 }, 'xd.growthAction': { result: { credit: 50 } } }
+  const { context, calls } = panelGrowthRun(answers)
+  const reading = context.readGrowth()
+  await context.runGrowthAction(ROW, 'streak', '14d')
+  await reading
+  assert.deepEqual(calls, ['xd.growthState'])
+  delete answers['xd.growthState']
+  await context.runGrowthAction(ROW, 'streak', '14d')
+  assert.deepEqual(calls.slice(1), ['xd.growthAction', 'xd.growthState'])
+  assert.equal(context.growthState, null)
+})
+
 test('a finished growth run leaves the page holding the new rows', async () => {
   const document = { accounts: [{ id: 'a1' }], growth: { last: { at: '2026-10-19T12:00:00.000Z' } } }
   const { context, calls, said } = panelGrowthRun({
     'xd.growthRun': { state: document, growth: { accounts: 1, failed: 0, rows: [] } },
-    'xd.growthState': { growth: { accounts: 1, failed: 0, rows: [ROW] } },
+    'xd.growthState': { growth: { accounts: 1, failed: 0, rows: [ROW] }, readEpoch: 0 },
   })
   await context.runGrowth()
   assert.deepEqual(calls, ['xd.growthRun', 'xd.growthState'],
@@ -805,7 +840,7 @@ test('a growth run that outran its answer waits for the pass instead', async () 
 function panelGrowthPoll(answers) {
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
   const parts = []
-  for (const name of ['stopGrowthPoll', 'pollGrowthRun', 'adopt', 'renderGrowth']) {
+  for (const name of ['el', 'iconLabel', 'stopGrowthPoll', 'pollGrowthRun', 'adopt', 'renderGrowth']) {
     const from = source.indexOf(`function ${name}(`)
     assert.notEqual(from, -1, `${name} must exist in the panel`)
     let depth = 0
@@ -819,14 +854,16 @@ function panelGrowthPoll(answers) {
   const timers = []
   const calls = []
   const nodes = {}
+  const makeNode = () => ({ className: '', textContent: '', title: '', disabled: false, children: [], appendChild(child) { this.children.push(child) } })
   const sandbox = {
+    document: { createElement: makeNode },
     state: null,
     stateRevision: 0,
     busy: null,
     activeTab: 'growth',
     growthState: null,
     growthReading: false,
-    growthDropped: 0,
+    growthReadEpoch: 0,
     growthPoll: null,
     growthPollFailures: 0,
     GROWTH_POLL_MS: 0,
@@ -837,9 +874,10 @@ function panelGrowthPoll(answers) {
       setTimeout(fn) { timers.push(fn); return timers.length },
       clearTimeout() {},
     },
-    $: (id) => nodes[id] || (nodes[id] = { textContent: '', title: '', disabled: false }),
+    $: (id) => nodes[id] || (nodes[id] = makeNode()),
     t: (key) => key,
     growthStateText: () => '',
+    placeOf: () => ({}), restorePlace() {},
     paintGrowthAccounts: () => {},
     paintGrowthNote: () => {},
     readGrowth: () => { calls.push('readGrowth') },
@@ -903,4 +941,136 @@ test('the keep-alive line reports on its own, whatever the pass log says', () =>
   assert.equal(context.keepAliveNoteRow({ ...record, failed: 2 }).tone, 'fail', 'a failure colours the line')
   assert.equal(context.keepAliveNoteRow(record).tone, '', 'a pass that refreshed nothing is not a success')
   assert.equal(context.keepAliveNoteRow(null), null, 'a card with no run yet draws no line')
+})
+
+test('one-account growth actions serialize mutations and invalidate their reads', async (t) => {
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'growth-action-'))
+  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK })
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'growthAccountDetails', async () => ({ heatmap: { cells: [] }, errors: {} }))
+  let release
+  const mutations = []
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'growthAccountAction', async (_credential, action, value) => {
+    mutations.push([action, value])
+    await new Promise(resolve => { release = resolve })
+    return { reward_credit: 28 }
+  })
+  try {
+    const read = await plugin.onPanelInvoke('xd.growthState')
+    const id = read.growth.rows[0].id
+    const details = await plugin.onPanelInvoke('xd.growthDetails', { id })
+    assert.deepEqual(JSON.parse(JSON.stringify(details.details.heatmap.cells)), [])
+    const pending = plugin.onPanelInvoke('xd.growthAction', { id, action: 'travelClaim' })
+    while (!release) await new Promise(resolve => setImmediate(resolve))
+    await assert.rejects(plugin.onPanelInvoke('xd.growthAction', { id, action: 'lottery' }), /running/)
+    release()
+    const result = await pending
+    assert.equal(result.result.reward_credit, 28)
+    assert.equal((await plugin.onPanelInvoke('xd.state')).growth.read, null)
+    assert.deepEqual(mutations, [['travelClaim', undefined]])
+    await assert.rejects(plugin.onPanelInvoke('xd.growthAction', { id: 'missing', action: 'lottery' }), /account/i)
+  } finally {
+    await plugin.onUnload()
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('disabling an account during its buddy lookup cancels manual travel', async (t) => {
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'growth-action-'))
+  let release
+  let reached
+  const reading = new Promise((resolve) => { reached = resolve })
+  const { plugin } = await loadPlugin(t, temporary, {
+    streak: STREAK,
+    buddy: async () => {
+      reached()
+      await new Promise((resolve) => { release = resolve })
+      return { id: 1, name: 'cat' }
+    },
+  })
+  const depart = t.mock.method(WorkBuddyUpstreamClient.prototype, 'departTravel', async () => {})
+  try {
+    const row = (await plugin.onPanelInvoke('xd.growthState')).growth.rows[0]
+    const pending = plugin.onPanelInvoke('xd.growthAction', { id: row.id, action: 'travelDepart', value: 9 })
+    await reading
+    await plugin.onPanelInvoke('xd.setAccountState', { region: 'cn', accountId: row.id, state: 'disabled' })
+    release()
+    await assert.rejects(pending, /no longer active/i)
+    assert.equal(depart.mock.callCount(), 0)
+  } finally {
+    await plugin.onUnload()
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+for (const channel of ['xd.growthRun', 'xd.runCheckinNow']) test(`${channel} includes travel credits from an arrived trip without a record_id`, async t => {
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'growth-travel-'))
+  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 1, buddy: { name: 'cat' } })
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchTravelStatus', async () => ({ state: 'arrived' }))
+  const claim = t.mock.method(WorkBuddyUpstreamClient.prototype, 'claimTravelReward', async () => 28)
+  try {
+    const answer = await plugin.onPanelInvoke(channel)
+    const last = answer.state?.growth.last ?? answer.autoCheckin.last
+    assert.equal(claim.mock.callCount(), 1)
+    assert.equal((last.growth ?? last).credit, 238, '200 streak + 10 lottery + 28 travel')
+    assert.deepEqual({ ...last.travel }, { departed: 0, claimed: 1, failed: 0, credit: 28 })
+    if (channel === 'xd.growthRun') assert.equal(answer.growth.credit, 238)
+  } finally {
+    await plugin.onUnload()
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('preview growth credits match the change in account balances after travel', async () => {
+  const window = {}
+  vm.runInNewContext(fs.readFileSync(path.join(root, 'docs/preview-data.js'), 'utf8'), { window })
+  const { state, invokeGrowth } = window.__previewData
+  const balance = accounts => accounts.reduce((total, row) => total + (row.credits?.total ?? 0), 0)
+  const before = balance(state.accounts)
+  const answer = await invokeGrowth('xd.growthRun')
+  assert.equal(answer.growth.credit, balance(answer.state.accounts) - before)
+  assert.equal(answer.state.growth.last.travel.credit, 9)
+})
+
+test('a failed streak read keeps the activity result and reports the failure', async (t) => {
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'growth-partial-'))
+  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK })
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'growthStreakFull', async () => {
+    throw new Error('streak temporarily unavailable')
+  })
+  try {
+    const answer = await plugin.onPanelInvoke('xd.growthRun')
+    assert.equal(answer.growth.credit, 0)
+    assert.equal(answer.growth.detail.activity, 1)
+    assert.equal(answer.growth.detail.failed, 1)
+  } finally {
+    await plugin.onUnload()
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('an old growth action leaves a new activation read intact', async (t) => {
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'growth-reload-'))
+  const { plugin } = await loadPlugin(t, temporary, { streak: STREAK })
+  let release
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'growthAccountAction', async () => {
+    await new Promise(resolve => { release = resolve })
+    return { credit: 50 }
+  })
+  try {
+    const before = await plugin.onPanelInvoke('xd.growthState')
+    const pending = plugin.onPanelInvoke('xd.growthAction', { id: before.growth.rows[0].id, action: 'travelClaim' })
+    while (!release) await new Promise(resolve => setImmediate(resolve))
+    await plugin.onUnload()
+    await plugin.onLoad()
+    await plugin.onPanelInvoke('xd.state', { wait: true })
+    const fresh = await plugin.onPanelInvoke('xd.growthState')
+    release()
+    await pending
+    const state = await plugin.onPanelInvoke('xd.state')
+    assert.equal(state.growth.read?.readAt, fresh.growth.readAt)
+  } finally {
+    release?.()
+    await plugin.onUnload()
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
 })

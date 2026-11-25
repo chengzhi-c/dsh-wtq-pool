@@ -144,75 +144,24 @@ test('a sealed sign-in the key cannot open keeps the account the pool already ha
   } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
 })
 
-/**
- * The signature scan is handed a module path its own edition can load.
- *
- * `powershell` is Windows PowerShell 5.1, and it binds
- * `Microsoft.PowerShell.Security` by walking `PSModulePath` in order. Any machine
- * with a Store-installed PowerShell 7 carries that build's Modules directory
- * ahead of the system one, because the Store install prepends it to the variable
- * the desktop host inherited. 5.1 then binds the 7 build's copy of the module, the
- * import dies on a type-data conflict, and `Get-AuthenticodeSignature` throws for
- * every candidate. The scan's own catch swallows that, the policy function is
- * handed an empty status, and the at-rest key reads as "no WorkBuddy executable
- * found" on a machine holding two signed installs - which is what it read as
- * here, until the scan was given a path of its own.
- *
- * The chain is driven from a stubbed `node:child_process` and an environment
- * built here, so the case proves the child is handed a path of our own rather
- * than the ambient one, and that the path puts the system directory ahead of the
- * Store one. Dropping the option, or restoring the ambient order, fails it.
- */
-test('the signature scan is handed a module path 5.1 can load', async () => {
-  const spawns = []
+test('the registry scan uses the system PowerShell and its modules', () => {
+  const systemRoot = process.platform === 'win32' ? fs.realpathSync.native('\\\\?\\GLOBALROOT\\SystemRoot') : 'C:\\Windows'
   const ownRequire = createRequire(path.join(root, 'src/at-rest.ts'))
-  const modules = path.join('C:\\Windows', 'system32', 'WindowsPowerShell', 'v1.0', 'Modules')
-  const store = path.join('C:\\Program Files', 'WindowsApps', 'microsoft.powershell_7.6.7.0_x64__8wekyb3d8bbwe', 'Modules')
-  const ambient = [
-    path.join('C:\\Users\\fixture', 'Documents', 'PowerShell', 'Modules'),
-    path.join('C:\\Program Files', 'PowerShell', 'Modules'),
-    store,
-    modules,
-  ].join(';')
+  let call
   const context = vm.createContext({
     require: (specifier) => specifier === 'node:child_process'
-      ? { execFileSync: (file, args, options) => { spawns.push({ file, args, options }); return '' } }
+      ? { execFileSync: (file, args, options) => { call = { file, env: options.env }; return '[]' } }
       : ownRequire(specifier),
-    // No install root the scan would find, so the only candidate source left is
-    // the registry, and the only registry is the stub above.
-    process: { env: { SystemRoot: 'C:\\Windows', PSModulePath: ambient }, platform: 'win32' },
+    process: { platform: process.platform, env: { SystemRoot: systemRoot, PATH: 'fixture', PSModulePath: 'fixture' } },
     module: { exports: {} }, exports: {}, console: { log() {} }, Buffer,
   })
   context.exports = context.module.exports
-  vm.runInContext(transpile(fs.readFileSync(path.join(root, 'src/at-rest.ts'), 'utf8')), context)
-  const { signatureScanEnv, encryptedFieldOpener } = context.module.exports
-  assert.equal(typeof signatureScanEnv, 'function')
-  await encryptedFieldOpener()
-  assert.equal(spawns.length, 1, 'the scan runs exactly once')
-  // Pinned by absolute path rather than resolved through PATH: the scan exists
-  // because a user-level process can plant what runs, and a user-writable
-  // directory is on the default PATH.
-  assert.equal(spawns[0].file, path.join('C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
-  const handed = spawns[0].options.env
-  assert.notEqual(handed, undefined, 'the child must be handed an environment of our own, not the ambient one')
-  const order = handed.PSModulePath.split(';')
-  assert.equal(order[0], modules, 'the 5.1 modules directory is the module path the child is given')
-  // Nothing user-controlled reaches the child. An inherited `PSModulePath` names
-  // directories a user-level process can write, and PowerShell imports the first
-  // module it finds there: pinning the list is the point, not an accident.
-  assert.equal(order.includes(store), false, 'the Store module root is not inherited')
-  assert.equal(order.length, 1, 'the system module directory is the whole list')
-  assert.equal(signatureScanEnv({ SystemRoot: 'C:\\Windows', PSModulePath: ambient, PATH: 'unchanged' }).PATH,
-    path.join('C:\\Windows', 'System32'),
-    'a user PATH is replaced rather than passed through')
-  assert.equal(signatureScanEnv({ SystemRoot: 'C:\\Windows', PSModulePath: order.join(';') }).PSModulePath,
-    path.join('C:\\Windows', 'system32', 'WindowsPowerShell', 'v1.0', 'Modules'),
-    'building it twice is a no-op, so the path cannot grow on every scan')
-  // On Windows the root comes from the object manager, not from the environment,
-  // so a caller-supplied PATH never decides where the child looks.
-  assert.equal(signatureScanEnv({ PATH: 'unchanged' }).PATH,
-    path.join(fs.realpathSync.native('\\\\?\\GLOBALROOT\\SystemRoot'), 'System32'),
-    'the ambient PATH does not reach the child on Windows')
+  const source = fs.readFileSync(path.join(root, 'src/at-rest.ts'), 'utf8')
+  vm.runInContext(transpile(source + '\nexport { readRegistryAppPaths }'), context)
+  context.exports.readRegistryAppPaths()
+  assert.equal(call.file, path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
+  assert.equal(call.env.PATH, path.join(systemRoot, 'System32'))
+  assert.equal(call.env.PSModulePath, path.join(systemRoot, 'system32', 'WindowsPowerShell', 'v1.0', 'Modules'))
 })
 
 /**
@@ -580,6 +529,25 @@ test('a sign-in that answers 401 hands the turn to the next one in the list', as
  * off the chat path. What the TTL must not do is outlive the user's rescan:
  * the panel's rescan is exactly the moment the answer on disk has changed.
  */
+for (const source of ['Trae', 'Qoder']) test(`${source} a discovery read cannot repopulate the cache after rescan`, async () => {
+  const file = path.join(root, 'src', source === 'Trae' ? 'trae-discovery.ts' : 'qoder-credentials.ts')
+  const module = { exports: {} }
+  const context = vm.createContext({ module, exports: module.exports, require: createRequire(file), process, Buffer, URL })
+  vm.runInContext(transpile(fs.readFileSync(file, 'utf8')), context)
+  const result = label => ({ credentials: [{ label }], failures: [] })
+  let release, reads = 0
+  const older = new Promise(resolve => { release = resolve })
+  context['read' + source + 'Credentials'] = async () => ++reads === 1 ? older : result('current')
+  const discover = module.exports['discover' + source + 'Credentials']
+  const pending = discover()
+  module.exports['reset' + source + 'CredentialCache']()
+  assert.equal((await discover()).credentials[0].label, 'current')
+  release(result('older'))
+  await pending
+  assert.equal((await discover()).credentials[0].label, 'current')
+  assert.equal(reads, 2)
+})
+
 test('a discovery answer is reused inside its TTL and dropped by a rescan', async () => {
   const trae = require('../src/trae-discovery.ts')
   const qoder = require('../src/qoder-credentials.ts')
@@ -705,6 +673,7 @@ test('the collected check-in slots survive a restart and stay three days deep', 
   try {
     await plugin.onLoad()
     await startRegisteredService()
+    vm.runInContext('settings.sourceWorkbuddy = true', context)
     await plugin.onPanelInvoke('xd.runCheckinNow')
     const written = JSON.parse(fs.readFileSync(path.join(temporary, 'checkin-slots.json'), 'utf8'))
     assert.deepEqual(Object.keys(written).sort(), [dayKey(2), dayKey(1), dayKey(0)].sort(),
@@ -1060,7 +1029,7 @@ test('a Qoder frame whose choices is not a list is not forwarded as a chunk', ()
  * unwrap is the stubbed seam (the one that would need the installed app), so
  * the decipher and the cache are the real code.
  */
-test('a second Qoder read in one process still opens the sealed session', async () => {
+test('Qoder reads keep cached keys intact and follow a rotated wrapper with the same mtime', async () => {
   const { EventEmitter } = require('node:events')
   const { createCipheriv } = require('node:crypto')
   const { readQoderCredential, resetQoderCredentialCache } = require('../src/qoder-credentials.ts')
@@ -1070,7 +1039,7 @@ test('a second Qoder read in one process still opens the sealed session', async 
   process.env.APPDATA = temporary
   process.env.USERPROFILE = temporary
   process.env.HOME = temporary
-  const key = Buffer.alloc(32, 7)
+  let key = Buffer.alloc(32, 7)
   const nonce = Buffer.alloc(12, 3)
   const cipher = createCipheriv('aes-256-gcm', key, nonce)
   const sealed = Buffer.concat([
@@ -1109,6 +1078,8 @@ test('a second Qoder read in one process still opens the sealed session', async 
     fs.writeFileSync(local.path, JSON.stringify({
       os_crypt: { encrypted_key: Buffer.concat([Buffer.from('DPAPI'), Buffer.alloc(48)]).toString('base64') },
     }))
+    const stamp = new Date('2026-01-01T00:00:00Z')
+    fs.utimesSync(local.path, stamp, stamp)
     resetQoderCredentialCache()
     const group = candidates.filter((candidate) => candidate.appDir === auth.appDir)
     const first = await readQoderCredential(group)
@@ -1116,6 +1087,16 @@ test('a second Qoder read in one process still opens the sealed session', async 
     const second = await readQoderCredential(group)
     assert.equal(second.credential?.token, 'qoder-token',
       'the second read must open it too: the reader zeroes its own copy, not the cached key')
+    key = Buffer.alloc(32, 8)
+    const rotated = createCipheriv('aes-256-gcm', key, nonce)
+    fs.writeFileSync(auth.path, Buffer.concat([Buffer.from('v10'), nonce,
+      rotated.update(JSON.stringify({ token: 'rotated-token', user: { id: 'user-1' } })), rotated.final(), rotated.getAuthTag()]))
+    fs.writeFileSync(local.path, JSON.stringify({
+      os_crypt: { encrypted_key: Buffer.concat([Buffer.from('DPAPI'), Buffer.alloc(48, 1)]).toString('base64') },
+    }))
+    fs.utimesSync(local.path, stamp, stamp)
+    assert.equal((await readQoderCredential(group)).credential?.token, 'rotated-token',
+      'the wrapper bytes decide whether the key changed, even when the timestamp is unchanged')
   } finally {
     child.spawn = realSpawn
     for (const name of Object.keys(restore)) {
@@ -1399,31 +1380,6 @@ test('a Qoder claim that paid nothing carries no amount', () => {
   const paid = qoderNormalizeClaimResult({ data: { status: 'CLAIMED' } }, campaign)
   assert.equal(paid.claimed, true)
   assert.equal(paid.amount, 30, 'a claim that paid out names what it paid')
-})
-
-/**
- * A promo window that runs past midnight is promised only as far as the rule's
- * last day allows.
- *
- * The night window is 23:00 to 08:00, so on the rule's final day the hours
- * after midnight are outside it. The badge used to answer "free from 00:00"
- * for the whole last evening, which is wrong in both directions: the model IS
- * free from 23:00, and 00:00 is past the rule so it is not free then either.
- */
-test('a promo window is not promised past the rule\'s last day', () => {
-  const { promoStatusFor } = require('../src/promo.ts')
-  const model = { id: 'hy4-preview' }
-  const lastDay = { day: '2026-10-31', hour: 23 }
-  assert.deepEqual(promoStatusFor(model, lastDay, 'cn'), { kind: 'night', untilHour: 24 },
-    'on the last day the window is promised up to midnight, not past it')
-  assert.equal(promoStatusFor(model, { day: '2026-10-30', hour: 23 }, 'cn')?.untilHour, 8,
-    'the day before, the same window is promised in full')
-  assert.equal(promoStatusFor(model, { day: '2026-10-31', hour: 2 }, 'cn')?.untilHour, 8,
-    'and inside the rule\'s last day the window still ends before midnight')
-  assert.equal(promoStatusFor(model, { day: '2026-10-31', hour: 22 }, 'cn')?.kind, 'night-later',
-    'before the window opens on the last day it is still offered as opening later')
-  assert.equal(promoStatusFor(model, { day: '2026-11-01', hour: 2 }, 'cn'), undefined,
-    'past the rule there is no window at all')
 })
 
 /**
@@ -1971,8 +1927,14 @@ test('a check-in pass that starts after a stop still collects', async () => {
   assert.notEqual(moduleName, undefined, 'the check-in-time import must be present')
   const claims = { workbuddy: 0, travel: 0, qoder: 0, trae: 0, growth: 0 }
   const slots = new Set()
+  const regions = { workbuddy: ['cn'], qoder: ['cn'], trae: ['cn'] }
+  const logs = []
+  let pauses = 0
   const context = vm.createContext({
     AbortController,
+    activeRegions: () => regions.workbuddy,
+    activeQoderRegions: () => regions.qoder,
+    activeTraeRegions: () => regions.trae,
     GROWTH_AFTER_CHECKIN_MS: 0,
     checkinAbort: new AbortController(),
     checkinScope: { enterWith() {} },
@@ -1994,18 +1956,19 @@ test('a check-in pass that starts after a stop still collects', async () => {
       normaliseCheckinHours: (raw) => raw,
       CHECKIN_POLL_MS: 60000,
     },
-    saveCheckinSlots: () => { slots.add('2026-10-15T9') },
+    saveCheckinSlots: () => {},
     isolatedCheckinWorker: (work) => work,
     claimAllCheckins: async () => { claims.workbuddy += 1; return { claimed: 2, skipped: 0, failed: 0 } },
-    travelAllAccounts: async () => { claims.travel += 1; return { departed: 0, claimed: 0, adopted: 0 } },
+    travelAllAccounts: async () => { claims.travel += 1; return { departed: 0, claimed: 0, failed: 0, credit: 0 } },
     qoderCheckinAll: async () => { claims.qoder += 1; return { claimed: 1, skipped: 0, failed: 0 } },
     traeCheckinAll: async () => { claims.trae += 1; return { claimed: 1, skipped: 0, failed: 0 } },
-    checkinDelay: async () => {},
+    checkinDelay: async () => { pauses += 1 },
     claimAllGrowth: async () => { claims.growth += 1; return { streak: 0, credit: 0 } },
     scheduleRefresh: () => {},
-    log: () => {},
+    log: (...args) => logs.push(args),
     safeMessage: (error) => String(error),
   })
+  vm.runInContext(balanced(source, source.indexOf('function nextQoderRetryAt(')), context)
   vm.runInContext(modifier + balanced(source, from), context)
   // Aborted, exactly as a stop leaves it.
   context.checkinAbort.abort(new Error('the service stopped'))
@@ -2016,8 +1979,28 @@ test('a check-in pass that starts after a stop still collects', async () => {
   assert.equal(claims.trae, 1)
   assert.equal(claims.growth, 1, 'the growth pass runs after the accounts')
   assert.equal(answer.claimed, 2, 'the counts the workers returned must reach the answer')
+  assert.equal(logs.at(-1)[0], 'info')
+  assert.match(logs.at(-1)[1], /manual check-in accounts collected: 2/)
   assert.equal(context.checkinAbort.signal.aborted, false,
     'the pass must have re-armed the flag, or the next one inherits this stop')
+  for (const enabled of ['qoder', 'trae', 'none']) {
+    for (const source of Object.keys(regions)) regions[source] = source === enabled ? ['cn'] : []
+    for (const source of Object.keys(claims)) claims[source] = 0
+    slots.clear()
+    pauses = 0
+    const filtered = await context.runCheckinPass({ manual: true })
+    assert.equal(filtered.workbuddy, false)
+    assert.equal(claims.workbuddy + claims.travel + claims.growth, 0, 'inactive WorkBuddy must not start any worker')
+    assert.equal(claims.qoder, Number(enabled === 'qoder'))
+    assert.equal(claims.trae, Number(enabled === 'trae'))
+    assert.equal(slots.size, Number(enabled !== 'none'), 'a full pass records its slot whenever a source ran')
+    assert.equal(pauses, 0, 'a pass without growth has no growth delay')
+    assert.equal(filtered.qoder === undefined, enabled !== 'qoder')
+    assert.equal(filtered.trae === undefined, enabled !== 'trae')
+    slots.clear()
+    await context.runCheckinPass({ manual: true, only: enabled })
+    assert.equal(slots.size, 0, 'a source-only click leaves the full scheduled pass due')
+  }
 })
 
 /**
@@ -3320,7 +3303,7 @@ test('a WorkBuddy stream that fails mid-flight ends with a terminator', async ()
         controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
         return
       }
-      controller.error(new Error('Bearer eyJhbGciOi.real.token.value rejected'))
+      controller.error(new Error('Bearer sample.token.value rejected'))
     },
   })
   const client = {
@@ -3989,7 +3972,7 @@ test('a check-in-only probe keeps the cached balance and cannot satisfy a full r
     },
   }
   new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS', 'signInRefused', 'safeMessage',
-    balanced(source, start) + '\nmodule.exports = { accountProbe }',
+    'const loadGeneration = 0;\n' + balanced(source, start) + '\nmodule.exports = { accountProbe }',
   )(mod, mod.exports, core, probeCache, 60000, 15000, () => false, (error) => String(error?.message ?? error))
 
   try {
@@ -4050,7 +4033,7 @@ test('a failed balance read is retried before its cache window ends', async () =
   assert.ok(probeStart > 0, 'accountProbe is where it is expected')
   new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS',
     'signInRefused', 'safeMessage', 'regionEnabled', 'regionOf',
-    balanced(source, probeStart) + '\n' + grab('probesStale') + '\nmodule.exports = { accountProbe, probesStale }',
+    'const loadGeneration = 0;\n' + balanced(source, probeStart) + '\n' + grab('probesStale') + '\nmodule.exports = { accountProbe, probesStale }',
   )(mod, mod.exports, core, probeCache, 60000, 15000, () => false,
     (error) => String(error?.message ?? error), () => true, () => 'cn')
 
@@ -4146,7 +4129,7 @@ test('a probe invalidated by a claim does not write its pre-claim answer back', 
     },
   }
   new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'signInRefused', 'safeMessage',
-    balanced(source, start) + '\
+    'const loadGeneration = 0;\n' + balanced(source, start) + '\
 module.exports = { accountProbe }',
   )(mod, mod.exports, core, probeCache, 60000, () => false, (error) => String(error?.message ?? error))
 
@@ -4194,14 +4177,11 @@ module.exports = { accountProbe }',
     await creditsGate
     return { total: 11, packages: [] }
   }
-  core.client.fetchCheckinStatus = async () => ({ active: true, todayCheckedIn: true })
+  core.client.fetchCheckinStatus = async () => { throw new Error('old check-in failure') }
   const full = mod.exports.accountProbe(account, true, false)
   await creditsBegan
-  probeCache.set(account.id, {
-    atMs: Date.now(),
-    checkinOnly: true,
-    value: { checkinError: 'old check-in failure' },
-  })
+  await mod.exports.accountProbe(account, true, true)
+  core.client.fetchCheckinStatus = async () => ({ active: true, todayCheckedIn: true })
   releaseCredits()
   const merged = await full
   assert.equal(merged.checkin.todayCheckedIn, true, 'the full read check-in is the newer answer')
@@ -4640,6 +4620,8 @@ test('a service stop releases the refresh slot', async () => {
   }
   const stopped = []
   const context = vm.createContext({
+    probeCache: new Map(),
+    deviceLogins: new Map(),
     console,
     ...state,
     core: { pool: { clear: () => stopped.push('pool') } },
@@ -4721,9 +4703,10 @@ test('source check-in batches preserve the first safe refusal without retrying a
     : { outcome: 'failed', reason: (credential.label === 'one' ? 'first' : 'second') + ' refusal: HTTP 403 Bearer secret-' + credential.label + '-credential', retry: false }
   const context = vm.createContext({
     safeMessage,
+    activeRegions: () => [],
     activeQoderRegions: () => ['cn'],
     activeTraeRegions: () => ['cn'],
-    discoverQoderCredentials: async () => ({ credentials, failures: [] }),
+    discoverQoderCredentials: async () => ({ credentials, failures: [{ region: 'global', reason: 'no-key' }] }),
     discoverTraeCredentials: async () => ({ credentials, failures: [] }),
     traeStorageCandidates: () => [],
     traeRegionOfCredential: (credential) => credential.region,
@@ -4762,6 +4745,7 @@ test('source check-in batches preserve the first safe refusal without retrying a
     saveCheckinSlots() {},
     GROWTH_AFTER_CHECKIN_MS: 0,
   })
+  vm.runInContext(balanced(source, source.indexOf('function nextQoderRetryAt(')), context)
   for (const name of ['qoderCheckinAll', 'traeCheckinAll', 'runCheckinPass', 'autoCheckinTick']) {
     vm.runInContext('async ' + balanced(source, source.indexOf('function ' + name + '(')), context)
   }
@@ -4770,6 +4754,19 @@ test('source check-in batches preserve the first safe refusal without retrying a
     assert.equal(counts.failed, 2)
     assert.equal(counts.claimed, 1, 'one refusal must not prevent a later account from collecting')
     assert.equal(counts.reason, 'first refusal: HTTP 403 Bearer [redacted]', 'the panel needs the first refusal, without its echoed credential')
+    const stopping = new AbortController()
+    const claimed = []
+    context.currentCheckinSignal = () => stopping.signal
+    context.checkinDelay = async () => stopping.abort()
+    context[kind + 'ClaimFor'] = async credential => {
+      claimed.push(credential.label)
+      return { outcome: 'claimed' }
+    }
+    await context[kind + 'CheckinAll']()
+    assert.deepEqual(claimed, ['one'], `${kind} must stop when its account delay is cancelled`)
+    context.currentCheckinSignal = () => ({ aborted: false })
+    context.checkinDelay = async () => {}
+    context[kind + 'ClaimFor'] = claim
   }
   const answer = await context.runCheckinPass({ only: 'qoder', manual: true })
   assert.equal(answer.error, undefined)
@@ -4799,6 +4796,8 @@ test('a Qoder business refusal is redacted before the single-account answer', as
   }
   const context = vm.createContext({
     ...qoder,
+    loadGeneration: 0,
+    regionEnabled: () => true,
     QoderUpstreamClient: QoderClient,
     sourceCredentialExpired: () => false,
     qoderClientCredential: (credential) => credential,

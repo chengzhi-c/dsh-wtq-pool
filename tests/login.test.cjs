@@ -404,12 +404,9 @@ test('only the current login writes credentials and returns the panel document',
   const { createRequire } = require('node:module')
   const { createServer } = require('node:http')
   const directory = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-login-doc-'))
-  // The repointed auth file sits in the plugin's own sign-in directory, which
-  // is the directory a panel login writes into: one walk reads both, and the
-  // machine's real auth directory is never opened.
   const own = path.join(directory, 'signins')
-  fs.mkdirSync(own, { recursive: true })
-  const authFile = path.join(own, 'workbuddy-desktop.info')
+  const authFile = path.join(directory, 'desktop', 'workbuddy-desktop.info')
+  fs.mkdirSync(path.dirname(authFile))
   fs.writeFileSync(authFile, JSON.stringify({
     auth: {
       accessToken: 'fixture-token', refreshToken: 'fixture-refresh',
@@ -489,9 +486,8 @@ test('only the current login writes credentials and returns the panel document',
     const replied = await plugin.onPanelInvoke('xd.pollLogin', { realm: 'cn' })
     assert.equal(replied.status, 'ok')
     assert.equal(replied.nickname, 'Added From Panel')
-    assert.ok(replied.state !== undefined && typeof replied.state === 'object'
-      && Array.isArray(replied.state.accounts),
-      'the answer must carry the document the panel adopts, or the list keeps painting the pool it already had')
+    assert.ok(replied.state.accounts.some((account) => account.label === 'Added From Panel'),
+      'the panel login is visible alongside the desktop sign-in override')
     assert.ok(fs.existsSync(path.join(own, 'workbuddy-panel-90000000021.info')),
       'the sign-in landed in the plugin directory, not the app\'s')
     const state = await plugin.onPanelInvoke('xd.state')

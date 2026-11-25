@@ -1,167 +1,66 @@
-/**
- * The growth card's freshness rule.
- *
- * The card used to hold its read in the renderer only, so a repaint or a reload
- * turned a refresh into "go press Read state". These cases pin the rule that
- * replaced it: a read is stamped, a stored one is painted, and a run since the
- * read makes it stale.
- */
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const vm = require('node:vm')
+const ts = require('typescript')
 
-const root = path.join(__dirname, '..')
-
-/** Lift the panel's growth freshness helpers, as the other panel cases do. */
+const file = ts.createSourceFile('panel.js', fs.readFileSync(path.join(__dirname, '../renderer/panel.js'), 'utf8'), ts.ScriptTarget.Latest, true)
+const helpers = file.statements.filter(node =>
+  ts.isFunctionDeclaration(node) && ['growthLastRun', 'growthStale', 'growthStateText', 'selectTab'].includes(node.name.text)
+  || ts.isVariableStatement(node) && node.declarationList.declarations.some(value => value.name.getText(file) === 'GROWTH_STALE_MS'))
+  .map(node => node.getText(file)).join('\n')
 function loadFreshness() {
-  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  const lift = (name) => {
-    const from = source.indexOf(`function ${name}(`)
-    assert.notEqual(from, -1, `${name} must exist in the panel`)
-    let depth = 0
-    let index = source.indexOf('{', from)
-    for (; index < source.length; index += 1) {
-      if (source[index] === '{') depth += 1
-      else if (source[index] === '}') { depth -= 1; if (depth === 0) break }
-    }
-    return source.slice(from, index + 1)
-  }
-  const stale = source.match(/var GROWTH_STALE_MS = [^\n]+/)
-  assert.ok(stale, 'the throttle must be a named constant')
-  const context = vm.createContext({
-    state: null,
-    growthState: null,
-    Date,
-    Number,
-    Boolean,
-    t: (key) => key,
-    num: (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback),
-    console,
-  })
-  vm.runInContext(stale[0], context)
-  vm.runInContext(lift('growthLastRun'), context)
-  vm.runInContext(lift('growthStale'), context)
-  vm.runInContext(lift('growthStateText'), context)
+  const context = vm.createContext({ state: null, growthState: null, Date, t: key => key,
+    num: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback })
+  vm.runInContext(helpers, context)
   return context
 }
+const ROWS = { accounts: 1, failed: 0, rows: [{ id: 'a1', tiers: 1, makeupCards: 2, lottery: 0 }] }
 
-const ROWS = { accounts: 1, failed: 0, rows: [{ id: 'a1', label: 'One', region: 'cn', days: 12, tiers: 1, makeupCards: 2, lottery: 0, tierList: [] }] }
-
-test('no read at all is stale', () => {
-  const context = loadFreshness()
-  assert.equal(context.growthStale(), true)
-  assert.equal(context.growthStateText(), 'growth.stateNone')
-})
-
-test('a read with no timestamp is treated as stale, not as current', () => {
-  const context = loadFreshness()
-  // The card cannot tell how old it is, so it refreshes rather than trusting it.
-  context.growthState = { ...ROWS }
-  assert.equal(context.growthStale(), true)
-})
-
-test('a fresh read is painted and not refreshed', () => {
-  const context = loadFreshness()
-  context.growthState = { ...ROWS, readAt: Date.now() }
-  assert.equal(context.growthStale(), false, 'a read taken now is current')
-  assert.match(context.growthStateText(), /growth\.stateSummary/,
-    'the card shows its figures instead of asking for a read')
-})
-
-test('a read older than the throttle is refreshed', () => {
-  const context = loadFreshness()
-  context.growthState = { ...ROWS, readAt: Date.now() - context.GROWTH_STALE_MS - 1000 }
-  assert.equal(context.growthStale(), true)
-})
-
-test('a run since the read makes it stale even when it is new', () => {
-  const context = loadFreshness()
-  const readAt = Date.now()
-  context.growthState = { ...ROWS, readAt }
-  // The run spent what the rows describe, so the figures no longer hold.
-  context.state = { growth: { last: { at: new Date(readAt + 1000).toISOString() } } }
-  assert.equal(context.growthStale(), true)
-  assert.equal(context.growthStateText(), 'growth.stateStale')
-})
-
-test('a run from before the read leaves it current', () => {
-  const context = loadFreshness()
-  const readAt = Date.now()
-  context.growthState = { ...ROWS, readAt }
-  context.state = { growth: { last: { at: new Date(readAt - 60_000).toISOString() } } }
-  assert.equal(context.growthStale(), false)
-})
-
-test('the later of a manual run and a scheduled pass is the one shown', () => {
-  const context = loadFreshness()
-  const manualAt = Date.parse('2026-10-30T18:33:00.000Z')
-  const scheduledAt = Date.parse('2026-10-30T19:00:00.000Z')
-  context.state = {
-    growth: { last: { at: new Date(manualAt).toISOString(), detail: { gift: 1 } } },
-    autoCheckin: { last: { at: new Date(scheduledAt).toISOString(), growth: { detail: { makeup: 2 } } } },
+test('growth freshness follows its timestamp and the latest manual or scheduled mutation', () => {
+  const context = loadFreshness(), now = Date.now(), at = delta => new Date(now + delta).toISOString()
+  const fresh = { ...ROWS, readAt: now }
+  for (const [name, read, state, stale, text] of [
+    ['missing', null, null, true, 'growth.stateNone'],
+    ['undated', ROWS, null, true, 'growth.stateSummary'],
+    ['fresh', fresh, null, false, 'growth.stateSummary'],
+    ['expired', { ...fresh, readAt: now - context.GROWTH_STALE_MS - 1000 }, null, true, 'growth.stateSummary'],
+    ['new manual run', fresh, { growth: { last: { at: at(1000) } } }, true, 'growth.stateStale'],
+    ['old manual run', fresh, { growth: { last: { at: at(-60000) } } }, false, 'growth.stateSummary'],
+    ['new scheduled run', fresh, { autoCheckin: { last: { at: at(1000), growth: { claimed: 1 } } } }, true, 'growth.stateStale'],
+    ['future timestamp', { ...fresh, readAt: now + 3600000 }, null, true, 'growth.stateSummary'],
+  ]) {
+    Object.assign(context, { growthState: read, state })
+    assert.equal(context.growthStale(), stale, name)
+    assert.equal(context.growthStateText(), text, name)
   }
-  assert.equal(context.growthLastRun().detail.makeup, 2,
-    'a scheduled pass that finished later must not be hidden behind an older manual run')
-  context.state.autoCheckin.last.at = new Date(manualAt - 1000).toISOString()
-  assert.equal(context.growthLastRun().detail.gift, 1,
-    'and the manual run still wins when it is the later one')
 })
 
-/**
- * The scheduled check-in's growth half counts as a run.
- *
- * The timer records what it did under `autoCheckin.last.growth`, not under
- * `growth.last`, so reading only the latter kept the figures from before the
- * pass that had just spent them - and the card said so with a straight face for
- * the whole throttle window.
- */
-test('a scheduled pass that ran growth makes the read stale', () => {
+test('the later of a manual run and a scheduled pass is shown', () => {
   const context = loadFreshness()
-  const readAt = Date.now()
-  context.growthState = { ...ROWS, readAt }
   context.state = {
-    autoCheckin: { last: { at: new Date(readAt + 1000).toISOString(), growth: { claimed: 1, note: [] } } },
+    growth: { last: { at: '2026-10-30T18:33:00Z', detail: { streak: 1 } } },
+    autoCheckin: { last: { at: '2026-10-30T19:00:00Z', growth: { detail: { makeup: 2 } } } },
   }
-  assert.equal(context.growthStale(), true, 'the pass spent the cards the rows still show')
+  assert.equal(context.growthLastRun().detail.makeup, 2)
+  context.state.autoCheckin.last.at = '2026-10-30T18:32:00Z'
+  assert.equal(context.growthLastRun().detail.streak, 1)
 })
 
-/**
- * A timestamp in the future is a clock that moved, not a fresh read.
- *
- * `Date.now() - readAt` is negative for any future stamp, so it never crossed
- * the throttle and a stale figure stayed "current" forever.
- */
-test('a read stamped in the future is treated as stale', () => {
-  const context = loadFreshness()
-  context.growthState = { ...ROWS, readAt: Date.now() + 60 * 60 * 1000 }
-  assert.equal(context.growthStale(), true)
-})
-
-test('entering the growth tab re-reads a stale read, and waits out a running pass', () => {
-  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  const at = source.indexOf('function selectTab(')
-  assert.notEqual(at, -1, 'the tab switch must exist')
+test('entering the growth tab refreshes a stale read and waits for running work', () => {
   const context = loadFreshness()
   let reads = 0
-  Object.assign(context, {
-    $: (id) => id,
-    show() {},
-    document: { querySelectorAll: () => [] },
-    pageScrollTo() {},
-    readGrowth: () => { reads += 1 },
-  })
-  vm.runInContext(source.slice(at, source.indexOf('\n}', at) + 2), context)
-  const cases = [
+  Object.assign(context, { $: id => id, show() {}, document: { querySelectorAll: () => [] },
+    pageScrollTo() {}, readGrowth: () => { reads += 1 } })
+  for (const { label, tab = 'growth', want, ...state } of [
     { label: 'stale read', want: 1 },
     { label: 'fresh read', growthState: { ...ROWS, readAt: Date.now() }, want: 0 },
     { label: 'running pass', state: { growth: { running: true } }, want: 0 },
     { label: 'busy action', busy: 'checkin', want: 0 },
     { label: 'pending read', growthReading: true, want: 0 },
     { label: 'another tab', tab: 'pool', want: 0 },
-  ]
-  for (const { label, tab = 'growth', want, ...state } of cases) {
+  ]) {
     reads = 0
     Object.assign(context, { state: null, growthState: null, busy: null, growthReading: false }, state)
     context.selectTab(tab)

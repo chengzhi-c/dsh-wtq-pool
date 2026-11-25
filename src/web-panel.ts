@@ -7,11 +7,9 @@
  * the page itself needs no knowledge of the host it is embedded in.
  *
  * Every route is registered through `ctx.webServer`, and every registration is
- * released by the caller's effect. Route owners guard their own requests: this
- * host's server carries no authentication or origin policy of its own, so the
- * peer, Host and origin checks below are the whole of the panel's access
- * control, and the document itself carries the content policy that keeps a page
- * on another site from framing the panel's controls.
+ * released by the caller's effect. The routes inherit the host's authentication
+ * policy and restrict access to same-origin loopback requests. The document's
+ * content policy also keeps another site from framing the panel's controls.
  *
  * @module dsh-wtq-pool/web-panel
  */
@@ -70,9 +68,11 @@ const CHANNELS = new Set([
   'xd.sourceDistribution',
   'xd.startLogin',
   'xd.pollLogin',
-  // The growth centre's card: one read, one run.
+  // Growth centre status, account details and explicit reward actions.
   'xd.growthState',
   'xd.growthRun',
+  'xd.growthDetails',
+  'xd.growthAction',
   // The token keep-alive's switch and by-hand run.
   'xd.keepAlive',
 ])
@@ -163,10 +163,8 @@ function askerIsThisOrigin(req: IncomingMessage): boolean {
 /**
  * Answer one panel route behind the guards every route answers with.
  *
- * The four checks are the whole of the panel's access control - this host's
- * server carries no authentication or origin policy of its own - and each route
- * owes the same four in the same order: the peer, the Host the asker named, the
- * method, and the origin. The loopback bind and the peer check between them
+ * Each route checks the peer, Host header, method, and origin after the host's
+ * admission. The loopback bind and the peer check between them
  * admit a DNS-rebinding page, because a browser aimed at
  * `http://127.0.0.1:<port>` sends the Host that page chose, and only the Host
  * check refuses it. A refusal is answered here and returns, so `handle` runs

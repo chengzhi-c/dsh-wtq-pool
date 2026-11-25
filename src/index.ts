@@ -56,7 +56,9 @@ const REQUEST_IMAGE_BUDGETS = {
   maxRequestImageBytes: 20_971_520,
   maxRequestImages: 50,
   imageOffloadCountQuantum: 10,
+  requestImageBudgetCount: 20,
   requestImagePixelBudget: 4_194_304,
+  // DSH 0.2.0/0.2.2 use this field; 0.2.3 derives its cap from the shared budget.
   requestImageMaxBytes: 1_048_576,
 } as const
 
@@ -148,26 +150,26 @@ export interface Config {
 let activationToken = 0
 
 export const Config: z<Config> = z.object({
-  enabled: z.boolean().default(true).description('Serve this pool at all').volatile(),
-  sourceWorkbuddy: z.boolean().default(true).description('Merge the WorkBuddy desktop sign-ins').volatile(),
-  sourceTrae: z.boolean().default(true).description('Merge the Trae desktop sign-ins').volatile(),
-  sourceQoder: z.boolean().default(true).description('Merge the Qoder desktop sign-ins').volatile(),
-  authFile: z.string().description("WorkBuddy desktop auth file (defaults to the app's own location)").volatile(),
+  enabled: z.boolean().default(true).description('Enable this plugin').volatile(),
+  sourceWorkbuddy: z.boolean().default(true).description('Include WorkBuddy desktop sign-ins').volatile(),
+  sourceTrae: z.boolean().default(true).description('Include Trae desktop sign-ins').volatile(),
+  sourceQoder: z.boolean().default(true).description('Include Qoder desktop sign-ins').volatile(),
+  authFile: z.string().description('WorkBuddy sign-in file path; defaults to auto-discovery').volatile(),
   autoCheckin: z.object({
     enabled: z.boolean().default(false),
     hours: z.array(z.number()).default([]),
-  }).description('Daily check-in across every discovered sign-in').volatile(),
+  }).description('Automatically claim daily check-in rewards').volatile(),
   cooldownSeconds: z.number().default(60).description('Rate-limit cooldown per account, in seconds').volatile(),
-  creditReserves: z.dict(z.number()).default({}).description('Per-account credit floor, keyed by account id').volatile(),
-  disabledAccountIds: z.array(z.string()).default([]).description('Account ids the pool must never pick').volatile(),
-  disabledRegions: z.array(z.string()).default([]).description('Regions parked on their own, as source:region').volatile(),
-  distribution: z.union(['priority', 'round-robin', 'expiry', 'sticky']).default('priority').description('How the WorkBuddy pool spreads requests').volatile(),
-  modelSelection: z.any().description('Per-gateway model selection').volatile(),
-  preferredAccountIds: z.any().description('Picked WorkBuddy account per region').volatile(),
-  preferredSourceAccounts: z.any().description('Picked Trae/Qoder account per region').volatile(),
-  removedAccounts: z.any().description('Accounts taken out of the pool; their label and region are kept so the panel can restore them').volatile(),
+  creditReserves: z.dict(z.number()).default({}).description('Minimum credit balance per account').volatile(),
+  disabledAccountIds: z.array(z.string()).default([]).description('Account ids excluded from the pool').volatile(),
+  disabledRegions: z.array(z.string()).default([]).description('Disabled source regions in source:region form').volatile(),
+  distribution: z.union(['priority', 'round-robin', 'expiry', 'sticky']).default('priority').description('WorkBuddy account distribution').volatile(),
+  modelSelection: z.any().description('Published models by gateway').volatile(),
+  preferredAccountIds: z.any().description('Preferred WorkBuddy account by region').volatile(),
+  preferredSourceAccounts: z.any().description('Preferred Trae or Qoder account by region').volatile(),
+  removedAccounts: z.any().description('Removed accounts and their display information').volatile(),
   showComposerPoints: z.boolean().default(false).description('Show the active account credits beside the composer').volatile(),
-  sourceDistributions: z.any().description('How each Trae/Qoder region spreads requests').volatile(),
+  sourceDistributions: z.any().description('Trae and Qoder account distribution by region').volatile(),
 }) as unknown as z<Config>
 
 /** Peel one volatile reference, if the running line wrapped it. */
@@ -189,15 +191,7 @@ function unwrapVolatileDeep<T>(value: T): T {
   const peeled = unwrapVolatile(value)
   if (Array.isArray(peeled)) return peeled.map((entry) => unwrapVolatileDeep(entry)) as T
   if (peeled !== null && typeof peeled === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [key, entry] of Object.entries(peeled)) {
-      // `__proto__` is an own key of a JSON-parsed document but assigns the
-      // prototype on a plain object, so a hand-edited settings file could plant
-      // one and shadow every field of the config this returns.
-      if (key === '__proto__') continue
-      out[key] = unwrapVolatileDeep(entry)
-    }
-    return out as T
+    return Object.fromEntries(Object.entries(peeled).map(([key, entry]) => [key, unwrapVolatileDeep(entry)])) as T
   }
   return peeled
 }
@@ -291,10 +285,9 @@ function toPiModel(
     : (() => {
         const out: Record<string, string | null> = {}
         for (const level of THINKING_LEVELS) out[level] = advertised.includes(level) ? level : null
-        // `off` is the one level whose *absence* means supported: the gateway
-        // switches thinking off by sending no parameter at all, so the key is
-        // left out when the row offers it and pinned to null when it does not.
         if (!declared.includes('off')) out['off'] = null
+        // WorkBuddy and Qoder need an explicit switch to disable reasoning.
+        else if (!providerId.startsWith('wtqpool-trae-')) out['off'] = 'off'
         return out
       })()
   return {
@@ -374,7 +367,6 @@ function withDelegateShape(api: ProviderStreams): ProviderStreams {
  */
 function buildAdapter(descriptors: ProviderDescriptor[], ctx: ClientContext): {
   adapter: PiAiAdapter
-  profiles: Map<string, ResolvedPiAiProviderProfile>
   providerIds: string[]
 } {
   const profiles = new Map<string, ResolvedPiAiProviderProfile>()
@@ -451,7 +443,7 @@ function buildAdapter(descriptors: ProviderDescriptor[], ctx: ClientContext): {
     return { model: withModelDefault(call.model), stream: options => call.stream(withOptionsDefault(options)) }
   }
   adapter.stream = options => stream(withOptionsDefault(options))
-  return { adapter, profiles, providerIds }
+  return { adapter, providerIds }
 }
 
 /** A stable rendering of what a registration would serve, to skip no-op writes. */
@@ -569,7 +561,7 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
     if (!echoExpected) writesStarted -= 1
     writesInFlight -= 1
     if (writesInFlight === 0) {
-      if (droppedPushes > writesStarted) {
+      if (droppedPushes > writesStarted && !stopped && token === activationToken) {
         // More pushes than this plugin's own echoes: at least one was a real
         // edit from the host's settings UI, and the live document already
         // carries it. Delivered to every subscriber, once.
@@ -596,6 +588,7 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
     onSettingsChanged: (handler) => {
       settingsHandlers.add(handler)
       const listener = (): void => {
+        if (stopped || token !== activationToken) return
         // The echo of this plugin's own write, or an edit that raced it: the
         // writer's accounting tells the two apart once the writes settle.
         if (writesInFlight > 0) {

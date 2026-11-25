@@ -190,6 +190,11 @@ test('a host edit that raced a local save is re-read, not dropped', async () => 
     const current = host.readSettings()
     assert.equal(current.showComposerPoints, true, 'the local save must survive the host event')
     assert.equal(current.cooldownSeconds, 120, 'the host edit that raced the save must land too')
+    for (const patch of [{ disabledRegions: ['workbuddy:cn'] }, { enabled: false }]) {
+      host.read('growthRead = { rows: [] }')
+      await host.internals.onHostSettingsChanged({ ...host.readSettings(), ...patch })
+      assert.equal(host.read('growthRead'), null, 'host scope changes invalidate the growth read')
+    }
   } finally {
     await host.stop()
     host.cleanup()

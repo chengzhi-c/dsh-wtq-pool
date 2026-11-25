@@ -32,12 +32,12 @@ export const composerZh: Record<string, string> = {
   'composer.account': '账号',
   'composer.balance': '积分',
   'composer.switching': '切换中…',
-  'composer.click': '点击切换账号',
+  'composer.click': '点击后可以更换账号',
   'composer.refresh': '刷新积分',
   'composer.refreshing': '正在刷新…',
-  'composer.refused': '这个账号无法切换，刷新后重试',
-  'composer.saved': '已设为优先；积分面板暂不可用，恢复后自动生效',
-  'composer.unavailable': '已设为优先，但该账号现在不能服务（冷却或已停用），恢复后自动生效',
+  'composer.refused': '无法使用此账号。请刷新后重试。',
+  'composer.saved': '已设为优先账号。积分面板恢复后自动生效。',
+  'composer.unavailable': '账号已设为优先，但当前不可用（冷却或已停用）。恢复后自动生效。',
   'composer.planQuota': '套餐',
   'composer.addOnQuota': '资源包',
   'composer.never': '不过期',
@@ -50,12 +50,12 @@ export const composerEn: Record<string, string> = {
   'composer.account': 'Account',
   'composer.balance': 'Credits',
   'composer.switching': 'Switching…',
-  'composer.click': 'Click to switch account',
+  'composer.click': 'Click to change accounts',
   'composer.refresh': 'Refresh credits',
   'composer.refreshing': 'Refreshing…',
-  'composer.refused': 'That account cannot be switched; refresh and try again',
-  'composer.saved': 'Set as preferred; the credits panel is unavailable right now and it takes over once it recovers',
-  'composer.unavailable': 'Set as preferred, but that account cannot serve right now (cooling or switched off); it takes over once it recovers',
+  'composer.refused': 'This account cannot be used. Refresh and try again.',
+  'composer.saved': 'Set as the preferred account. It will take effect when the credits panel recovers.',
+  'composer.unavailable': 'Set as the preferred account, but it is currently unavailable (cooling down or disabled). It will take effect when available.',
   'composer.planQuota': 'Plan',
   'composer.addOnQuota': 'Add-on',
   'composer.never': 'never expires',
@@ -382,6 +382,7 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
     setPoints(null)
     let stopped = false
     let timer = 0
+    let request = 0
     let startedAt = Date.now()
     // Re-armed rather than fixed-interval: the readout asks again quickly while
     // a balance of ours is still unread, and slowly once it has one - or once
@@ -395,9 +396,10 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
       timer = window.setTimeout(pull, settled || !warming ? REFRESH_INTERVAL_MS : WARMUP_INTERVAL_MS)
     }
     const pull = (): void => {
+      const current = ++request
       invoke('xd.composerPoints', { provider, model })
         .then((next) => {
-          if (stopped) return
+          if (stopped || current !== request) return
           // The chip is switched off in the panel: `show: false` alone cannot
           // say that, and the readout renders nothing while it stays off. Keep
           // the slow poll, though: the panel can switch it back on without a
@@ -413,7 +415,7 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
           schedule(next)
         })
         .catch(() => {
-          if (stopped) return
+          if (stopped || current !== request) return
           setPoints(null)
           schedule(null)
         })

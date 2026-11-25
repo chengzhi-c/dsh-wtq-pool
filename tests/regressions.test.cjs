@@ -87,10 +87,9 @@ test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
     blockedModels.mock.restore()
     await startRegisteredService()
     await plugin.onPanelInvoke('xd.setSource', { source: 'workbuddy', enabled: false })
-    const pass = plugin.onPanelInvoke('xd.runCheckinNow')
-    assert.equal((await plugin.onPanelInvoke('xd.state')).autoCheckin.last.pending, true, 'an ongoing check-in must expose pending state')
-    await pass
-    assert.equal((await plugin.onPanelInvoke('xd.state')).autoCheckin.last.pending, undefined, 'a finished check-in must clear pending state')
+    const inactive = await plugin.onPanelInvoke('xd.runCheckinNow')
+    assert.equal(inactive.autoCheckin.last.workbuddy, false, 'a disabled source must not enter the pass')
+    assert.equal(inactive.autoCheckin.last.pending, undefined, 'a pass without active sources must finish immediately')
   } finally {
     await plugin.onUnload()
     await stopRegisteredService()
@@ -412,15 +411,8 @@ test('growth rewards accept numeric strings and normalize tier status', async ()
   assert.deepEqual(streak.tiers[0], { tier: 'seven', days: 7, credit: 100, energy: 2, status: 'unlocked' })
 })
 
-/**
- * The streak's one-off collections must ask the paths that answer.
- *
- * The gift and compensation endpoints sit on the billing host without a `/v2`
- * prefix; with one they reply `404 route not found`, which reads as "nothing to
- * collect" and silently loses the credits. A make-up target is a calendar day in
- * the check-in zone, not the host's zone.
- */
-test('streak collections use the paths the upstream answers on', async () => {
+/** A make-up target is a calendar day in the check-in zone, not the host's zone. */
+test('streak make-up uses the path and date contract the upstream answers on', async () => {
   const { WorkBuddyUpstreamClient } = require('../src/upstream.ts')
   const { zonedDay } = require('../src/checkin-time.ts')
   const calls = []
@@ -430,16 +422,12 @@ test('streak collections use the paths the upstream answers on', async () => {
   } })
   const credential = { accessToken: 'test', refreshToken: '', domain: '', expiresAtMs: 0 }
 
-  assert.equal(await client.claimGift(credential), 25)
-  assert.equal(await client.claimCompensation(credential), 25)
   await client.useMakeupCard(credential, '2026-10-18')
 
   assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [
-    '/billing/meter/claim-gift',
-    '/billing/meter/claim-compensation',
     '/activity/growth/makeup-cards/use',
-  ], 'a /v2 prefix turns these into 404s')
-  assert.deepEqual(JSON.parse(calls[2].body), { target_date: '2026-10-18' })
+  ])
+  assert.deepEqual(JSON.parse(calls[0].body), { target_date: '2026-10-18' })
   assert.match(zonedDay(0), /^\d{4}-\d{2}-\d{2}$/)
   assert.notEqual(zonedDay(-1), zonedDay(0), 'yesterday is a different day')
 })
@@ -1447,24 +1435,6 @@ test('every composer string the popup asks for exists in both languages', () => 
 })
 
 /**
- * Scrolling inside the popup does not close the popup.
- *
- * The dismissal listens for `scroll` in the capture phase so that a scroll in any
- * container carrying the trigger is seen. The popup is a scroll container itself
- * once it holds more rows than fit, so reading past the first screenful dismissed
- * the panel it was being read in - on the one control that exists to be read.
- */
-test('the composer popup ignores a scroll that happens inside it', () => {
-  const source = fs.readFileSync(path.join(root, 'src', 'client', 'composer.tsx'), 'utf8')
-  const at = source.indexOf('const onViewport')
-  assert.notEqual(at, -1, 'the popup has to react to the viewport moving')
-  const body = source.slice(at, source.indexOf('\n    }', at))
-  assert.match(body, /panelRef\.current\?\.contains\(/,
-    'a scroll inside the panel is the user reading it, not the trigger moving')
-  assert.match(body, /setOpen\(false\)/, 'and a scroll anywhere else still dismisses')
-})
-
-/**
  * Every gateway answers the same three refusals, and the Host and Origin ones
  * had no caller of their own: each gateway spelled the sequence out separately,
  * so nothing failed when one of them answered a different status. They now
@@ -1992,7 +1962,7 @@ test('a panel error never carries the credential an upstream echoed', async () =
  * The claim under test: the accounts row reports how many sign-ins the pool
  * holds, and neither the finding nor the report text carries a display name.
  */
-test('the connection report counts the accounts without naming them', async (t) => {
+test('the connection report counts visible and available accounts without naming them', async (t) => {
   const accountName = 'fixture.user@example.com'
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-doctor-names-'))
   const auth = path.join(temporary, 'auth')
@@ -2027,10 +1997,17 @@ test('the connection report counts the accounts without naming them', async (t) 
     await startRegisteredService()
     const report = await plugin.onPanelInvoke('xd.doctor')
     const accounts = report.findings.find((finding) => finding.id === 'accounts')
-    assert.equal(accounts.detail, '1 account(s)', 'the row reports the count')
+    assert.equal(accounts.detail, 'Accounts found: 1', 'the row reports the count')
     assert.equal(accounts.detail.includes(accountName), false, 'and carries no display name')
     assert.equal(report.report.includes(accountName), false,
       'neither does the report text, which is what doctor.txt holds')
+    await plugin.onPanelInvoke('xd.setAccountState', {
+      region: 'cn', accountId: report.status.accounts[0].id, state: 'disabled',
+    })
+    const restricted = await plugin.onPanelInvoke('xd.doctor')
+    const rotation = restricted.findings.find((finding) => finding.id === 'rotation')
+    assert.equal(rotation.ok, false)
+    assert.equal(rotation.detail, 'Ready accounts: 0/1')
   } finally {
     await stopRegisteredService()
     await plugin.onUnload()

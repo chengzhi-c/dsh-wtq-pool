@@ -7,7 +7,7 @@
  */
 import { execFile, spawn } from 'node:child_process'
 import { pbkdf2Sync } from 'node:crypto'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { QoderRegion, QoderStorageCandidate } from './qoder-discovery'
 import { decryptQoderOscrypt, decryptQoderOscryptMac, qoderStorageCandidates } from './qoder-discovery'
@@ -39,10 +39,10 @@ const MACHINE_ID_NAMES: readonly string[] = ['auth.machine-id', 'machineid', 'ma
  * Unwrapped OSCrypt keys, keyed on the `Local State` path they came from.
  *
  * Unwrapping costs a PowerShell spawn, so the result is kept for the life of
- * the process and invalidated by the file's mtime: a desktop re-login that
+ * the process and invalidated by the wrapped key: a desktop re-login that
  * rotates the key changes the file, an ordinary chat request changes nothing.
  */
-const oscryptKeyCache = new Map<string, { mtimeMs: number; key: Buffer }>()
+const oscryptKeyCache = new Map<string, { encoded: string; key: Buffer }>()
 
 /** The OSCrypt blob length prefix Chromium writes before the DPAPI payload. */
 const DPAPI_PREFIX = 'DPAPI'
@@ -125,18 +125,10 @@ export async function unwrapQoderOscryptKey(
     }
     const payload = blob.subarray(DPAPI_PREFIX.length)
     if (payload.length === 0) throw new QoderKeyError('invalid', 'Qoder encrypted_key is empty')
-    // The unwrapped key is process-stable, and unwrapping it costs a PowerShell
-    // spawn (a C# compile plus DPAPI) on every call. Cached per Local State
-    // file, keyed on its mtime, so a desktop re-login that rotates the key is
-    // still picked up while an ordinary chat request pays nothing. Every hand
-    // out is a copy: the reader zeroes the buffer it was given, and zeroing the
-    // cached one left every later read decrypting with an empty key.
-    let mtimeMs = 0
-    try {
-      mtimeMs = (await stat(localStatePath)).mtimeMs
-    } catch { /* an unstatable file is treated as stale */ }
+    // Compare the wrapper already read: a file rotation can preserve mtime or
+    // race the read. Return a copy because the caller zeroes its buffer.
     const cached = oscryptKeyCache.get(localStatePath)
-    if (cached !== undefined && cached.mtimeMs === mtimeMs) return Buffer.from(cached.key)
+    if (cached !== undefined && cached.encoded === encoded) return Buffer.from(cached.key)
     const exe = trustedWindowsPowerShell()
     if (exe === undefined) throw new QoderKeyError('unavailable', 'SystemRoot is not set, cannot locate PowerShell')
     // `spawn` rather than `execFile`, because the blob has to go in on stdin and
@@ -176,7 +168,7 @@ export async function unwrapQoderOscryptKey(
     })
     const key = Buffer.from(stdout.trim(), 'base64')
     if (key.length !== 32) throw new QoderKeyError('invalid', 'DPAPI unwrap did not yield a 32-byte key')
-    oscryptKeyCache.set(localStatePath, { mtimeMs, key: Buffer.from(key) })
+    oscryptKeyCache.set(localStatePath, { encoded, key: Buffer.from(key) })
     return key
   } finally {
     blob.fill(0)
@@ -382,11 +374,12 @@ export async function readQoderCredential(
  * The gateways read credentials per request so a desktop re-login is picked up
  * without a rescan, but the read itself walks the app directories and, per
  * directory, used to spawn PowerShell to unwrap the OSCrypt key. The key is
- * now cached on the file's mtime; this TTL keeps the file walk itself off the
+ * now cached on the wrapped key; this TTL keeps the file walk itself off the
  * chat path. `resetQoderCredentialCache()` clears it for a rescan.
  */
 const DISCOVERY_TTL_MS = 30_000
 let discoveryCache: { at: number; value: { credentials: QoderCredential[]; failures: QoderCredentialFailure[] } } | undefined
+let discoveryReadSequence = 0
 
 /**
  * Drop the cached discovery answer, e.g. when the user asks for a rescan.
@@ -397,6 +390,7 @@ let discoveryCache: { at: number; value: { credentials: QoderCredential[]; failu
  */
 export function resetQoderCredentialCache(): void {
   discoveryCache = undefined
+  discoveryReadSequence += 1
   darwinKeyCache.clear()
 }
 
@@ -414,12 +408,13 @@ export async function discoverQoderCredentials(
     const cached = discoveryCache.value
     return { credentials: [...cached.credentials], failures: [...cached.failures] }
   }
+  const sequence = cacheable ? ++discoveryReadSequence : discoveryReadSequence
   const value = await readQoderCredentials(candidates ?? qoderStorageCandidates())
   // An empty answer is not cached: the expensive half of this read only runs
   // when the app's own files are there, so a machine with no sign-in retries
   // for free, while a read that failed under load retries on the next request
   // instead of sticking for the whole TTL.
-  if (cacheable && value.credentials.length > 0) discoveryCache = { at: Date.now(), value }
+  if (cacheable && sequence === discoveryReadSequence && value.credentials.length > 0) discoveryCache = { at: Date.now(), value }
   return { credentials: [...value.credentials], failures: [...value.failures] }
 }
 

@@ -73,8 +73,8 @@ function emptyEntry() {
 }
 
 /** The panel with its roster and sheet renderers lifted, and one model in a draft. */
-function loadPanel() {
-  const model = { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 200000, maxOutputTokens: 32000 }
+function loadPanel(id = 'glm-5.3') {
+  const model = { id, name: 'GLM-5.3', contextWindow: 200000, maxOutputTokens: 32000 }
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
   const { Node, document } = makeDom()
   // The roster element `paintEditingRow` walks. `renderModels` is not run, so the
@@ -95,7 +95,7 @@ function loadPanel() {
     selectedSheet: null,
     roster,
   })
-  for (const name of ['el', 'modelDisplay', 'formatTokens', 'withinCeiling', 'windowCeiling',
+  for (const name of ['el', 'iconLabel', 'helpNote', 'modelDisplay', 'formatTokens', 'withinCeiling', 'windowCeiling',
     'outputCeilingFor', 'effectiveWindow', 'effectiveOutput',
     'tagOf', 'modelListRow', 'modelSheetRow', 'toggleModelSheet', 'paintEditingRow',
     'closeSheetOf', 'openSheetOf', 'sheetIsOpen', 'currentModelKey']) {
@@ -109,23 +109,12 @@ function loadPanel() {
   return { context, roster, model, advanced, drawn: roster.children[0] }
 }
 
-test('opening a model from the sheet buttons marks its roster row', () => {
+test('the sheet button toggles the editor and its roster mark', () => {
   const { context, model, advanced, drawn } = loadPanel()
   assert.equal(drawn.classList.contains('is-editing'), false, 'a closed sheet is not marked')
 
   advanced.listeners.click()
-
   assert.equal(context.draft[model.id].open, true, 'the button opens the sheet')
-  assert.equal(drawn.classList.contains('is-editing'), true, 'and the roster row says which model it is')
-})
-
-/**
- * The reported fault: closing the sheet left the row marked, so the roster kept
- * naming a model that was no longer being edited anywhere on screen.
- */
-test('closing a model from the sheet buttons clears its roster mark', () => {
-  const { context, model, advanced, drawn } = loadPanel()
-  advanced.listeners.click()
   assert.equal(drawn.classList.contains('is-editing'), true, 'an open sheet is marked')
 
   advanced.listeners.click()
@@ -226,8 +215,8 @@ test('unticking through the header drops the sheet too', () => {
 })
 
 /** The panel with its save and discard buttons wired to a stub host. */
-function loadPanelWithButtons() {
-  const { context, roster, model } = loadPanel()
+function loadPanelWithButtons(id) {
+  const { context, roster, model } = loadPanel(id)
   const saved = []
   context.invoke = (channel, payload) => {
     saved.push({ channel, payload })
@@ -244,7 +233,7 @@ function loadPanelWithButtons() {
     list: [model], selection: { enabledModelIds: [model.id], overrides: {} },
   })
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  for (const name of ['saveModels', 'discardDraft']) {
+  for (const name of ['draftFor', 'publishedModels', 'saveModels', 'discardDraft']) {
     context[name] = vm.runInContext('(' + lift(source, name) + ')', context)
   }
   return { context, roster, model, saved }
@@ -257,13 +246,17 @@ function loadPanelWithButtons() {
  * Both buttons end the draft, and a rebuilt draft restores `open` from
  * `selectedSheet`, so the record has to go with the draft.
  */
-test('saving a draft ends the session, so the row is not marked afterwards', async () => {
-  const { context, model, saved } = loadPanelWithButtons()
-  context.draft[model.id] = { ...context.draft[model.id], enabled: true, open: true }
+test('saving a draft preserves a special model ID and closes its sheet', async () => {
+  const { context, model, saved } = loadPanelWithButtons('__proto__')
+  context.draft = context.draftFor([model], {})
+  Object.assign(context.draft[model.id], { alias: 'Edited', open: true })
+  const published = context.publishedModels([model], 1)
   context.selectedSheet = { key: context.currentModelKey(), id: model.id }
 
   await context.saveModels()
   assert.equal(saved.length, 1, 'the save reached the host')
+  assert.equal(JSON.parse(JSON.stringify(saved[0].payload.selection.overrides))[model.id].alias, 'Edited')
+  assert.equal(published[model.id], true)
   assert.deepEqual(saved[0].payload.knownModelIds, [model.id],
     'the host is told which models this page could show, so its merge keeps the rest')
   assert.equal(context.selectedSheet, null, 'and it drops the record that reopens the sheet')
@@ -284,4 +277,27 @@ test('discarding a draft ends the session too', () => {
   context.draft = { [model.id]: emptyEntry() }
   const after = context.modelListRow(model, { [model.id]: true })
   assert.equal(after.classList.contains('is-editing'), false, 'and the rebuilt row is unmarked')
+})
+
+test('a late model roster read preserves saved settings and can be retried on the next visit', async () => {
+  const source = fs.readFileSync(path.join(root, 'renderer/panel.js'), 'utf8')
+  let finish
+  let reply = new Promise(resolve => { finish = resolve })
+  const context = vm.createContext({
+    modelRosterRequested: false, bridge: {}, stateRevision: 0,
+    invoke: () => reply, state: { sources: { trae: true } },
+    adoptAndMaybePoll(next) { context.state = next; context.stateRevision += 1 }, note() {},
+  })
+  vm.runInContext(lift(source, 'requestModelRoster'), context)
+  context.requestModelRoster()
+  context.adoptAndMaybePoll({ sources: { trae: false } })
+  finish({ sources: { trae: true } })
+  await reply
+  assert.equal(context.state.sources.trae, false)
+
+  const current = { sources: { trae: false }, models: ['new-model'] }
+  reply = Promise.resolve(current)
+  context.requestModelRoster()
+  await reply
+  assert.deepEqual(context.state, current)
 })

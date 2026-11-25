@@ -10,7 +10,7 @@
 
 <p align="center"><sub>DeepSeek Harness edition · <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool">PI-Desktop edition</a></sub></p>
 
-<p align="center"><b>Use local WorkBuddy, Trae and Qoder sign-ins in DeepSeek Harness, with account failover based on each sign-in's state.</b></p>
+<p align="center"><b>Use local WorkBuddy, Trae and Qoder accounts in DeepSeek Harness and switch accounts when one becomes unavailable.</b></p>
 
 <p align="center">
   <b>English</b> | <a href="README.md">简体中文</a>
@@ -30,13 +30,13 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/chengzhi-c/dsh-wtq-pool?style=flat-square" alt="MIT license"></a>
 </p>
 
-> This project is for learning use only. Unofficial clients may trigger account restrictions. Review the risks and the relevant service terms before use.
+> This project is for educational use only. Unofficial clients may trigger account restrictions. Review the risks and the relevant service terms before use.
 
-Providers are registered separately by vendor and region. When an account is rate-limited, out of credits or signed out, requests fail over according to that source's rules.
+The plugin registers providers separately by vendor and region. When an account is rate-limited, out of credits or signed out, requests switch accounts according to that source's rules.
 
 ## Install
 
-Supports DeepSeek Harness `0.2.0` and the `0.2.2` series, including prereleases allowed by `engines.dsh`. Requires Node `^22.19.0 || >=24.0.0`, as well as the Node version required by the host.
+Supports DeepSeek Harness `0.2.0`, `0.2.2`, and the `0.2.3` series starting at `0.2.3-alpha.2`, including prereleases allowed by `engines.dsh`. Requires Node `^22.19.0 || >=24.0.0`, as well as the Node version required by the host.
 
 ### Desktop app
 
@@ -54,13 +54,13 @@ dsh plugin --profile web add dsh-wtq-pool
 
 ## Usage
 
-Sign in to WorkBuddy, Trae or Qoder, then select **Detect accounts again**. WorkBuddy supports multiple sign-ins; domestic Trae reads Trae CN and TRAE SOLO CN separately. Each Qoder installation and the international WorkBuddy edition retain one sign-in, so switching accounts replaces it.
+Sign in to WorkBuddy, Trae or Qoder, then select **Detect accounts again**. WorkBuddy supports multiple sign-ins; domestic Trae reads Trae CN and TRAE SOLO CN separately. Each Qoder installation and the international WorkBuddy edition retain one sign-in. Signing in to another account replaces the current one.
 
 WorkBuddy 5.6+ `$wbEncrypted` sign-ins need a decryption key from the local WorkBuddy installation. On Windows, only signed installations with a supported key on a fixed local drive are used; decryption is skipped when the host runs elevated. On macOS, the local app is run to read the key without signature verification; root processes on macOS and Linux also skip decryption. Use a trusted installation.
 
 ### Add an account
 
-Add one through the official sign-in page in the panel, or import an `.info` file containing `{auth, account}`. Run this from a source checkout:
+Add an account through the official sign-in page in the panel, or import an `.info` file containing `{auth, account}`. Run this from a source checkout:
 
 ```powershell
 $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME ".dsh" }
@@ -71,25 +71,27 @@ node .\tools\import-signins.cjs --data $pluginData --from $accountFile
 
 Optional arguments: `--region cn|global|all`, `--dry-run`, `--force`.
 
-Files in `signins/` contain usable access and refresh tokens; protect them like account passwords. Plugin-owned sign-ins can be deleted after a second confirmation; the desktop app's active sign-in cannot be deleted from the panel.
+Files in `signins/` contain usable access and refresh tokens; protect them as account passwords. Deleting a plugin-managed sign-in requires a second confirmation; the desktop app's active sign-in cannot be deleted from the panel.
 
 ### Panel
 
-**Account pool** manages sign-ins and account status. **Models** controls published models and display options; **Connection check** reports gateways, catalogues, addresses and host registration; **Growth centre** manages WorkBuddy rewards.
+**Account pool** manages sign-ins and account status. **Models** controls published models and display options. **Connection check** reports gateways, catalogues, addresses and host registration. **Growth centre** manages WorkBuddy rewards.
 
-Automatic check-in is off by default, defaults to 09:00 Beijing time and can be changed in the panel; check-in and **Run now** may claim rewards using make-up cards or lottery draws. Domestic Trae allows one check-in per device each day; Qoder commonly opens at 10:00 Beijing time.
+Automatic check-in is off by default, runs at 09:00 Beijing time and can be changed in the panel. Check-in and **Run now** may use make-up cards or lottery draws. Domestic Trae allows one check-in per device each day; Qoder commonly opens at 10:00 Beijing time.
 
-**Refresh now** renews plugin-owned sign-ins issued at least six hours ago or expiring within five minutes; the desktop app renews its active sign-in.
+**Refresh now** renews plugin-managed sign-ins issued at least six hours ago or expiring within five minutes; the desktop app renews sign-ins it manages.
+
+Expand an account in the growth centre to see this month’s login status. Green marks active days and gray marks inactive days. Hover over a day to see its date. The growth centre supports streak and travel rewards, destination selection, a single lottery draw and make-up check-ins. **Run now** handles cat travel and growth rewards in one pass. Actions that spend cards, trips or lottery chances require confirmation. Feature availability varies by region.
 
 ## Features
 
-- Distribution: priority, round robin, expiring credits first and WorkBuddy conversation stickiness.
-- Composer credits show and switch the active account's balance; when disabled, balances are read every five minutes.
+- Account distribution: priority, round robin, expiring credits first and WorkBuddy conversation stickiness.
+- Composer credits show the current account's balance. Click the balance to switch accounts.
 - Each model group publishes up to 64 models; catalogues refresh on demand and gateways return SSE `chat.completion.chunk` responses.
 
 ### Failover and recovery
 
-| Condition | Behaviour |
+| Condition | Handling |
 | --- | --- |
 | Invalid request or Trae/Qoder model missing from the catalogue | Return 400 or 404 without sending a chat request |
 | WorkBuddy rate limit, upstream 5xx or host unavailable | Try the next account; rate limits follow the upstream wait time or configured cooldown |
@@ -132,6 +134,8 @@ Panel **Delete** removes a plugin-owned sign-in and its archive entry and preven
 ## Preview
 
 ![Account pool](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-pool.png)
+
+![Growth centre](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-growth.png)
 
 The [live preview](https://chengzhi-c.github.io/dsh-wtq-pool/) runs the actual panel code with demo data.
 

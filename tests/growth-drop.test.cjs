@@ -1,19 +1,3 @@
-/**
- * The growth drop signal, and what an in-flight read does with it.
- *
- * Three states the card must not reach:
- *
- *   1. the host dropped the read because the pool changed, and the panel kept
- *      painting the rows anyway;
- *   2. a read was running when the drop arrived, and its answer - computed against
- *      the pool as it was, stamped with the time it arrived - put the rows back and
- *      read as fresh for the whole throttle window;
- *   3. the host's own settings card, a rescan or a new login changed the pool
- *      without dropping, so (2) happened with nothing to notice it.
- *
- * The first two are driven here through the panel's own functions; the third is
- * asserted against the entry points, which is where the drop has to be called.
- */
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
@@ -40,7 +24,7 @@ function loadGrowth() {
     state: null,
     growthState: null,
     growthReading: false,
-    growthDropped: 0,
+    growthReadEpoch: 0,
     stateRevision: 0,
     answered: null,
     notes: [],
@@ -61,64 +45,38 @@ function loadGrowth() {
 
 const ROWS = { accounts: 1, failed: 0, readAt: Date.now(), rows: [{ id: 'a1', label: 'One', region: 'cn', tiers: 1 }] }
 
-test('the panel drops its copy when the host publishes no read', () => {
+test('only a newer pool revision invalidates the displayed rows', () => {
   const context = loadGrowth()
-  context.growthState = ROWS
-  context.adopt({ growth: { read: null } })
-  assert.equal(context.growthState, null, 'a published null is the host saying the pool changed')
-})
-
-test('a document that says nothing about growth leaves the rows alone', () => {
-  const context = loadGrowth()
-  context.growthState = ROWS
-  // No `growth` key at all - this is what a pass in flight publishes, and taking
-  // the figures off screen for it would be the same mistake in the other direction.
+  context.adopt({ growth: { readEpoch: 1, read: ROWS } })
   context.adopt({ accounts: {} })
   context.adopt({ growth: { running: true } })
-  assert.equal(context.growthState, ROWS, 'the rows the user is watching stay')
+  context.adopt({ growth: { readEpoch: 1, read: null } })
+  assert.equal(context.growthState, ROWS, 'a cache miss for the same pool leaves the rows alone')
+  context.adopt({ growth: { readEpoch: 2, read: null } })
+  context.adopt({ growth: { readEpoch: 1, read: ROWS } })
+  assert.equal(context.growthState, null, 'a delayed status response cannot restore the old rows')
 })
 
 test('a read that was in flight when the drop landed does not put the rows back', async () => {
   const context = loadGrowth()
-  context.answered = { growth: { ...ROWS, readAt: Date.now() } }
+  context.adopt({ growth: { readEpoch: 1, read: null } })
+  context.answered = { readEpoch: 1, growth: ROWS }
   const pending = context.readGrowth()
   // The drop arrives while the host read is still running. This is the sequence a
   // user produces by pressing "read state" and then switching an account off.
-  context.adopt({ growth: { read: null } })
+  context.adopt({ growth: { readEpoch: 2, read: null } })
   await pending
   assert.equal(context.growthState, null,
     'the answer describes the pool as it was, so adopting it would repaint the dropped rows as fresh')
 })
 
-test('a read with no drop behind it is adopted as usual', async () => {
+test('ordinary polling does not discard the first growth read', async () => {
   const context = loadGrowth()
-  const answer = { ...ROWS, readAt: Date.now() }
-  context.answered = { growth: answer }
-  await context.readGrowth()
-  assert.deepEqual(context.growthState, answer, 'the ordinary path still paints what the host holds')
-})
-
-test('the host settings card, a rescan and a new login all drop the read', () => {
-  // Each of these changes which accounts a read would return, so an answer in
-  // flight across one of them describes a pool that no longer exists. Asserted on
-  // the entry point: a helper test cannot see whether the call is there.
-  const entry = fs.readFileSync(path.join(root, 'src', 'host.ts'), 'utf8')
-  const bodyOf = (marker) => {
-    const at = entry.indexOf(marker)
-    assert.notEqual(at, -1, `${marker} must exist in the entry`)
-    const end = entry.indexOf(marker.startsWith('case ') ? '\n    }' : '\n}', at)
-    assert.notEqual(end, -1, `${marker} must have a closing block`)
-    return entry.slice(at, end)
-  }
-  // A neighbouring branch must not satisfy this block's assertion.
-  assert.match(bodyOf('async function onHostSettingsChanged(next)'), /await applySettingsEverywhere\(toggled\)/,
-    'a host settings change must reach the shared reconciliation')
-  assert.match(bodyOf('async function applySettingsEverywhere(toggled)'), /if \(toggled\)[\s\S]*?invalidateGrowthRead\(\)/,
-    'a source or region switched in the host settings must drop the read')
-  assert.match(bodyOf('case "xd.rescan": {'), /invalidateGrowthRead\(\)/,
-    'a rescan can add or retire accounts, so it must drop the read')
-  assert.match(bodyOf('case "xd.rescan": {'), /core\.pool\.rescan\(\)/,
-    'a manual rescan must not reuse a snapshot started before the click')
-  assert.match(bodyOf('case "xd.pollLogin": {'), /invalidateGrowthRead\(\)/,
-    'an account that just landed is not in a read taken before it')
+  const initial = { growth: { readEpoch: 1, read: null } }
+  context.adopt(initial)
+  context.answered = { readEpoch: 1, growth: ROWS }
+  const pending = context.readGrowth()
+  context.adopt(initial)
+  await pending
+  assert.equal(context.growthState, ROWS)
 })

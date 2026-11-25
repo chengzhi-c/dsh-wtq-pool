@@ -60,9 +60,6 @@
     header.top .spacer { flex: 1 1 auto; }
     header.top .links { display: flex; gap: 14px; font-size: 13px; }
 
-    .lede { margin: 18px 0 22px; max-width: 70ch; color: var(--fg); }
-    .lede p { margin: 0 0 8px; }
-    .lede .muted { color: var(--muted); font-size: 13px; }
 
     .toolbar {
       display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
@@ -103,18 +100,13 @@
   <div class="wrap">
     <header class="top">
       <h1>WTQ Pool</h1>
-      <span class="tag">MIT</span>
+      <span class="tag">DSH · 1.4.0</span>
       <span class="spacer"></span>
       <nav class="links">
         <a href="https://github.com/chengzhi-c/dsh-wtq-pool#readme">README</a>
         <a href="https://github.com/chengzhi-c/dsh-wtq-pool">GitHub</a>
       </nav>
     </header>
-
-    <div class="lede">
-      <p>把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 DeepSeek Harness：限流或额度用尽时自动换号，模型组按来源和区域发布。</p>
-      <p class="muted">以下为实际面板代码，使用虚构演示数据，不读取本机账号或令牌。</p>
-    </div>
 
     <div class="toolbar">
       <span class="label">主题</span>
@@ -125,13 +117,10 @@
     </div>
 
     <div class="stage">
-      <div class="caption"><span class="dot"></span>实际面板代码 · 演示数据</div>
+      <div class="caption"><span class="dot"></span>交互预览 · 演示数据</div>
       <iframe id="panel" src="./preview-panel.html" title="WTQ Pool 面板预览"></iframe>
     </div>
 
-    <footer class="foot">
-      <span>演示数据均为虚构，不含任何真实账号或令牌。</span>
-    </footer>
   </div>
 
   <script>
@@ -169,7 +158,7 @@
 
       root.dataset.base = base;
       // The panel boots asynchronously after the frame fetches its markup.
-      frame.addEventListener("load", function () { setTimeout(apply, 400); });
+      frame.addEventListener("load", apply);
     })();
   </script>
 </body>

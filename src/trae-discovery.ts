@@ -195,7 +195,7 @@ function timeToMs(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value > 1e12 ? value : value * 1000
   if (typeof value !== 'string' || value.trim() === '') return undefined
   const numeric = Number(value)
-  if (Number.isFinite(numeric) && numeric > 0) return numeric > 1e12 ? numeric : numeric * 1000
+  if (Number.isFinite(numeric)) return numeric > 0 ? (numeric > 1e12 ? numeric : numeric * 1000) : undefined
   const parsed = Date.parse(value)
   return Number.isFinite(parsed) ? parsed : undefined
 }
@@ -254,6 +254,10 @@ function traeAccountKey(credential: TraeCredential): string {
  * knows who the account is.
  */
 function preferredTraeCredential(left: TraeCredential, right: TraeCredential): TraeCredential {
+  const now = Date.now()
+  const expired = (credential: TraeCredential) => credential.expiresAtMs > 0 && credential.expiresAtMs <= now
+  const leftExpired = expired(left)
+  if (leftExpired !== expired(right)) return leftExpired ? right : left
   if (left.expiresAtMs !== right.expiresAtMs) return left.expiresAtMs > right.expiresAtMs ? left : right
   const rank = (credential: TraeCredential): number =>
     (credential.source === 'desktop' ? 2 : 0) + (credential.accountName ?? credential.email ? 1 : 0)
@@ -420,10 +424,12 @@ function credentialFrom(candidate: TraeStorageCandidate, text: string): TraeCred
  */
 const DISCOVERY_TTL_MS = 30_000
 let discoveryCache: { at: number; value: { credentials: TraeCredential[]; failures: TraeCandidateFailure[] } } | undefined
+let discoveryReadSequence = 0
 
 /** Drop the cached discovery answer, e.g. when the user asks for a rescan. */
 export function resetTraeCredentialCache(): void {
   discoveryCache = undefined
+  discoveryReadSequence += 1
 }
 
 /**
@@ -441,11 +447,12 @@ export async function discoverTraeCredentials(
     const cached = discoveryCache.value
     return { credentials: [...cached.credentials], failures: [...cached.failures] }
   }
+  const sequence = cacheable ? ++discoveryReadSequence : discoveryReadSequence
   const value = await readTraeCredentials(candidates ?? traeStorageCandidates())
   // An empty answer is not cached: a read that failed under load retries on the
   // next request instead of sticking for the whole TTL, and a machine with no
   // sign-in has no files to pay for.
-  if (cacheable && value.credentials.length > 0) discoveryCache = { at: Date.now(), value }
+  if (cacheable && sequence === discoveryReadSequence && value.credentials.length > 0) discoveryCache = { at: Date.now(), value }
   return { credentials: [...value.credentials], failures: [...value.failures] }
 }
 

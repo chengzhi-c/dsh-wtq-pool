@@ -137,18 +137,8 @@ export interface WorkBuddyTravelState {
   state: string
   /** True once today's dispatch quota is used (resets at 00:00 CST). */
   dailyLimitReached: boolean
-  /** In-transit/arrived record id; claiming requires it. */
+  /** In-transit/arrived record id. */
   recordId: number
-}
-
-/**
- * True when adopting the first buddy was refused for an unmet conversation
- * threshold. Expected, not an account problem: the caller records the day and
- * retries tomorrow instead of hammering the upstream.
- */
-export function isBuddyThresholdIncomplete(message: unknown): boolean {
-  return typeof message === 'string'
-    && message.toLowerCase().includes('first_buddy task not completed yet')
 }
 
 /** Result of one upstream chat attempt. */
@@ -211,6 +201,8 @@ const MODELS_CATALOG_PATH = '/v2/enterprises/personal/models'
 /** Global product config, which carries the international model roster. */
 const GLOBAL_CONFIG_PATH = '/v3/config'
 const JSON_TIMEOUT_MS = 30_000
+// Panel invocations expire at 30 s; leave time to return the action result.
+const GROWTH_TIMEOUT_MS = 20_000
 const ERROR_BODY_LIMIT = 4096
 /** Deadline for a failed response's error body, which no other phase covers. */
 export const ERROR_BODY_TIMEOUT_MS = 10_000
@@ -1758,13 +1750,7 @@ export class WorkBuddyUpstreamClient {
       isStreakDay: data['is_streak_day'] === true,
     }
   }
-  /**
-   * Query the account's buddy profile; null means no buddy yet.
-   *
-   * Null, missing and empty-object shapes all read as "no buddy" — the
-   * upstream answers whichever it feels like, and the caller adopts in all
-   * three cases.
-   */
+  /** Query the account's buddy profile; null means no buddy yet. */
   async fetchBuddyInfo(credential: WorkBuddyCredential): Promise<WorkBuddyBuddy | null> {
     const response = await this.fetchImpl(`${chatBase(credential)}/activity/growth/buddy/info`, {
       redirect: 'error',
@@ -1826,12 +1812,12 @@ export class WorkBuddyUpstreamClient {
    * Claim the arrival reward. A missing reward field is not a failure — the
    * caller logs 0 and moves on, matching the upstream's own tolerance.
    */
-  async claimTravelReward(credential: WorkBuddyCredential, recordId: number): Promise<number> {
+  async claimTravelReward(credential: WorkBuddyCredential): Promise<number> {
     const response = await this.fetchImpl(`${chatBase(credential)}/activity/growth/buddy/travel/claim`, {
       redirect: 'error',
       method: 'POST',
       headers: billingHeaders(credential),
-      body: JSON.stringify({ record_id: recordId }),
+      body: '{}',
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
     const envelope = await readEnvelope(response)
@@ -1842,35 +1828,9 @@ export class WorkBuddyUpstreamClient {
     return numberField(data, 'reward_credit')
   }
 
-  /** Accept the buddy agreement. Idempotent: safe to repeat. */
-  async agreeBuddy(credential: WorkBuddyCredential): Promise<void> {
-    const response = await this.fetchImpl(`${chatBase(credential)}/activity/growth/buddy/agreement`, {
-      redirect: 'error',
-      method: 'POST',
-      headers: billingHeaders(credential),
-      body: JSON.stringify({ agree: true }),
-      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
-    })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
-  }
-
-  /** Adopt the first buddy. Throws the threshold refusal when unqualified. */
-  async adoptBuddy(credential: WorkBuddyCredential): Promise<void> {
-    const response = await this.fetchImpl(`${chatBase(credential)}/activity/growth/buddy/first`, {
-      redirect: 'error',
-      method: 'POST',
-      headers: billingHeaders(credential),
-      body: '{}',
-      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
-    })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
-  }
-
   /**
    * Report one chat activity. The full event shape, not a minimal subset: the
-   * upstream lights growth streak and unlocks the first-buddy task on this,
+   * upstream lights growth streak on this,
    * and a trimmed event risks a future tightening. `userId` is the account
    * uid — without it the upstream answers 200 yet silently drops the report.
    *
@@ -1952,7 +1912,7 @@ export class WorkBuddyUpstreamClient {
       method,
       headers: billingHeaders(credential),
       ...body === undefined ? {} : { body: JSON.stringify(body) },
-      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+      signal: AbortSignal.timeout(GROWTH_TIMEOUT_MS),
     })
     const envelope = await readEnvelope(response)
     if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
@@ -1977,6 +1937,7 @@ export class WorkBuddyUpstreamClient {
         const tier = asRecord(entry)
         const name = typeof tier['tier'] === 'string' ? tier['tier'] : ''
         if (name === '') continue
+        const status = String(redemption[`tier_${name}_status`] ?? '').toLowerCase()
         tiers.push({
           tier: name,
           days: numberField(tier, 'days'),
@@ -1984,7 +1945,7 @@ export class WorkBuddyUpstreamClient {
           energy: numberField(tier, 'energy'),
           // The flat status fields are the authoritative unlock state; the
           // per-tier entry does not carry one of its own.
-          status: String(redemption[`tier_${name}_status`] ?? '').toLowerCase(),
+          status: status === 'available' ? 'unlocked' : status,
         })
       }
     }
@@ -2005,51 +1966,15 @@ export class WorkBuddyUpstreamClient {
    * The client token is the upstream's idempotency key — a fresh one per attempt
    * keeps a retry from being read as a duplicate of the last one.
    */
-  async redeemStreakTier(credential: WorkBuddyCredential, tier: string): Promise<void> {
-    await this.growthJson(credential, 'POST', '/activity/growth/redeem', {
+  async redeemStreakTier(credential: WorkBuddyCredential, tier: string): Promise<{ credit: number; energy: number; cards: number; chances: number }> {
+    const data = await this.growthJson(credential, 'POST', '/activity/growth/redeem', {
       tier,
       client_token: randomUUID(),
     })
-  }
-
-  /**
-   * Call a billing-domain endpoint and return its unwrapped `data`.
-   *
-   * Counterpart of {@link growthJson}: same envelope, but these paths carry the
-   * `/v2/billing/meter` prefix and the billing host. Kept separate because the
-   * prefix is part of the path, not something the caller should remember.
-   */
-  private async billingJson(
-    credential: WorkBuddyCredential,
-    path: string,
-    body?: unknown,
-  ): Promise<Record<string, unknown>> {
-    const response = await this.fetchImpl(`${billingBase(credential)}${path}`, {
-      redirect: 'error',
-      method: 'POST',
-      headers: billingHeaders(credential),
-      body: body === undefined ? '{}' : JSON.stringify(body),
-      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
-    })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
-    return asRecord(envelope.data)
-  }
-
-  /**
-   * The one-off starter gift. Once per account; a second claim is a business
-   * error, which the caller treats as "nothing to collect".
-   *
-   * No `/v2` prefix: that form answers a 404 route miss, while the bare path is
-   * the one the console itself posts to.
-   */
-  async claimGift(credential: WorkBuddyCredential): Promise<number> {
-    return numberField(await this.billingJson(credential, '/billing/meter/claim-gift'), 'credit')
-  }
-
-  /** Campaign compensation, when the account has any waiting. */
-  async claimCompensation(credential: WorkBuddyCredential): Promise<number> {
-    return numberField(await this.billingJson(credential, '/billing/meter/claim-compensation'), 'credit')
+    return {
+      credit: numberField(data, 'credit_granted'), energy: numberField(data, 'energy_granted'),
+      cards: numberField(data, 'cards_granted'), chances: numberField(data, 'chances_granted'),
+    }
   }
 
   /**
@@ -2094,5 +2019,72 @@ export class WorkBuddyUpstreamClient {
     return await this.growthJson(credential, 'POST', '/activity/growth/lottery/draw', {
       client_token: randomUUID(),
     })
+  }
+
+  /** Independent modules can be disabled per region; keep the other sections usable. */
+  async growthAccountDetails(credential: WorkBuddyCredential) {
+    const domestic = regionOf(credential.domain) === 'cn'
+    const paths = {
+      heatmap: '/activity/growth/heatmap',
+      ...domestic ? {
+        config: '/activity/growth/buddy/travel/config',
+        status: '/activity/growth/buddy/travel/status',
+        lottery: '/activity/growth/lottery/summary',
+      } : {},
+    }
+    const data: Record<string, Record<string, unknown>> = {}
+    const errors: Record<string, string> = {}
+    let buddy: WorkBuddyBuddy | null | undefined
+    await Promise.all([
+      ...Object.entries(paths).map(async ([key, path]) => {
+        try { data[key] = await this.growthJson(credential, 'GET', path) }
+        catch (error) { errors[key] = redactSecrets(error instanceof Error ? error.message : String(error)) }
+      }),
+      domestic
+        ? this.fetchBuddyInfo(credential).then((value) => { buddy = value }).catch((error) => {
+          errors.buddy = redactSecrets(error instanceof Error ? error.message : String(error))
+        })
+        : Promise.resolve(),
+    ])
+    return {
+      buddy,
+      travel: { locations: data.config?.locations, status: data.status },
+      heatmap: data.heatmap, lottery: data.lottery, errors,
+    }
+  }
+
+  /** Values arrive from the panel bridge; validate them at this mutation boundary. */
+  async growthAccountAction(
+    credential: WorkBuddyCredential,
+    action: string,
+    value: unknown,
+    assertActive: () => void,
+  ): Promise<Record<string, unknown>> {
+    switch (action) {
+      case 'travelDepart':
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) throw new Error('invalid growth id')
+        if (await this.fetchBuddyInfo(credential) === null) throw new Error('buddy is not adopted')
+        assertActive()
+        await this.departTravel(credential, value)
+        return {}
+      case 'travelClaim':
+        assertActive()
+        return { credit: await this.claimTravelReward(credential) }
+      case 'streak':
+        if (typeof value !== 'string' || !/^[\w-]+$/.test(value)) throw new Error('invalid growth key')
+        assertActive()
+        return { credit: (await this.redeemStreakTier(credential, value)).credit }
+      case 'lottery': {
+        assertActive()
+        const { prize_name, prize_type, credit_granted, reward_credit, credit } = await this.drawLottery(credential)
+        return { prize_name, prize_type, credit_granted, reward_credit, credit }
+      }
+      case 'makeup':
+        if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error('invalid makeup date')
+        assertActive()
+        await this.useMakeupCard(credential, value)
+        return {}
+      default: throw new Error('invalid growth action')
+    }
   }
 }

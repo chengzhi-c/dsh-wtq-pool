@@ -10,7 +10,7 @@
 
 <p align="center"><sub>DeepSeek Harness 版 · <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool">PI-Desktop 版</a></sub></p>
 
-<p align="center"><b>在 DeepSeek Harness 中使用本机 WorkBuddy、Trae 和 Qoder 登录，按账号状态自动换号。</b></p>
+<p align="center"><b>在 DeepSeek Harness 中使用本机 WorkBuddy、Trae 和 Qoder 账号，并在账号不可用时自动切换。</b></p>
 
 <p align="center">
   <a href="README.en.md">English</a> | <b>简体中文</b>
@@ -32,11 +32,11 @@
 
 > 本项目仅供学习使用。非官方客户端可能触发厂商的账号风控或限制。使用前请评估风险并遵守对应服务条款。
 
-各厂商和区域分别注册模型组。账号遇到限流、额度耗尽或登录失效时，按对应策略切换账号。
+插件按厂商和区域注册模型组。账号限流、额度耗尽或登录失效时，按对应策略切换账号。
 
 ## 安装
 
-支持 DeepSeek Harness `0.2.0` 与 `0.2.2` 系列（含 `engines.dsh` 允许的预发布版本），要求 Node `^22.19.0 || >=24.0.0`，并满足宿主的 Node 版本要求。
+支持 DeepSeek Harness `0.2.0`、`0.2.2` 及 `0.2.3-alpha.2` 起的 `0.2.3` 系列（含 `engines.dsh` 允许的预发布版本），要求 Node `^22.19.0 || >=24.0.0`，并满足宿主的 Node 版本要求。
 
 ### 桌面版
 
@@ -54,13 +54,13 @@ dsh plugin --profile web add dsh-wtq-pool
 
 ## 使用
 
-在 WorkBuddy、Trae 或 Qoder 桌面应用登录后，点击「重新检测账号」。WorkBuddy 支持多个登录；国内 Trae 分别读取 Trae CN 与 TRAE SOLO CN。每个 Qoder 安装及 WorkBuddy 国际版各保留一个登录，切换时替换原登录。
+在 WorkBuddy、Trae 或 Qoder 桌面应用中登录后，在面板中点击「重新检测账号」。WorkBuddy 支持多个登录；国内 Trae 分别读取 Trae CN 与 TRAE SOLO CN。每个 Qoder 安装及 WorkBuddy 国际版各保留一个登录，登录其他账号会替换当前账号。
 
 WorkBuddy 5.6 起的 `$wbEncrypted` 登录需要本机 WorkBuddy 的解密密钥。Windows 只使用固定本地磁盘上签名有效且公钥受支持的安装，管理员进程跳过解密；macOS 会运行本机应用读取密钥，不校验签名，macOS 和 Linux 的 root 进程跳过解密。请使用可信的 WorkBuddy 安装。
 
 ### 添加账号
 
-在面板通过官方登录页添加，或导入含 `{auth, account}` 的 `.info` 文件。从源码仓库运行：
+通过面板的官方登录页添加账号，或导入含 `{auth, account}` 的 `.info` 文件。从源码仓库运行：
 
 ```powershell
 $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME ".dsh" }
@@ -71,23 +71,25 @@ node .\tools\import-signins.cjs --data $pluginData --from $accountFile
 
 可选参数：`--region cn|global|all`、`--dry-run`、`--force`。
 
-`signins/` 含可用的访问令牌和刷新令牌，应按账号密码保护。自管登录可二次确认删除；桌面应用当前使用的登录不能从面板删除。
+`signins/` 含可用的访问令牌和刷新令牌，应按账号密码保护。删除插件管理的登录需要再次确认；桌面应用当前使用的登录不能从面板删除。
 
 ### 面板
 
-「账号池」管理登录和账号状态；「模型」页设置模型组及显示选项；连接检查报告网关、模型目录、注册地址和宿主注册状态；成长中心领取 WorkBuddy 奖励。
+「账号池」管理登录和账号状态；「模型」页设置模型组及显示选项；「连接检查」报告网关、模型目录、注册地址和宿主注册状态；「成长中心」领取 WorkBuddy 奖励。
 
-自动签到默认关闭，默认北京时间 09:00，可在面板调整；签到和手动「立即执行」可能消耗补签卡或抽奖次数。国内 Trae 每台设备每天可签到一次，Qoder 通常在北京时间 10:00 开放。
+自动签到默认关闭，时间为北京时间 09:00，可在面板修改。签到和「立即执行」可能消耗补签卡或抽奖机会。国内 Trae 每台设备每天可签到一次，Qoder 通常在北京时间 10:00 开放。
 
-「立即刷新」只续期签发满六小时或五分钟内到期的插件自管登录；桌面应用登录由应用续期。
+「立即刷新」仅续期签发满六小时或五分钟内到期的插件管理登录；桌面应用管理的登录由应用续期。
+
+展开账号可查看本月登录状态：绿色表示已登录，灰色表示未登录，悬停日期可查看日期。成长中心支持领取连登档位和旅行积分、选择旅行地点、单次抽奖及补签。「立即执行」批量处理猫猫旅行和成长奖励；补签、抽奖和派遣会先确认消耗。功能可用性因地区而异。
 
 ## 功能
 
-- 分发：按优先级、轮询或临期积分；WorkBuddy 另支持同一对话固定账号。
-- 输入框积分：显示当前账号积分并可切换账号；关闭时每五分钟读取余额。
+- 账号分配：支持优先使用、轮流使用和临期积分优先；WorkBuddy 另支持同一对话固定账号。
+- 输入框积分：显示当前账号积分，点击读数后可以更换账号。
 - 每个模型组最多发布 64 个模型；网关使用 SSE 流式响应，模型目录按需刷新。
 
-### 换号与恢复
+### 账号切换与恢复
 
 | 情况 | 处理方式 |
 | --- | --- |
@@ -123,7 +125,7 @@ Trae、Qoder 冷却默认 60 秒，最长 24 小时。WorkBuddy 登录失效时�
 
 数据目录为 `~/.dsh/dsh-wtq-pool/`，或 `$DSH_HOME/dsh-wtq-pool/`（设置了 `DSH_HOME` 时）。`signins/` 与 `credentials-archive.json` 含可用登录令牌，登录文件名可能含账号计费身份；归档在访问或刷新令牌中较晚的到期时间后保留 30 天，未记录到期时间的归档在删除账号时清除。
 
-面板「删除」会清除自管登录及归档，并阻止旧桌面快照重新加入；「移除」只将账号排除出分发。外链需点击后打开，登录页和令牌请求仅使用以下厂商主机：
+面板「删除」会清除插件管理的登录及归档，并阻止旧桌面快照重新加入；「移除」只将账号排除出分发。外部链接需点击后打开，登录页和令牌请求仅使用以下厂商主机：
 
 - WorkBuddy：`copilot.tencent.com`、`www.codebuddy.cn`、`www.codebuddy.ai`、`www.workbuddy.ai`
 - Trae：`api.trae.cn`、`solo.trae.cn`、`trae-api-cn.mchost.guru`、`coresg-normal.trae.ai`、`growsg-normal.trae.ai`
@@ -132,6 +134,8 @@ Trae、Qoder 冷却默认 60 秒，最长 24 小时。WorkBuddy 登录失效时�
 ## 预览
 
 ![账号池](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-pool.png)
+
+![成长中心](https://github.com/chengzhi-c/dsh-wtq-pool/raw/main/docs/preview-growth.png)
 
 [在线预览](https://chengzhi-c.github.io/dsh-wtq-pool/) 使用实际面板代码和演示数据。
 
