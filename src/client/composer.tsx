@@ -501,7 +501,6 @@ export function ComposerPoints(props: ComposerProps): React.ReactElement | null 
       source: points.source ?? '',
       region: points.region ?? '',
       accountId: account.id ?? '',
-      accountLabel: account.label ?? '',
     }).then((next) => {
       if (routeRef.current !== requestedRoute) return
       setBusy(false)

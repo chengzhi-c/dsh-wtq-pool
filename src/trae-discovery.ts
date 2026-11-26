@@ -241,7 +241,7 @@ export function normalizeTraeCredential(raw: unknown, edition: TraeEdition, sour
  * into one entry drops whichever copy expires sooner, and that region's gateway
  * is then left with no credential at all while this dedup reports success.
  */
-function traeAccountKey(credential: TraeCredential): string {
+export function traeAccountKey(credential: TraeCredential): string {
   const region = traeRegionOfCredential(credential)
   const userId = credential.userId.trim()
   if (userId !== '') return `id:${region}:${userId}`
@@ -388,7 +388,8 @@ function failureOf(candidate: TraeStorageCandidate, error: unknown): TraeCandida
     edition: candidate.edition,
     source: candidate.source,
     reason: code === undefined ? 'invalid' : 'unreadable',
-    message: error instanceof Error ? error.message : String(error),
+    message: error instanceof SyntaxError ? 'Trae sign-in is not valid JSON'
+      : error instanceof Error ? error.message : String(error),
   }
 }
 

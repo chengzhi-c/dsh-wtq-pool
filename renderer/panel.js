@@ -268,6 +268,7 @@ var EN = {
   "growth.confirm": "Confirm",
   "growth.cancel": "Cancel",
   "growth.actionDone": "Completed · +{credit} credits",
+  "growth.refreshFailed": "Could not refresh the growth centre",
   "growth.physicalPrize": "Add a delivery address in the official Growth Centre.",
   "growth.runConfirm": "Run travel and growth rewards for enabled accounts? This may use a daily trip, make-up cards and all lottery chances.",
   "auto.enableConfirm": "Enable scheduled rewards? WorkBuddy runs may send a trip, use make-up cards and use all lottery chances.",
@@ -573,6 +574,7 @@ var ZH = {
   "growth.confirm": "确认",
   "growth.cancel": "取消",
   "growth.actionDone": "操作完成 · +{credit} 积分",
+  "growth.refreshFailed": "成长状态刷新失败",
   "growth.physicalPrize": "请在官方成长中心填写收货地址。",
   "growth.runConfirm": "为启用的账号执行旅行和成长奖励？可能消耗当日旅行次数、补签卡和全部抽奖次数。",
   "auto.enableConfirm": "开启定时领取？启用 WorkBuddy 时，每轮可能派遣旅行、消耗补签卡并耗尽全部抽奖次数。",
@@ -846,9 +848,6 @@ function growthStale() {
 /** Which growth rows are expanded, keyed by account id. */
 var openGrowth = {};
 var growthDestinations = new Map();
-// Keep the acting account row at the same viewport offset while its details reload.
-var growthScrollReturn = null;
-var growthScrollVersion = 0;
 
 /**
  * The model sheet's draft: the edits of the models ticked on the roster.
@@ -1104,6 +1103,7 @@ function fillRegionNav(nav, source, regions, accounts, active) {
   regions.forEach(function (region) {
     var on = region === active;
     var button = el("button", on ? "active" : "");
+    button.id = (nav.id || source + "-regions") + "-" + region;
     button.type = "button";
     button.disabled = busy !== null;
     button.setAttribute("aria-pressed", on ? "true" : "false");
@@ -1145,7 +1145,7 @@ function sourcePreferredPicker(source, region, accounts) {
   picker.appendChild(automatic);
   accounts.forEach(function (account) {
     var option = el("option", null, account.label);
-    option.value = account.label;
+    option.value = account.id;
     // Listed but not selectable: the host refuses an expired account as the
     // preferred one, so offering it turned a click into an error.
     if (account.expired === true) {
@@ -1155,7 +1155,7 @@ function sourcePreferredPicker(source, region, accounts) {
     picker.appendChild(option);
   });
   var preferred = ((state[source] || {}).preferred || {})[region] || "";
-  if (preferred !== "" && !accounts.some(function (account) { return account.label === preferred; })) {
+  if (preferred !== "" && !accounts.some(function (account) { return account.id === preferred; })) {
     var missing = el("option", null, t("acct.unavailable"));
     missing.value = preferred;
     picker.appendChild(missing);
@@ -1170,9 +1170,9 @@ function sourcePreferredPicker(source, region, accounts) {
 }
 
 /** Remember which account serves one source region; "" means automatic. */
-function setPreferredSourceAccount(source, region, label) {
+function setPreferredSourceAccount(source, region, accountId) {
   return runBusy("source-account", function () {
-    return invoke("xd.preferSourceAccount", { source: source, region: region, label: label });
+    return invoke("xd.preferSourceAccount", { source: source, region: region, accountId: accountId });
   }).catch(function () {});
 }
 function sourceRegionLabel(region) {
@@ -1699,22 +1699,22 @@ function checkinFailureText(claimed, failed, reason) {
   return typeof reason === "string" && reason !== "" ? text + " · " + reason : text;
 }
 
-/** The busy key of one source account row: source, region and label together. */
+/** The busy key of one source account row: source, region and account ID together. */
 function sourceCheckinKey(source, account) {
-  return source + ":" + account.region + ":" + account.label;
+  return source + ":" + account.region + ":" + account.id;
 }
 
 /**
  * Collect one Trae/Qoder account's reward.
  *
- * The row names the account (source, region, label); the plugin re-reads the
+ * The row names the account (source, region, ID); the plugin re-reads the
  * account's own status before claiming, so a second click cannot collect twice.
  */
 function claimSourceCheckin(source, account) {
   if (busy !== null || checkinBusy !== null) return Promise.resolve();
   checkinBusy = sourceCheckinKey(source, account);
   render();
-  return invoke("xd.sourceCheckin", { source: source, label: account.label, region: account.region })
+  return invoke("xd.sourceCheckin", { source: source, accountId: account.id, region: account.region })
     .then(function (payload) {
       checkinBusy = null;
       if (payload && payload.state) adopt(payload.state);
@@ -2315,12 +2315,8 @@ function growthButton(row, label, action, value, confirmText) {
 async function runGrowthAction(row, action, value, confirmText) {
   if (busy !== null || growthReading) return;
   if (confirmText && !await confirmGrowth(confirmText)) return;
-  var rowHead = document.getElementById("growth-row-" + row.id);
-  var growthReturnY = rowHead ? rowHead.getBoundingClientRect().top : 0;
-  growthScrollVersion += 1;
-  var growthReturn = { id: row.id, y: growthReturnY, version: growthScrollVersion };
-  growthScrollReturn = growthReturn;
   var message;
+  var refreshError;
   await runBusy("growth-action", async function () {
     try {
       var answer = await invoke("xd.growthAction", { id: row.id, action: action, value: value });
@@ -2331,20 +2327,13 @@ async function runGrowthAction(row, action, value, confirmText) {
       if (action === "makeup") message = t("growth.makeupDone");
       if (receipt.prize_type === "physical") message += " · " + t("growth.physicalPrize");
     } finally {
-      growthState = null;
-      await readGrowth();
+      refreshError = await readGrowth(true);
     }
   }).then(function () {
-    note(message, "success");
+    if (refreshError) message += " · " + t("growth.refreshFailed") + ": " + refreshError;
+    if (activeTab === "growth") note(message, refreshError ? "warn" : "success");
     announce(message);
-    restoreGrowthScroll(growthReturn);
-  }).catch(function (error) {
-    note(String(error.message || error));
-    if (growthScrollReturn && growthScrollReturn.id === row.id) {
-      restoreGrowthScroll(growthScrollReturn);
-      growthScrollReturn = null;
-    }
-  });
+  }).catch(function () {});
 }
 
 function confirmGrowth(message) {
@@ -2375,20 +2364,13 @@ function confirmGrowth(message) {
 function loadGrowthDetails(row) {
   if (row.detailsLoading) return;
   row.detailsLoading = true;
-  var returnVersion = growthScrollReturn && growthScrollReturn.id === row.id
-    ? growthScrollReturn.version : null;
-  invoke("xd.growthDetails", { id: row.id }).then(function (answer) {
+  return invoke("xd.growthDetails", { id: row.id }).then(function (answer) {
     row.details = answer.details;
   }).catch(function (error) {
     row.details = { errors: { details: String(error.message || error) } };
   }).finally(function () {
     row.detailsLoading = false;
     if (growthState && growthState.rows.includes(row)) render();
-    if (returnVersion !== null && growthScrollReturn
-      && growthScrollReturn.id === row.id && growthScrollReturn.version === returnVersion) {
-      restoreGrowthScroll(growthScrollReturn);
-      growthScrollReturn = null;
-    }
   });
 }
 
@@ -2497,22 +2479,32 @@ function paintGrowthCalendar(host, row, heatmap) {
 }
 
 
-function readGrowth() {
+function readGrowth(afterAction) {
   // `growthReading` alone, not the panel-wide `busy`: a finished run re-reads
   // its own rows from inside `runBusy`, while `busy` still says "growth".
   if (growthReading) return Promise.resolve();
   growthReading = true;
   render();
-  return invoke("xd.growthState").then(function (answer) {
-    growthReading = false;
+  return invoke("xd.growthState").then(async function (answer) {
+    // Replace the rows and their open details together, without collapsing the page between responses.
+    if (answer.readEpoch >= growthReadEpoch && answer.growth && growthState) {
+      var expanded = answer.growth.rows.filter(function (row) { return openGrowth["growth:" + row.id]; });
+      await Promise.all(expanded.map(loadGrowthDetails));
+    }
     if (answer.readEpoch >= growthReadEpoch) {
       growthReadEpoch = answer.readEpoch;
       growthState = answer.growth;
     }
+    growthReading = false;
     render();
   }).catch(function (error) {
     growthReading = false;
-    note(String(error && error.message ? error.message : error));
+    var reason = String(error && error.message ? error.message : error);
+    if (afterAction) {
+      growthState = null;
+      return reason;
+    }
+    note(reason);
     render();
   });
 }
@@ -2732,11 +2724,12 @@ function accountCard(account) {
     // the row every 1.2-2 s, and a flag written onto the node was gone before the
     // second press arrived, so every press re-armed instead of deleting.
     var armed = pendingDelete === account.id;
-    var deleteBtn = el("button", armed ? "acct-delete confirming ic-trash" : "acct-delete ic-trash", t("acct.deleteConfirmAgain"));
-    if (!armed) iconLabel(deleteBtn, t("acct.delete"));
+    var deleteLabel = t(armed ? "acct.deleteConfirmAgain" : "acct.delete");
+    var deleteBtn = el("button", "acct-delete ic-trash icon-only" + (armed ? " confirming" : ""));
+    if (armed) deleteBtn.appendChild(el("span", "delete-prompt", deleteLabel));
     deleteBtn.id = rowKey + "-delete";
     deleteBtn.type = "button";
-    deleteBtn.setAttribute("aria-label", t(armed ? "acct.deleteConfirmAgain" : "acct.delete") + ": " + account.label);
+    deleteBtn.setAttribute("aria-label", deleteLabel + ": " + account.label);
     deleteBtn.title = t("acct.deleteHint");
     deleteBtn.disabled = rowBusy;
     deleteBtn.setAttribute("aria-pressed", armed ? "true" : "false");
@@ -3199,16 +3192,6 @@ function pageScroll() {
 function pageScrollTo(top) {
   var root = document.scrollingElement || document.documentElement || document.body;
   if (root) root.scrollTop = top;
-}
-
-function restoreGrowthScroll(anchor) {
-  if (!anchor) return;
-  function restore() {
-    var head = document.getElementById("growth-row-" + anchor.id);
-    if (head) pageScrollTo(pageScroll() + head.getBoundingClientRect().top - anchor.y);
-  }
-  restore();
-  requestAnimationFrame(restore);
 }
 
 /**
@@ -3826,7 +3809,7 @@ function isDirty(list, selection) {
     if (!entry) continue;
     if (entry.enabled !== (enabled === undefined || enabled.indexOf(model.id) >= 0)) return true;
     var saved = overrides[model.id] || {};
-    if (entry.alias !== (typeof saved.alias === "string" ? saved.alias : "")) return true;
+    if (entry.alias.trim() !== (typeof saved.alias === "string" ? saved.alias : "")) return true;
     // Compared through the same clamp the draft was built with: a stored figure
     // above the catalog's is not something the editor can show, so it must not
     // read as an edit waiting to be saved either.
@@ -4448,6 +4431,7 @@ function adoptAndMaybePoll(next, attempts) {
       }
       adoptAndMaybePoll(again, attempts + 1);
     }).catch(function () {
+      if (revision !== stateRevision) return;
       // The document's own flag is what these two loops watch, and a failing
       // channel leaves it set: stopping the timer here alone left the header
       // saying "detecting…" for good, with nothing left to clear it. The same
@@ -4533,6 +4517,7 @@ function pollGrowthRun() {
         readGrowth();
       }
     }).catch(function () {
+      if (revision !== stateRevision) return;
       growthPollFailures += 1;
       if (growthPollFailures < GROWTH_POLL_MAX_FAILURES) { pollGrowthRun(); return; }
       stopGrowthPoll();
@@ -4595,6 +4580,7 @@ function pollCheckinLog(attempts) {
       checkinPollFailures = 0;
       render();
     }).catch(function () {
+      if (revision !== stateRevision) return;
       // A failing channel leaves the flag set, so re-arming here without a bound
       // polled forever. The watch gives up and clears what it was watching, the
       // same way `adoptAndMaybePoll` does.
@@ -4887,7 +4873,8 @@ function saveModels() {
     // Only a field that differs from the catalog is stored: an untouched row
     // must not freeze today's catalog numbers into the settings file.
     var override = {};
-    if (entry.alias !== "") override.alias = entry.alias.trim();
+    var alias = entry.alias.trim();
+    if (alias !== "") override.alias = alias;
     if (entry.window !== null) override.contextWindow = entry.window;
     if (entry.output !== null) override.maxOutputTokens = entry.output;
     if (entry.images !== null) override.supportsImages = entry.images;
@@ -4985,6 +4972,7 @@ function copyReport() {
 // -------------------------------------------------------------------- tabs
 
 function selectTab(name) {
+  var changed = activeTab !== name;
   activeTab = name;
   var views = { pool: "poolView", models: "modelsView", check: "checkView", growth: "growthView" };
   Object.keys(views).forEach(function (key) {
@@ -5000,7 +4988,7 @@ function selectTab(name) {
   // Each page starts at its own top. Carrying the previous page's offset over
   // landed the user mid-roster after leaving the pool scrolled to its third
   // account.
-  pageScrollTo(0);
+  if (changed) pageScrollTo(0);
   // Entering the tab while another action runs would raise the busy banner and
   // silently skip the doctor; the next entry retries.
   if (name === "check" && doctorResult === null && busy === null) runDoctor();

@@ -76,9 +76,9 @@ async function workbuddyShim({ client, models, model = 'hy3' }) {
 }
 
 /** A WorkBuddy gateway built from several sign-in files. */
-async function workbuddyShimFromDirs({ client, models, dirs, region = 'cn', model = 'hy3' }) {
+async function workbuddyShimFromDirs({ client, models, dirs, region = 'cn', model = 'hy3', warm = true }) {
   const pool = new WorkBuddyAccountPool({ authDirs: dirs, cooldownMs: 60_000, client })
-  await pool.scan()
+  if (warm) await pool.scan()
   const shim = createWorkBuddyShim({
     pool, region, client, logger: QUIET,
     catalog: { visible: () => models.map((id) => ({ id })), current: () => models.map((id) => ({ id })) },
@@ -275,10 +275,7 @@ test('a transport failure does not cool the account it failed on', async () => {
   }
 })
 
-test('a pool larger than eight accounts still reaches its healthy tail', async (t) => {
-  // `maxAttempts` was the fixed number eight. With nine sign-ins and the first
-  // eight rate-limited, the ninth was never tried and the request answered 429
-  // while a healthy account sat idle.
+test('a cold pool larger than eight accounts still reaches its healthy tail', async (t) => {
   const dirs = signInDirs('tail', 9)
   t.after(() => { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }) })
   let calls = 0
@@ -295,21 +292,12 @@ test('a pool larger than eight accounts still reaches its healthy tail', async (
       }
     },
   }
-  const pool = new WorkBuddyAccountPool({ authDirs: dirs, cooldownMs: 60_000, client })
-  await pool.scan()
-  const shim = createWorkBuddyShim({
-    pool, region: 'cn', client, logger: QUIET,
-    catalog: { visible: () => [{ id: 'hy3' }], current: () => [{ id: 'hy3' }] },
-  })
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs, warm: false })
   try {
-    await shim.ready
-    const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'hy3', messages: [{ role: 'user', content: 'hi' }] }),
-    })
+    const answer = await shim.turn()
     assert.equal(answer.status, 200, 'the ninth account has to get the turn')
     assert.equal(calls, 9, 'and every earlier account is still tried in order')
-    await answer.text()
+    assert.match(answer.text, /tail/)
   } finally {
     await shim.close()
   }
@@ -414,15 +402,15 @@ test('an account whose first byte never arrives is skipped for the next one', as
   }
 })
 
-test('an empty 200 stream is a failed attempt, not the end of the turn', async (t) => {
-  const dirs = signInDirs('empty', 2)
+test('an empty 200 stream does not spend the transport retry budget in a cold pool', async (t) => {
+  const dirs = signInDirs('empty4', 4)
   t.after(() => { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }) })
   let calls = 0
   const client = {
     prepareChatBody: (raw) => JSON.parse(raw),
     chatStream: async () => {
       calls += 1
-      if (calls === 1) {
+      if (calls <= 3) {
         return {
           ok: true,
           response: new Response(new ReadableStream({ start(controller) { controller.close() } }), {
@@ -432,18 +420,18 @@ test('an empty 200 stream is a failed attempt, not the end of the turn', async (
       }
       return {
         ok: true,
-        response: new Response('data: {"choices":[{"delta":{"content":"second"}}]}\n\ndata: [DONE]\n\n', {
+        response: new Response('data: {"choices":[{"delta":{"content":"fourth"}}]}\n\ndata: [DONE]\n\n', {
           status: 200, headers: { 'content-type': 'text/event-stream' },
         }),
       }
     },
   }
-  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs })
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs, warm: false })
   try {
     const answer = await shim.turn()
-    assert.equal(answer.status, 200, 'an empty 200 is still an attempt the next account can replace')
-    assert.match(answer.text, /second/)
-    assert.equal(calls, 2)
+    assert.equal(answer.status, 200, 'the healthy account behind three dead streams still serves')
+    assert.match(answer.text, /fourth/)
+    assert.equal(calls, 4, 'every account up to the healthy one is tried once')
   } finally {
     await shim.close()
   }

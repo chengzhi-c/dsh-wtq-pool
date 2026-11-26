@@ -42,7 +42,7 @@ const renewed = () => ({
  * which the renewal may write, or a plain directory standing in for the desktop
  * app's, which it may not.
  */
-function poolOver(label, { issuedAgo = 0, lifetimeMs = 28 * DAY, own = true, live = false } = {}) {
+function poolOver(label, { issuedAgo = 0, lifetimeMs = 28 * DAY, own = true, live = false, refreshToken = async () => renewed() } = {}) {
   const dataDir = scratch(label)
   const dir = path.join(dataDir, own ? 'signins' : 'desktop')
   const file = path.join(dir, own ? 'workbuddy-panel-renewal-uin.info' : live ? LIVE_FILENAME : 'workbuddy-desktop-renewal-uin.info')
@@ -59,7 +59,7 @@ function poolOver(label, { issuedAgo = 0, lifetimeMs = 28 * DAY, own = true, liv
   const pool = new WorkBuddyAccountPool({
     authDirs: [dir],
     dataPath: () => dataDir,
-    client: { refreshToken: async () => renewed() },
+    client: { refreshToken },
   })
   return { pool, file, dataDir, signins: path.join(dataDir, 'signins') }
 }
@@ -80,13 +80,17 @@ test('a sign-in the plugin wrote is renewed once it is old enough', async () => 
 })
 
 test('the renewal is written back into the sign-in file it came from', async () => {
-  const { pool, file, dataDir } = poolOver('writeback', { issuedAgo: 7 * 60 * 60 * 1000 })
+  const domain = 'www.workbuddy.cn'
+  const { pool, file, dataDir } = poolOver('writeback', {
+    issuedAgo: 7 * 60 * 60 * 1000, refreshToken: async () => ({ ...renewed(), domain }),
+  })
   const [account] = await pool.scan()
   try {
     await pool.ensureFresh(account)
     const onDisk = readSignIn(file).auth
     assert.equal(onDisk.accessToken, 'renewed-token', 'the new access token reaches the file')
     assert.equal(onDisk.refreshToken, 'renewed-refresh', 'and so does the rotated refresh token')
+    assert.equal(onDisk.domain, domain, 'the renewed routing domain reaches the file')
     assert.ok(onDisk.expiresAt > Date.now() + 27 * DAY, 'and the stored expiry moves forward with it')
     assert.ok(onDisk.lastRefreshTime > Date.now() - 60_000, 'stamped with the moment of the renewal')
 
@@ -95,6 +99,9 @@ test('the renewal is written back into the sign-in file it came from', async () 
     const [after] = await pool.scan()
     assert.equal(after.credential.accessToken, 'renewed-token',
       'a later scan keeps the renewed token rather than reading the superseded one back')
+    const restarted = new WorkBuddyAccountPool({ authDirs: [path.dirname(file)], dataPath: () => dataDir })
+    const [reloaded] = await restarted.scan()
+    assert.equal(reloaded.credential.domain, domain, 'the renewed routing domain survives a restart')
   } finally {
     await cleanup(dataDir)
   }

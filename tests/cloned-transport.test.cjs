@@ -88,31 +88,80 @@ for (const [name, open] of Object.entries(clients)) {
       }
     })
   }
-  test(`${name} closes a refused HTTP transport while the host captures a clone`, async () => {
-    let captured, onClose
-    const closed = new Promise(resolve => { onClose = resolve })
-    const server = createServer((_req, res) => {
-      res.on('close', onClose)
-      res.writeHead(429, { 'content-type': 'text/plain' })
-      // Exceed every client's error-body bound, then keep the connection open.
-      res.write('rate limited ' + 'x'.repeat(10_000))
+  for (const status of name === 'workbuddy' ? [429, 200] : [429]) {
+    test(`${name} closes a refused HTTP ${status} transport while the host captures a clone`, async () => {
+      let captured, onClose
+      const closed = new Promise(resolve => { onClose = resolve })
+      const server = createServer((_req, res) => {
+        res.on('close', onClose)
+        res.writeHead(status, { 'content-type': status === 200 ? 'application/json' : 'text/plain' })
+        // Exceed every client's error-body bound, then keep the connection open.
+        res.write(status === 200
+          ? JSON.stringify({ code: 6004, msg: 'rate limited', padding: 'x'.repeat(10_000) })
+          : 'rate limited ' + 'x'.repeat(10_000))
+      })
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+      try {
+        const result = await open(async (_url, init) => {
+          const response = await fetch(`http://127.0.0.1:${server.address().port}/chat`, init)
+          captured = response.clone().text().then(() => {}, () => {})
+          return response
+        })
+        if (status === 200) {
+          assert.equal(result.ok, true)
+          assert.match(await result.response.text(), /rate limited/)
+        } else {
+          assert.equal(result.ok, false)
+          assert.equal(result.status, status)
+          assert.match(result.message, /^rate limited /)
+        }
+        await within(captured)
+        await within(closed)
+      } finally {
+        server.closeAllConnections()
+        await new Promise(resolve => server.close(resolve))
+        await captured
+      }
+    })
+  }
+}
+
+for (const refused of ['directory', 'reasoning']) {
+  test(`trae closes a refused ${refused} response while the host captures a clone`, async () => {
+    const captured = [], closed = []
+    const server = createServer((req, res) => {
+      if (refused === 'reasoning' && req.url === '/directory') {
+        res.end(JSON.stringify({ config_info_list: [{ config_name: 'fixture-model' }] }))
+        return
+      }
+      closed.push(new Promise(resolve => res.once('close', resolve)))
+      res.writeHead(403, { 'content-type': 'text/plain' })
+      res.write('fixture upstream refusal')
     })
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
-    try {
-      const result = await open(async (_url, init) => {
-        const response = await fetch(`http://127.0.0.1:${server.address().port}/chat`, init)
-        captured = response.clone().text().then(() => {}, () => {})
+    const client = new TraeSoloUpstreamClient({
+      credential: async () => ({ accessToken: 'fixture', userId: 'fixture', edition: 'cn', source: 'desktop', expiresAtMs: 0 }),
+      identity: async () => ({ machineId: 'fixture', deviceId: 'fixture', platform: 'win32' }),
+      fetchImpl: async (url, init) => {
+        const route = String(url).includes('get_detail_param') ? 'directory' : 'reasoning'
+        const response = await fetch(`http://127.0.0.1:${server.address().port}/${route}`, init)
+        captured.push(response.clone().text().then(() => {}, () => {}))
         return response
-      })
-      assert.equal(result.ok, false)
-      assert.equal(result.status, 429)
-      assert.match(result.message, /^rate limited /)
-      await within(captured)
-      await within(closed)
+      },
+    })
+    try {
+      if (refused === 'directory') await assert.rejects(client.fetchModels(), /HTTP 403/)
+      else {
+        const result = await client.fetchModels()
+        assert.deepEqual(result.models.map(model => model.id), ['fixture-model'])
+        assert.equal(result.partial, false)
+      }
+      assert.ok(closed.length > 0)
+      await within(Promise.all([...captured, ...closed]))
     } finally {
       server.closeAllConnections()
       await new Promise(resolve => server.close(resolve))
-      await captured
+      await Promise.all(captured)
     }
   })
 }

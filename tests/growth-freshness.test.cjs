@@ -11,7 +11,7 @@ const helpers = file.statements.filter(node =>
   || ts.isVariableStatement(node) && node.declarationList.declarations.some(value => value.name.getText(file) === 'GROWTH_STALE_MS'))
   .map(node => node.getText(file)).join('\n')
 function loadFreshness() {
-  const context = vm.createContext({ state: null, growthState: null, Date, t: key => key,
+  const context = vm.createContext({ activeTab: 'pool', state: null, growthState: null, Date, t: key => key,
     num: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback })
   vm.runInContext(helpers, context)
   return context
@@ -46,6 +46,18 @@ test('the later of a manual run and a scheduled pass is shown', () => {
   assert.equal(context.growthLastRun().detail.makeup, 2)
   context.state.autoCheckin.last.at = '2026-10-30T18:32:00Z'
   assert.equal(context.growthLastRun().detail.streak, 1)
+})
+
+test('only navigating to a different view resets the scroll position', () => {
+  const context = loadFreshness()
+  let offset = 45
+  Object.assign(context, { $: id => id, show() {}, document: { querySelectorAll: () => [] },
+    pageScrollTo: top => { offset = top }, requestModelRoster() {} })
+
+  context.selectTab('pool')
+  assert.equal(offset, 45)
+  context.selectTab('models')
+  assert.equal(offset, 0)
 })
 
 test('entering the growth tab refreshes a stale read and waits for running work', () => {

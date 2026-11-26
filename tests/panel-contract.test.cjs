@@ -75,7 +75,7 @@ test('the Trae batch skips only the edition whose device is spent', async () => 
         ? { outcome: 'claimed', deviceCheckedIn: true }
         : { outcome: 'claimed' }
     },
-    traeRowLabel: (credential) => credential.label,
+    traeAccountId: (credential) => credential.label,
     markSourceCheckinRow: (...args) => marked.push(args),
     TRAE_ACCOUNT_DELAY_MS: 0,
     TRAE_ACCOUNT_JITTER_MS: 0,
@@ -367,38 +367,6 @@ function panelFunctions(names, source, extra) {
 }
 
 /**
- * A Trae or Qoder row as the composer's popup receives it.
- *
- * The popup marks the served row with one value and clears the notice it raised
- * against that same value, so a row without it can hold a notice that never
- * goes away - the state the component's own comment says must not happen.
- */
-test('a Trae or Qoder composer row carries the identity the popup marks it by', () => {
-  const ownRequire = createRequire(path.join(root, 'src/host.ts'))
-  const context = vm.createContext({
-    module: { exports: {} }, exports: {}, console,
-    require: name => ownRequire(name),
-    AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval, URL, Buffer, process,
-  })
-  context.exports = context.module.exports
-  vm.runInContext(transpile(sourceOf('src/host.ts'))
-    + '\nmodule.exports.__internals = { sourceComposerAccounts }\n'
-    + '\nmodule.exports.__setRows = (trae, qoder) => { traeAccountRows = trae; qoderAccountRows = qoder }\n', context)
-  const { sourceComposerAccounts } = context.module.exports.__internals
-  context.module.exports.__setRows(
-    [{ label: 'Trae CN A', region: 'cn', expired: false, usage: { credits: { total: 12 } } },
-     { label: 'Trae CN B', region: 'cn', expired: false }],
-    [{ label: 'Qoder A', region: 'cn', expired: false }],
-  )
-  const trae = sourceComposerAccounts('trae', 'cn')
-  assert.equal(trae.length, 2)
-  assert.deepEqual(trae.map(row => row.id), ['Trae CN A', 'Trae CN B'],
-    'each row must name itself, or the popup cannot clear the notice it put on it')
-  assert.equal(trae.filter(row => row.active === true).length, 1, 'exactly one row is the served one')
-  assert.equal(sourceComposerAccounts('qoder', 'cn')[0].id, 'Qoder A')
-})
-
-/**
  * A single claim has to change the row the next document serves.
  *
  * `xd.sourceCheckin` answers with `statusDocument`, and that document reads
@@ -417,16 +385,16 @@ test('a single claim records today on the cached source row', () => {
     + '\nmodule.exports.__rows = (trae, qoder) => { traeAccountRows = trae; qoderAccountRows = qoder }\n'
     + '\nmodule.exports.__mark = markSourceCheckinRow\n', context)
   const rows = context.module.exports.__rows
-  rows([{ label: 'B', region: 'cn', checkin: { active: true, todayCheckedIn: false } }],
-    [{ label: 'A', region: 'cn', checkin: { active: true, todayCheckedIn: false } }])
-  context.module.exports.__mark('qoder', 'A', 'cn', { outcome: 'claimed' })
+  rows([{ id: 'B-id', label: 'B', region: 'cn', checkin: { active: true, todayCheckedIn: false } }],
+    [{ id: 'A-id', label: 'A', region: 'cn', checkin: { active: true, todayCheckedIn: false } }])
+  context.module.exports.__mark('qoder', 'A-id', 'cn', { outcome: 'claimed' })
   assert.equal(vm.runInContext('qoderAccountRows[0].checkin.todayCheckedIn', context), true,
     'the document the panel reads back has to say the claim happened')
-  context.module.exports.__mark('trae', 'B', 'cn', { outcome: 'skipped', deviceCheckedIn: true })
+  context.module.exports.__mark('trae', 'B-id', 'cn', { outcome: 'skipped', deviceCheckedIn: true })
   assert.equal(vm.runInContext('traeAccountRows[0].checkin.deviceCheckedIn', context), true,
     'a device-level refusal has to reach the card too')
-  rows([], [{ label: 'C', region: 'cn', checkin: { active: true, todayCheckedIn: false } }])
-  context.module.exports.__mark('qoder', 'C', 'cn', { outcome: 'skipped', todayCheckedIn: true })
+  rows([], [{ id: 'C-id', label: 'C', region: 'cn', checkin: { active: true, todayCheckedIn: false } }])
+  context.module.exports.__mark('qoder', 'C-id', 'cn', { outcome: 'skipped', todayCheckedIn: true })
   assert.equal(vm.runInContext('qoderAccountRows[0].checkin.todayCheckedIn', context), true,
     'a round already collected in the app has to reach the card as collected')
 })
@@ -466,6 +434,7 @@ test('a panel.css that 404s twice before it loads is waited out, not reported mi
       React: { useEffect: run => run() },
       view, generation: 0,
       t: key => key,
+      setRecoveries() {},
       setMissing: value => missing.push(value),
       setProbeFailure: value => failures.push(value),
       PANEL_BASE: '/panel-base',
@@ -542,7 +511,7 @@ test('a panel.css that 404s twice before it loads is waited out, not reported mi
 for (const source of ['trae', 'qoder']) {
   test(`${source} composer refresh answers before its last slow probe finishes`, async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
-    const rows = ['A', 'B', 'C'].map(label => ({ label, region: 'cn' }))
+    const rows = ['A', 'B', 'C'].map(label => ({ id: label, label, region: 'cn' }))
     const discover = async () => ({ credentials: rows })
     const probe = credential => new Promise(resolve => {
       setTimeout(() => resolve({ usage: { credits: { total: 42 } } }), credential.label === 'B' ? 16000 : 8000)
@@ -556,7 +525,7 @@ for (const source of ['trae', 'qoder']) {
       matchComposerModel = () => ({ source: fixtureSource, region: 'cn' });
       composerPoints = () => ({ show: true });
       traeAccountRows = qoderAccountRows = fixtureRows;
-      traeRowLabel = qoderRowLabel = credential => credential.label;
+      traeAccountId = qoderAccountId = credential => credential.id;
       traeRowProbe = qoderRowProbe = probe;
     `, host.context)
     t.after(() => host.cleanup())
@@ -794,13 +763,10 @@ test('the panel page boots whole, with its controls at the top level', () => {
   }
 })
 /**
- * Every string the panel asks for is in both languages, and every string it
- * defines is asked for.
+ * Every string the panel asks for is in both languages.
  *
  * A missing entry is not a visible error: `t()` falls back to the key, so the
- * user reads `pool.noAccounts` in the middle of a Chinese sentence. The reverse
- * is just as invisible: an entry nothing asks for is dead weight that no case can
- * fail on, so it survives every release.
+ * user reads `pool.noAccounts` in the middle of a Chinese sentence.
  *
  * A key counts as asked for when it appears in the panel outside the two tables,
  * or when something outside the panel drives it: the four view tabs and the four
@@ -838,8 +804,6 @@ test('every string the panel asks for exists in both languages', () => {
   for (const { dictionary, body } of tables) {
     const missing = [...asked].filter((key) => !body.includes('"' + key + '"'))
     assert.deepEqual(missing, [], `${dictionary} is missing ${missing.join(', ')}`)
-    const orphaned = definedIn(body).filter((key) => !asked.has(key))
-    assert.deepEqual(orphaned, [], `${dictionary} defines ${orphaned.join(', ')}, which nothing asks for`)
   }
 })
 

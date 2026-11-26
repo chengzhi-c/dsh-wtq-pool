@@ -336,14 +336,13 @@ async function cleanupTerminalReclaims(lock: string): Promise<boolean> {
     try {
       const parsed = JSON.parse(await readFile(claim, 'utf8')) as unknown
       owner = typeof parsed === 'object' && parsed !== null ? parsed as LockRecord : {}
-    } catch { /* A sidecar still marks the generation as abandoned. */ }
+    } catch { /* Without a readable owner, a sidecar cannot identify this claim. */ }
     const terminalState = owner?.state === 'complete' || owner?.state === 'abandoned'
-    // Only a token this process remembers can make an unreadable claim
-    // abandoned. Two undefined tokens compared equal before, and a scanner that
-    // blocked the read made another process's live claim deletable.
     const rememberedAbandonment = owner?.token !== undefined
       && ABANDONED_RECLAIMS.get(claim) === owner.token
-    if (sidecars.length === 0 && !terminalState && !rememberedAbandonment) continue
+    const markedAbandoned = typeof owner?.token === 'string'
+      && sidecars.includes(`${claimName}.abandoned.${owner.token}`)
+    if (!markedAbandoned && !terminalState && !rememberedAbandonment) continue
     let claimRemoved = false
     try {
       await unlink(claim)
@@ -393,7 +392,6 @@ async function claimStaleReclaim(
     .map(name => join(directory, name))
   for (const claim of claims) {
     const claimName = basename(claim)
-    if (names.some(name => name.startsWith(`${claimName}.abandoned.`))) return undefined
     let owner: LockRecord = {}
     try {
       const parsed = JSON.parse(await readFile(claim, 'utf8')) as unknown
@@ -406,6 +404,7 @@ async function claimStaleReclaim(
     }
     // A terminal claim the cleanup could not unlink still fences this path.
     // Adding a generation beside it would grow the directory on every retry.
+    if (typeof owner.token === 'string' && names.includes(`${claimName}.abandoned.${owner.token}`)) return undefined
     if (owner.state === 'complete' || owner.state === 'abandoned') return undefined
     if (owner.token !== undefined && ABANDONED_RECLAIMS.get(claim) === owner.token) return undefined
     if (await lockState(claim, probeTimeoutMs, probe) === 'current') return undefined

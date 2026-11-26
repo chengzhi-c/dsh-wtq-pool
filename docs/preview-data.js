@@ -223,7 +223,7 @@
       preferred: { cn: '', ai: '' },
       accounts: [
         {
-          label: 'Trae CN', region: 'cn', app: 'Trae CN', email: 'lin.cn@example.com',
+          id: 'trae-cn-1', label: 'Trae CN', region: 'cn', app: 'Trae CN', email: 'lin.cn@example.com',
           expiresAt: ms(3), expired: false,
           usage: {
             credits: {
@@ -237,7 +237,7 @@
           checkin: { active: true, todayCheckedIn: false, deviceCheckedIn: false, amount: 100, unit: 'credits' },
         },
         {
-          label: 'Trae International', region: 'ai', app: 'Trae', email: 'lin.intl@example.com',
+          id: 'trae-ai-1', label: 'Trae International', region: 'ai', app: 'Trae', email: 'lin.intl@example.com',
           expiresAt: ms(8), expired: false,
           usage: { plan: { name: 'Pro', inTrial: false } },
           checkin: { active: false, todayCheckedIn: false, deviceCheckedIn: false },
@@ -266,7 +266,7 @@
       preferred: { cn: '', global: '' },
       accounts: [
         {
-          label: 'Qoder CN', region: 'cn', expiresAt: ms(11), expired: false,
+          id: 'qoder-cn-1', label: 'Qoder CN', region: 'cn', expiresAt: ms(11), expired: false,
           usage: {
             credits: {
               total: 500,
@@ -279,7 +279,7 @@
           checkin: { active: true, todayCheckedIn: true, amount: 50, unit: 'credits' },
         },
         {
-          label: 'Qoder Global', region: 'global', expiresAt: ms(5), expired: false,
+          id: 'qoder-global-1', label: 'Qoder Global', region: 'global', expiresAt: ms(5), expired: false,
           usage: { plan: { name: 'Trial', inTrial: true } },
           checkin: { active: false, todayCheckedIn: false },
         },

@@ -91,6 +91,7 @@ export interface OwnSignIn {
   domain: string
   uid: string
   uin: string
+  linkedUin?: string
   enterpriseId: string
   nickname: string
   /**
@@ -135,6 +136,8 @@ export interface WorkBuddyCredential {
   lastRefreshAtMs?: number
   nickname?: string
   uin?: string
+  /** Billing identity learned after this account was keyed by UID. */
+  linkedUin?: string
   uid?: string
   enterpriseId?: string
   domain: string
@@ -340,9 +343,9 @@ export function parseWorkBuddyAuth(
     && refreshExpiresAtMs > 0
     && refreshExpiresAtMs < Date.now()
 
-  const lastRefreshAtMs = typeof auth['lastRefreshTime'] === 'number'
-    ? expiryToMs(auth['lastRefreshTime'])
-    : undefined
+  const issued = auth['lastRefreshTime'] ?? auth['lastRefreshAtMs']
+  const expires = auth['expiresAt'] ?? auth['expiresAtMs']
+  const lastRefreshAtMs = typeof issued === 'number' ? expiryToMs(issued) : undefined
   const nickname = optionalString(decryptableString(identity['nickname'], decrypt))
 
   return {
@@ -350,11 +353,12 @@ export function parseWorkBuddyAuth(
     refreshToken: refreshExpired ? '' : refreshToken,
     ...!refreshExpired && refreshField !== undefined && refreshToken === ''
       ? { refreshTokenUnavailable: true } : {},
-    expiresAtMs: typeof auth['expiresAt'] === 'number' ? expiryToMs(auth['expiresAt']) : 0,
+    expiresAtMs: typeof expires === 'number' ? expiryToMs(expires) : 0,
     ...refreshExpiresAtMs === undefined || refreshExpired ? {} : { refreshExpiresAtMs },
     ...lastRefreshAtMs === undefined ? {} : { lastRefreshAtMs },
     ...nickname === undefined ? {} : { nickname },
     ...optionalString(identity['uin']) === undefined ? {} : { uin: optionalString(identity['uin']) },
+    ...optionalString(identity['linkedUin']) === undefined ? {} : { linkedUin: optionalString(identity['linkedUin']) },
     ...optionalString(identity['uid']) === undefined ? {} : { uid: optionalString(identity['uid']) },
     ...optionalString(identity['enterpriseId']) === undefined
       ? {}
@@ -362,6 +366,14 @@ export function parseWorkBuddyAuth(
     domain: typeof auth['domain'] === 'string' ? auth['domain'] : '',
     sourcePath,
   }
+}
+
+/** Read the disk index without exposing an opaque envelope as a usable token. */
+export function sealedSignInMetadata(text: string, sourcePath: string) {
+  const stored = parseWorkBuddyAuth(text, sourcePath, () => 'sealed')
+  if (!stored || !(stored.uin || stored.uid)) return undefined
+  const { uin, linkedUin, uid, domain, lastRefreshAtMs, expiresAtMs } = stored
+  return { uin, linkedUin, uid, domain, lastRefreshAtMs, expiresAtMs, sourcePath }
 }
 
 /**
@@ -407,6 +419,9 @@ function isLiveAuthFile(path: string): boolean {
   return name === WORKBUDDY_LIVE_FILENAME || name === WORKBUDDY_GLOBAL_LIVE_FILENAME
 }
 
+type CredentialFreshness = Pick<WorkBuddyCredential, 'sourcePath' | 'expiresAtMs' | 'lastRefreshAtMs'>
+  & Partial<Pick<WorkBuddyCredential, 'accessToken' | 'refreshToken' | 'refreshTokenUnavailable'>>
+
 /**
  * Which of two credentials for the same account the pool should keep.
  *
@@ -432,7 +447,7 @@ function isLiveAuthFile(path: string): boolean {
  * later than the token that actually works. Selecting on it made every upstream
  * call return 401 while a perfectly good credential sat in the same directory.
  */
-function compareFreshness(a: WorkBuddyCredential, b: WorkBuddyCredential, ownDir: string): number {
+function compareFreshness(a: CredentialFreshness, b: CredentialFreshness, ownDir: string): number {
   const aIssued = a.lastRefreshAtMs ?? 0
   const bIssued = b.lastRefreshAtMs ?? 0
   if (aIssued !== bIssued && aIssued > 0 && bIssued > 0) return bIssued - aIssued
@@ -462,14 +477,14 @@ function compareFreshness(a: WorkBuddyCredential, b: WorkBuddyCredential, ownDir
  * the plugin renews it and nothing renews the snapshot: the same token, but one
  * of the two copies has a future.
  */
-function credentialRank(credential: WorkBuddyCredential, ownDir: string): number {
+function credentialRank(credential: Pick<WorkBuddyCredential, 'sourcePath'>, ownDir: string): number {
   if (isLiveAuthFile(credential.sourcePath)) return 0
   if (ownSignInPath(credential.sourcePath, ownDir)) return 1
   return 2
 }
 
 /** True when `candidate` should replace `incumbent` for the same account. */
-export function isFresher(candidate: WorkBuddyCredential, incumbent: WorkBuddyCredential, ownDir: string): boolean {
+export function isFresher(candidate: CredentialFreshness, incumbent: CredentialFreshness, ownDir: string): boolean {
   const ordering = compareFreshness(candidate, incumbent, ownDir)
   if (candidate.accessToken !== incumbent.accessToken) return ordering < 0
 
@@ -1146,7 +1161,7 @@ export function ownSignInDir(dataPath: string): string {
  * credential spells it as an absent field; coalescing here keeps that meeting
  * point in one place rather than in every writer.
  */
-function ownSignInOf(credential: WorkBuddyCredential): OwnSignIn {
+export function ownSignInOf(credential: WorkBuddyCredential): OwnSignIn {
   return {
     region: regionOf(credential.domain),
     accessToken: credential.accessToken,
@@ -1156,6 +1171,7 @@ function ownSignInOf(credential: WorkBuddyCredential): OwnSignIn {
     ...credential.lastRefreshAtMs === undefined ? {} : { lastRefreshAtMs: credential.lastRefreshAtMs },
     uid: credential.uid ?? '',
     uin: credential.uin ?? '',
+    ...credential.linkedUin === undefined ? {} : { linkedUin: credential.linkedUin },
     enterpriseId: credential.enterpriseId ?? '',
     nickname: credential.nickname ?? '',
   }
@@ -1174,10 +1190,27 @@ export async function writeOwnSignIn(
   signIn: OwnSignIn,
   signal?: AbortSignal,
 ): Promise<string> {
-  const file = ownSignInFile(directory, signIn)
+  const file = await ownSignInFile(directory, signIn)
+  signal?.throwIfAborted()
   return await withSignInWriteLock(file, async () => {
     await writeOwnSignInDocument(file, signIn, signal)
     return file
+  })
+}
+
+export async function importOwnSignIn(directory: string, signIn: OwnSignIn, force = false): Promise<boolean> {
+  const file = await ownSignInFile(directory, signIn)
+  return await withSignInWriteLock(file, async () => {
+    const text = await readFile(file, 'utf8').catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined
+      throw error
+    })
+    if (text !== undefined) {
+      const current = parseWorkBuddyAuth(text, file) ?? sealedSignInMetadata(text, file)
+      if (current && (!force || !isFresher({ ...signIn, sourcePath: file }, current, directory))) return false
+    }
+    await writeOwnSignInDocument(file, signIn)
+    return true
   })
 }
 
@@ -1185,7 +1218,21 @@ const signInWriteQueues = new Map<string, Promise<void>>()
 
 async function withSignInWriteLock<T>(file: string, work: () => Promise<T>): Promise<T> {
   const previous = signInWriteQueues.get(file) ?? Promise.resolve()
-  const run = previous.then(work, work)
+  const locked = async () => {
+    let result!: T
+    let completed = false
+    try {
+      await withFileLock(`${file}.lock`, async () => {
+        result = await work()
+        completed = true
+      })
+    } catch (error: unknown) {
+      // A committed sign-in mutation stays successful if only its lock release fails.
+      if (!completed || !(error instanceof FileLockReleaseError)) throw error
+    }
+    return result
+  }
+  const run = previous.then(locked, locked)
   const settled = run.then(() => undefined, () => undefined)
   signInWriteQueues.set(file, settled)
   try {
@@ -1195,10 +1242,34 @@ async function withSignInWriteLock<T>(file: string, work: () => Promise<T>): Pro
   }
 }
 
-function ownSignInFile(directory: string, signIn: OwnSignIn): string {
-  const stable = signIn.uin === '' ? signIn.uid : signIn.uin
-  const suffix = stable === '' ? randomUUID() : stable.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32)
-  return join(directory, `${OWN_SIGN_IN_PREFIX}${suffix === '' ? randomUUID() : suffix}.info`)
+function isLegacyRandomSignIn(name: string): boolean {
+  return name.startsWith(OWN_SIGN_IN_PREFIX) && /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}\.info$/.test(name.slice(OWN_SIGN_IN_PREFIX.length))
+}
+
+async function ownSignInFile(directory: string, signIn: OwnSignIn): Promise<string> {
+  const stable = signIn.uin || signIn.uid
+  const filename = (suffix: string) => `${OWN_SIGN_IN_PREFIX}${suffix}.info`
+  if (!stable) return join(directory, filename(randomUUID()))
+
+  const hashed = filename(createHash('sha256').update(stable).digest('hex'))
+  const names: string[] = await readdir(directory).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return []
+    throw error
+  })
+  if (names.includes(hashed)) return join(directory, hashed)
+
+  // 1.4.1 stripped and truncated the identity, or used a UUID if nothing remained.
+  // Reuse its file only for its recorded owner.
+  const legacy = stable.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32)
+  const candidates = names.filter(name => legacy
+    ? name.toLowerCase() === filename(legacy).toLowerCase()
+    : isLegacyRandomSignIn(name))
+  for (const name of candidates) {
+    const file = join(directory, name)
+    const owner = parseWorkBuddyAuth(await readFile(file, 'utf8'), file)
+    if ((owner?.uin ?? owner?.uid) === stable) return file
+  }
+  return join(directory, /^\d{1,32}$/.test(stable) && !candidates.length ? filename(stable) : hashed)
 }
 
 async function writeOwnSignInDocument(file: string, signIn: OwnSignIn, signal?: AbortSignal): Promise<void> {
@@ -1219,6 +1290,7 @@ async function writeOwnSignInDocument(file: string, signIn: OwnSignIn, signal?: 
       account: {
         ...signIn.uid === '' ? {} : { uid: signIn.uid },
         ...signIn.uin === '' ? {} : { uin: signIn.uin },
+        ...signIn.linkedUin === undefined ? {} : { linkedUin: signIn.linkedUin },
         ...signIn.enterpriseId === '' ? {} : { enterpriseId: signIn.enterpriseId },
         ...signIn.nickname === '' ? {} : { nickname: signIn.nickname },
       },
@@ -1237,8 +1309,8 @@ async function writeOwnSignInDocument(file: string, signIn: OwnSignIn, signal?: 
  * Rewrite one of the plugin's own sign-in files with a renewed token.
  *
  * Read-modify-write of the document that is already there, so the identity
- * fields the vendor's own parser looks for survive untouched and only the three
- * auth values a refresh replaces are written. Atomic for the same reason as the
+ * fields the vendor's own parser looks for survive untouched and the refreshed
+ * auth values are updated. Atomic for the same reason as the
  * archive: a truncated `.info` is an account the scan cannot open.
  */
 export async function renewOwnSignInFile(
@@ -1265,7 +1337,12 @@ export async function renewOwnSignInFile(
       }
       return true
     }
-    const document = JSON.parse(text) as { auth?: Record<string, unknown> }
+    let document: { auth?: Record<string, unknown> }
+    try {
+      document = JSON.parse(text)
+    } catch {
+      throw new Error('sign-in file is not valid JSON')
+    }
     const auth = document.auth ?? {}
     if (auth.accessToken !== previous.accessToken) {
       const onDisk = parseWorkBuddyAuth(text, file)
@@ -1274,6 +1351,7 @@ export async function renewOwnSignInFile(
     }
     auth.accessToken = credential.accessToken
     auth.refreshToken = credential.refreshToken
+    auth.domain = credential.domain
     auth.expiresAt = credential.expiresAtMs
     auth.lastRefreshTime = credential.lastRefreshAtMs ?? Date.now()
     document.auth = auth
@@ -1361,7 +1439,7 @@ function sameDirs(a: readonly string[], b: readonly string[]): boolean {
  * throws, so the writer leaves the file alone instead of saving an empty one
  * over every sign-in it still holds.
  */
-async function readArchivedCredentials(file: string): Promise<{ stored: Map<string, WorkBuddyCredential>, pruned: boolean }> {
+export async function readArchivedCredentials(file: string): Promise<{ stored: Map<string, WorkBuddyCredential>, pruned: boolean }> {
   const result = { stored: new Map<string, WorkBuddyCredential>(), pruned: false }
   const { stored } = result
   let text: string
@@ -1411,6 +1489,7 @@ async function readArchivedCredentials(file: string): Promise<{ stored: Map<stri
       ...lastRefreshAt === 0 ? {} : { lastRefreshAtMs: lastRefreshAt },
       ...typeof record['nickname'] !== 'string' || record['nickname'] === '' ? {} : { nickname: record['nickname'] },
       ...typeof record['uin'] !== 'string' || record['uin'] === '' ? {} : { uin: record['uin'] },
+      ...optionalString(record['linkedUin']) === undefined ? {} : { linkedUin: optionalString(record['linkedUin']) },
       ...typeof record['uid'] !== 'string' || record['uid'] === '' ? {} : { uid: record['uid'] },
       ...typeof record['enterpriseId'] !== 'string' || record['enterpriseId'] === '' ? {} : { enterpriseId: record['enterpriseId'] },
       domain: typeof record['domain'] === 'string' ? record['domain'] : '',
@@ -1499,6 +1578,7 @@ async function writeArchivedCredentials(
       ...credential.lastRefreshAtMs === undefined ? {} : { lastRefreshAtMs: credential.lastRefreshAtMs },
       ...credential.nickname === undefined ? {} : { nickname: credential.nickname },
       ...credential.uin === undefined ? {} : { uin: credential.uin },
+      ...credential.linkedUin === undefined ? {} : { linkedUin: credential.linkedUin },
       ...credential.uid === undefined ? {} : { uid: credential.uid },
       ...credential.enterpriseId === undefined ? {} : { enterpriseId: credential.enterpriseId },
       domain: credential.domain,
@@ -2054,18 +2134,50 @@ export class WorkBuddyAccountPool {
       replaced = tombstone === undefined
         || !tombstoneBlocks({ record: tombstone, current: true }, deletingCredential)
     }
-    // Share the writer's queue from the identity check through the unlink:
-    // a re-login must not replace the old document between those two acts.
     try {
-      await withSignInWriteLock(ownedPath, async () => {
-        const onDisk = await readCredential(ownedPath)
-        if (!replaced) {
-          replaced = onDisk.kind === 'sealed'
-            || onDisk.kind === 'unreadable'
-            || (onDisk.kind === 'credential'
-              && (workbuddyAccountId(onDisk.credential) !== account.id
-                || !sameCredential(onDisk.credential)))
+      const stable = deletingCredential.uin ?? deletingCredential.uid
+      if (!replaced && stable && !/[A-Za-z0-9_-]/.test(stable)) {
+        // 1.4.1 wrote a different UUID on every login for this kind of identity.
+        const directory = ownSignInDir(this.dataPath?.() ?? '')
+        const entries = await readdir(directory, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return []
+          throw error
+        })
+        for (const entry of entries) {
+          const file = join(directory, entry.name)
+          if (!entry.isFile() || !isLegacyRandomSignIn(entry.name) || resolve(file) === resolve(ownedPath)) continue
+          await withSignInWriteLock(file, async () => {
+            let text: string
+            try {
+              text = await readFile(file, 'utf8')
+            } catch (error: unknown) {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+              throw error
+            }
+            const copy = parseWorkBuddyAuth(text, file)
+            const owner = copy ?? sealedSignInMetadata(text, file)
+            if (!owner || (owner.uin ?? owner.uid) !== stable) return
+            const issued = owner.lastRefreshAtMs ?? 0
+            const removable = copy ? !endsTombstone(recorded.written, copy)
+              : issued > 0 && issued < recorded.written.lastRefreshAtMs
+            if (!removable) {
+              replaced = true
+              return
+            }
+            await unlink(file)
+            await removeAbandonedTemps(file, 0)
+          })
+          if (replaced) break
         }
+      }
+      // A conflicting historical copy must not cost the user their current login.
+      // Recheck the selected file under its writer's lock immediately before unlink.
+      if (!replaced) await withSignInWriteLock(ownedPath, async () => {
+        const onDisk = await readCredential(ownedPath)
+        replaced = onDisk.kind === 'sealed'
+          || onDisk.kind === 'unreadable'
+          || (onDisk.kind === 'credential'
+            && (workbuddyAccountId(onDisk.credential) !== account.id || !sameCredential(onDisk.credential)))
         if (replaced) return
         try {
           const tombstoneFile = this.deletedSignInsFile()
@@ -2359,29 +2471,34 @@ export class WorkBuddyAccountPool {
       // copy would be a different account on every scan and the pool would grow
       // without bound. Such a snapshot keeps serving from where it lies.
       if ((credential.uin ?? credential.uid ?? '') === '') continue
-      let file: string
+      let adoptedCredential: WorkBuddyCredential | undefined
       try {
-        // The document said nothing about when this token was issued, and this
-        // build must not invent a date for it: the ranking trusts a date on a copy
-        // the plugin wrote, so an invented one made a superseded snapshot outrank
-        // the session the app is signed into once the user went back to it.
-        file = await writeOwnSignIn(directory, { ...ownSignInOf(credential), lastRefreshAtMs: credential.lastRefreshAtMs ?? 0 }, signal)
+        // An unknown issue time must not make a copied snapshot newer than a live login.
+        const signIn = { ...ownSignInOf(credential), lastRefreshAtMs: credential.lastRefreshAtMs ?? 0 }
+        const file = await ownSignInFile(directory, signIn)
+        adoptedCredential = await withSignInWriteLock(file, async () => {
+          // A login or another scan may have created the own copy after discovery.
+          const current = await readCredential(file)
+          if (current.kind === 'credential') return current.credential
+          if (current.kind !== 'absent') return undefined
+          await writeOwnSignInDocument(file, signIn, signal)
+          const copied = { ...credential, sourcePath: file }
+          // Keep cleanup under the writer's lock so it cannot remove a later login.
+          const after = await this.loadDeletedSignIns(signal)
+          const afterEntry = after === undefined ? undefined : tombstoneOf(after, copied, id)
+          if (after === undefined || (afterEntry !== undefined && tombstoneBlocks(afterEntry, copied))) {
+            await unlink(file).catch(() => {})
+            return undefined
+          }
+          return copied
+        })
       } catch (error: unknown) {
         if (signal.aborted) break
-        // A snapshot the plugin could not copy is still a snapshot: it keeps
-        // serving from where it lies, exactly as before.
+        // A snapshot the plugin could not copy keeps serving from where it lies.
         this.logger?.warn?.(`${LOG_PREFIX}: could not take over ${accountLogTag(accountLabel(credential))}: ${String(error)}`)
         continue
       }
-      const adoptedCredential: WorkBuddyCredential = { ...credential, sourcePath: file }
-      // The copy has a path of its own, so the delete's unlink cannot reach it.
-      // If a tombstone appeared during the copy, the copy has to go back out.
-      const after = await this.loadDeletedSignIns(signal)
-      const afterEntry = after === undefined ? undefined : tombstoneOf(after, adoptedCredential, id)
-      if (after === undefined || (afterEntry !== undefined && tombstoneBlocks(afterEntry, adoptedCredential))) {
-        await unlink(file).catch(() => {})
-        continue
-      }
+      if (adoptedCredential === undefined) continue
       ownedIds.add(id)
       adopted.push(adoptedCredential)
     }
@@ -2418,7 +2535,7 @@ export class WorkBuddyAccountPool {
     // maintains claims the account with the token that was just minted.
     const directory = ownSignInDir(this.dataPath?.() ?? '')
     if (directory === '') return true
-    const file = ownSignInFile(directory, ownSignInOf(credential))
+    const file = await ownSignInFile(directory, ownSignInOf(credential))
     if (!await guard()) return false
     const written = await renewOwnSignInFile(file, credential, previous, true, guard)
     if (written) credential.sourcePath = file

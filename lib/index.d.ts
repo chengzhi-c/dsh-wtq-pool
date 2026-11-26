@@ -68,7 +68,9 @@ interface Config {
   /** Picked WorkBuddy account per region. */
   preferredAccountIds?: Record<string, string>;
   /** Picked Trae/Qoder account per region. */
-  preferredSourceAccounts?: Record<string, string>;
+  preferredSourceAccounts?: Record<string, string | {
+    id: string;
+  }>;
   /** Accounts removed from the pool, with their label and region kept so the panel can restore them. */
   removedAccounts?: unknown[];
   /** Whether the credits readout is shown beside the composer. */

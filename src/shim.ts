@@ -651,19 +651,21 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     let effortFallback: string | undefined
     let effortFallbackBuilt = false
 
-    // One attempt per account, one retry for an account whose sign-in was
-    // refreshed, and two beyond that. The old fixed eight stopped before a
-    // healthy tail when several session-dead accounts each spent their retry.
-    const maxAttempts = Math.max(8, pool.list(region).length * 2 + 2)
-    const maxEmptyStreams = emptyStreamAttemptsFor(pool.list(region).length)
+    // First acquisition discovers a cold pool before its size sets retry limits.
+    if (controller.signal.aborted) return
+    const firstAccount = await pool.acquire(modelId, region, conversationKey, skipped)
+    const poolSize = pool.list(region).length
+    const maxAttempts = Math.max(8, poolSize * 2 + 2)
+    const maxEmptyStreams = emptyStreamAttemptsFor(poolSize)
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (controller.signal.aborted) return
 
-      const account = retryAccountId !== undefined
-        ? pool.available(Date.now(), modelId, region)
-          .find((candidate: { id: string }) => candidate.id === retryAccountId)
-          ?? await pool.acquire(modelId, region, conversationKey, skipped)
-        : await pool.acquire(modelId, region, conversationKey, skipped)
+      const account = attempt === 0 ? firstAccount
+        : retryAccountId !== undefined
+          ? pool.available(Date.now(), modelId, region)
+            .find((candidate: { id: string }) => candidate.id === retryAccountId)
+            ?? await pool.acquire(modelId, region, conversationKey, skipped)
+          : await pool.acquire(modelId, region, conversationKey, skipped)
       retryAccountId = undefined
       if (account === undefined) {
         // Distinguish "never signed in" from "every account was tried and

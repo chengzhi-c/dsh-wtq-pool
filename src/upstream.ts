@@ -1433,6 +1433,7 @@ export class WorkBuddyUpstreamClient {
         if (contentType.includes('application/json')
           || (smallDeclaredBody && !contentType.includes('text/event-stream'))) {
           const text = await readErrorBody(response, ERROR_BODY_LIMIT, signal)
+          deadline.abort()
           if (attempt === 0 && isChannelCheckText(text)) {
             const folded = foldSystemIntoUser(body)
             if (folded !== undefined) {
@@ -1444,15 +1445,13 @@ export class WorkBuddyUpstreamClient {
           if (rememberOnSuccess !== undefined && !isChannelCheckText(text)) {
             rememberFoldedPrompt(rememberOnSuccess)
           }
-          const envelopeResponse = new Response(text, {
-            status: response.status,
-            headers: response.headers,
-          })
-          const envelopeBody = envelopeResponse.body
-          if (envelopeBody === null) {
-            return { ok: false, kind: 'server', status: 502, message: 'upstream returned 200 without a body' }
+          return {
+            ok: true,
+            response: new Response(text, {
+              status: response.status,
+              headers: response.headers,
+            }),
           }
-          return { ok: true, response: withRelayStream(envelopeResponse, envelopeBody) }
         }
         // The folded request was accepted: from now on this prompt skips the
         // refused round trip.

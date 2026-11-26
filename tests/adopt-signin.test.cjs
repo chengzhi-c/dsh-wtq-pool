@@ -467,23 +467,43 @@ test('a snapshot is taken over once, not again on every scan', async () => {
   }
 })
 
-test('a sign-in the plugin already holds is not taken over again', async () => {
-  const { pool, dataDir, signins } = machine('already', { snapshots: [['90000002008', 'Mine']] })
-  await pool.scan()
+test('a login created during a scan is kept and serves the account', async (t) => {
+  const uin = '90000002008'
+  const { pool, dataDir, signins } = machine('login-race', { snapshots: [[uin, 'Snapshot']] })
+  const fsp = require('node:fs/promises')
+  const rename = fsp.rename
+  let entered, release, parked = false
+  const reached = new Promise(resolve => { entered = resolve })
+  const gate = new Promise(resolve => { release = resolve })
+  t.mock.method(fsp, 'rename', async (from, to) => {
+    if (!parked && path.basename(to) === 'credentials-archive.json') {
+      parked = true
+      entered()
+      await gate
+    }
+    return rename(from, to)
+  })
+  const scanning = pool.scan()
   try {
-    // A second snapshot of the same account arrives beside the first.
-    const stale = path.join(dataDir, 'desktop', 'workbuddy-desktop-2026-10-07T10-07-06-90000002008.info')
-    fs.writeFileSync(stale, JSON.stringify({
-      auth: {
-        accessToken: 'older-token', refreshToken: 'older-refresh',
-        expiresAt: Date.now() + 2 * DAY, domain: 'www.codebuddy.cn',
-        lastRefreshTime: Date.now() - 25 * DAY,
-      },
-      account: { uin: '90000002008', nickname: 'Mine' },
-    }, null, 2))
-    await pool.scan()
-    assert.equal(fs.readdirSync(signins).length, 1, 'still one copy, not one per snapshot')
+    await reached
+    const file = await writeOwnSignIn(signins, {
+      region: 'cn', uin, uid: '', nickname: 'New login', enterpriseId: '',
+      domain: 'www.codebuddy.cn', accessToken: 'new-login', refreshToken: 'new-refresh',
+      expiresAtMs: Date.now() + 28 * DAY, lastRefreshAtMs: Date.now(),
+    })
+    release()
+    await scanning
+    const onDisk = parseWorkBuddyAuth(fs.readFileSync(file, 'utf8'), file)
+    const [account] = pool.list()
+    assert.equal(onDisk.accessToken, 'new-login')
+    assert.equal(onDisk.refreshToken, 'new-refresh')
+    assert.equal(account.credential.accessToken, onDisk.accessToken)
+    assert.equal(account.credential.refreshToken, onDisk.refreshToken)
+    assert.equal(account.credential.sourcePath, file)
+    assert.equal(account.label, 'New login')
   } finally {
+    release()
+    await scanning.catch(() => {})
     await cleanup(dataDir)
   }
 })

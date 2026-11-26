@@ -1764,7 +1764,7 @@ test('the doctor reports a published address for all three sources and names the
  * and reported as saved, while an unlisted label is refused with `show: false`
  * and changes nothing.
  */
-test('a source account preference is stored only for a label that exists', async (t) => {
+test('a source account preference is stored only for an available account', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'dsh-srcpref-test-'))
   const settings = {
     enabled: true, sourceWorkbuddy: false, sourceTrae: true, sourceQoder: false,
@@ -1804,8 +1804,8 @@ test('a source account preference is stored only for a label that exists', async
       if (state.trae.accounts.length > 0) break
       await new Promise((resolve) => setTimeout(resolve, 50))
     }
-    const label = state.trae.accounts[0]?.label
-    assert.ok(label, 'the Trae sign-in must be listed with a label')
+    const accountId = state.trae.accounts[0]?.id
+    assert.ok(accountId, 'the Trae sign-in must be listed')
     // Warm the gateway directory the way the host does before it reads the roster.
     const gateway = state.trae.gateways.find((entry) => entry.region === 'cn')
     await fetch(`http://127.0.0.1:${gateway.port}/v1/models`, { headers: { connection: 'close' } })
@@ -1814,27 +1814,27 @@ test('a source account preference is stored only for a label that exists', async
     assert.ok(modelId, 'the gateway must publish the model the composer matches against')
 
     const stored = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'wtqpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountLabel: label,
+      provider: 'wtqpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountId,
     })
-    assert.equal(stored.saved, true, 'a listed label must be reported as stored')
-    assert.equal(settings.preferredSourceAccounts['trae:cn'], label, 'the choice must really have been stored')
+    assert.equal(stored.saved, true, 'a listed account must be reported as stored')
+    assert.equal(settings.preferredSourceAccounts['trae:cn'].id, accountId, 'the choice must really have been stored')
 
     // A sign-in the gateway just refused is still listed and may still be
     // stored, but this session keeps serving another account. The popup has to
     // learn that instead of closing as though the switch took effect.
-    vm.runInContext(`noteSourceFailure("trae", "cn", ${JSON.stringify(label)}, "60")`, context)
+    vm.runInContext(`noteSourceFailure("trae", "cn", ${JSON.stringify(accountId)}, "60")`, context)
     const held = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'wtqpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountLabel: label,
+      provider: 'wtqpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountId,
     })
     assert.equal(held.saved, true, 'the choice is still worth storing for when the hold ends')
     assert.equal(held.unavailable, true, 'a held source account must be reported as unavailable')
 
     const refused = await plugin.onPanelInvoke('xd.composerPrefer', {
-      provider: 'wtqpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountLabel: 'no-such-label',
+      provider: 'wtqpool-trae-cn', model: modelId, source: 'trae', region: 'cn', accountId: 'no-such-account',
     })
-    assert.equal(refused.show, false, 'a label nothing can match must be refused')
+    assert.equal(refused.show, false, 'an absent account must be refused')
     assert.equal(refused.saved, undefined, 'a refused click must not claim anything was stored')
-    assert.equal(settings.preferredSourceAccounts['trae:cn'], label, 'a refused click must not overwrite the stored choice')
+    assert.equal(settings.preferredSourceAccounts['trae:cn'].id, accountId, 'a refused click must not overwrite the stored choice')
   } finally {
     await stopRegisteredService()
     await plugin.onUnload()

@@ -58,6 +58,7 @@ export interface QoderGateway {
 }
 
 const MODELS_TTL_MS = 10 * 60 * 1000
+const MODELS_TIMEOUT_MS = 30_000
 /**
  * How long a failed directory read is not retried.
  *
@@ -69,6 +70,7 @@ const CATALOG_FAILURE_BACKOFF_MS = 30_000
 
 export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
   const logger = options.logger
+  const shutdown = new AbortController()
   let cachedModels: readonly QoderChatModel[] = []
   let catalogAt = 0
   let catalogFailedAt = 0
@@ -121,8 +123,11 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
         if (candidates.length === 0) throw new Error('no Qoder sign-in found on this machine')
         let lastError: unknown
         for (const credential of candidates) {
+          shutdown.signal.throwIfAborted()
           try {
-            const read = await clientFor(credential).fetchModels()
+            const read = await clientFor(credential).fetchModels(
+              AbortSignal.any([shutdown.signal, AbortSignal.timeout(MODELS_TIMEOUT_MS)]),
+            )
             cachedModels = read
             catalogAt = Date.now()
             catalogFailedAt = 0
@@ -428,6 +433,9 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
     baseUrl,
     port,
     models: () => cachedModels,
-    close: server.close,
+    close: async () => {
+      shutdown.abort()
+      await server.close()
+    },
   }
 }

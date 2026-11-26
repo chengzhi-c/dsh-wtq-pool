@@ -391,6 +391,7 @@ test('cancelled sign-in writes leave no sign-in or temporary file', async (t) =>
       const started = new Promise(resolve => { reached = resolve })
       const gate = new Promise(resolve => { release = resolve })
       t.mock.method(io, 'writeFile', async (file, ...args) => {
+        if (!file.endsWith('.tmp')) return write(file, ...args)
         reached()
         await gate
         return write(file, ...args)
@@ -1105,14 +1106,21 @@ test('DSH account selection restarts credit polling after a successful preferenc
   const renderer = fs.readFileSync(path.join(root, 'src/client/composer.tsx'), 'utf8')
   const pick = renderer.match(/  const pick = \(account: ComposerAccount\): void => \{[^]*?\n  \}/)[0]
   let restarted = 0
+  const calls = []
   const context = vm.createContext({
     busy: false, routeRef: { current: {} }, provider: 'fixture-p', model: 'fixture-m', points: { source: 'workbuddy', region: 'cn' },
-    invoke: async () => ({ saved: true, show: true, total: null }),
+    invoke: async (channel, payload) => {
+      calls.push(JSON.parse(JSON.stringify({ channel, payload })))
+      return { saved: true, show: true, total: null }
+    },
     setBusy() {}, setError() {}, setErrorFor() {}, setPoints() {}, setOpen() {}, t: key => key,
     restartPollRef: { current: () => { restarted++ } },
   })
-  vm.runInContext(transpile(pick + '\npick({id: "fixture"})'), context)
+  vm.runInContext(transpile(pick + '\npick({id: "fixture", label: "Shared name"})'), context)
   await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(calls, [{ channel: 'xd.composerPrefer', payload: {
+    provider: 'fixture-p', model: 'fixture-m', source: 'workbuddy', region: 'cn', accountId: 'fixture',
+  } }])
   assert.equal(restarted, 1, 'a preference save must not leave unread credits on the old five-minute timer')
 })
 

@@ -12,6 +12,26 @@ const { withFileLock } = require('../src/file-lock.ts')
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+test('a stale sidecar cannot retire a live recovery claim with a reused generation', async (t) => {
+  const directory = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-reused-claim-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const lock = path.join(directory, 'document.lock')
+  const claim = `${lock}.reclaim.000000000001`
+  fs.writeFileSync(claim, JSON.stringify({ pid: process.pid, token: 'current-owner' }))
+  fs.writeFileSync(`${claim}.abandoned.previous-owner`, '{}')
+
+  await withFileLock(lock, async () => {})
+  assert.ok(fs.existsSync(claim), 'cleanup removed the current owner\'s claim')
+
+  fs.writeFileSync(lock, '')
+  const old = new Date(Date.now() - 120_000)
+  fs.utimesSync(lock, old, old)
+  fs.writeFileSync(claim, JSON.stringify({ token: 'current-owner' }))
+  fs.utimesSync(claim, old, old)
+  await withFileLock(lock, async () => {})
+  assert.deepEqual(fs.readdirSync(directory), [])
+})
+
 test('two contenders cannot both replace the same stale lock', async () => {
   const directory = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'wtq-lock-recovery-'))
   const lock = path.join(directory, 'document.lock')

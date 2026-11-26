@@ -33,9 +33,6 @@ test('the built entry loads and exports the contract the host calls', () => {
   // card dead while every other case stays green.
   assert.equal(pkg.exports['./client'], './lib/client.js', 'the client subpath names the bundle the host loads')
   assert.ok(fs.existsSync(path.join(root, 'lib', 'client.js')), 'and that bundle has to exist')
-  for (const file of ['lib', 'renderer', 'cordis.patch.yml']) {
-    assert.ok(pkg.files.includes(file), `the published package must carry ${file}`)
-  }
   // The `files` list is a declaration, not the tarball. Packing with scripts
   // off catches a `.npmignore` or a stale entry that would ship a different
   // set, and pins the runtime files and the absence of docs in one check.

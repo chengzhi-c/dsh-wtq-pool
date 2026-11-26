@@ -141,7 +141,7 @@ export function writeOpenAIError(res: ServerResponse, status: number, kind: stri
  */
 const BARE_CREDENTIAL_KEYS =
   'access_?token|refresh_?token|id_?token|auth_?token|oauth_?token|api_?key|secret|token|' +
-  'uid|uin|user[-_]?id|cookie|set-cookie'
+  'uid|uin|user[-_]?id|x-enterprise-id|x-tenant-id|cookie|set-cookie'
 
 /**
  * Every name whose value is a credential, in any of the shapes it takes.
@@ -180,6 +180,48 @@ const BARE_CREDENTIAL = new RegExp(
   `((?:\\\\{0,2}["']?)\\b(?:${BARE_CREDENTIAL_KEYS})(?:\\\\{0,2}["']?\\s*[:=]\\s*\\\\{0,2}["']?))[A-Za-z0-9_+/.=-]{6,}`,
   'gi',
 )
+
+const ACCOUNT_FIELD = /(?<![\w-])(?:(?:x-)?(?:uid|uin|(?:enterprise|tenant|user|account)[-_]?id)|nickname)(?![\w-])/i
+const STRUCTURED_FIELD = new RegExp(`(?:${ACCOUNT_FIELD.source})|(?<![\\w-])(?:${CREDENTIAL_KEYS})(?![\\w-])`, 'i')
+const STRUCTURED_FIELD_KEY = new RegExp('^(?:' + STRUCTURED_FIELD.source + ')$', 'i')
+const ACCOUNT_FIELD_LINE = new RegExp(
+  String.raw`(${ACCOUNT_FIELD.source}(?:\\?["'])?(?:[ \t]*[:=,][ \t]*|(?<=-id)[ \t]+))[^\r\n]*`, 'gi',
+)
+
+function redactStructuredFields(text: string): string {
+  const fieldIndex = text.search(STRUCTURED_FIELD)
+  if (fieldIndex < 0) return text
+  let start = text.search(/\{\s*["']|\[\s*["'[{]|^\s*"/)
+  if (start < 0 || fieldIndex < start) {
+    // A raw header owns its whole line; JSON on a later line is a separate body.
+    start = text.search(/(?<=\n)[ \t]*[\[{]/)
+    if (start < 0) return text.replace(ACCOUNT_FIELD_LINE, '$1[redacted]')
+  }
+
+  const prefix = text.slice(0, start).replace(ACCOUNT_FIELD_LINE, '$1[redacted]')
+  try {
+    const document: unknown = JSON.parse(text.slice(start))
+    let changed = false
+    const redacted = JSON.stringify(document, function (this: { name?: unknown }, key: string, value: unknown) {
+      // Browsers expose header entries as pairs; Node also exposes a flat list.
+      const field: unknown = Array.isArray(this) && Number(key) % 2 === 1 ? this[Number(key) - 1]
+        : key === 'value' ? this.name : key
+      if (typeof field === 'string' && STRUCTURED_FIELD_KEY.test(field)) {
+        // The array scanner preserves the formatting of credential-valued arrays.
+        if (Array.isArray(value) && !ACCOUNT_FIELD.test(field)) return value
+        changed = true
+        return '[redacted]'
+      }
+      const replacement = typeof value === 'string' ? redactStructuredFields(value) : value
+      if (replacement !== value) changed = true
+      return replacement
+    })
+    return changed ? prefix + redacted : prefix + text.slice(start)
+  } catch {
+    // A truncated structured echo no longer has reliable value boundaries.
+    return prefix + '[redacted]'
+  }
+}
 
 /**
  * Credential shapes in any text that leaves this process.
@@ -412,7 +454,7 @@ export function redactSecrets(text: string): string {
   // input keeps a hostile or broken error page from driving the path rules into
   // quadratic backtracking while the whole plugin waits.
   let out = raw.length > REDACT_MAX_CHARS ? raw.slice(0, REDACT_MAX_CHARS) : raw
-  out = redactCredentialArrays(out)
+  out = redactCredentialArrays(redactStructuredFields(out))
   for (const [pattern, replacement] of REDACTIONS) out = out.replace(pattern, replacement)
   return out
 }

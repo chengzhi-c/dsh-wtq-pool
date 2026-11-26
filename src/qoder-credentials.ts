@@ -438,12 +438,14 @@ async function readQoderCredentials(
       const incumbent = at === -1 ? undefined : credentials[at]
       if (incumbent === undefined) {
         credentials.push(fresh)
-      } else if (fresh.expiresAtMs > incumbent.expiresAtMs) {
-        // Two install directories can hold the same account (`Qoder CN` beside
-        // the renamed `QoderWork CN`), one of them left behind by the upgrade.
-        // Keeping whichever was read first could keep the stale copy and throw
-        // away the sign-in that was just renewed.
-        credentials[at] = fresh
+      } else {
+        const now = Date.now()
+        const freshExpired = fresh.expiresAtMs > 0 && fresh.expiresAtMs <= now
+        const incumbentExpired = incumbent.expiresAtMs > 0 && incumbent.expiresAtMs <= now
+        // Zero means no recorded expiry; an expired copy must not displace it.
+        if (freshExpired !== incumbentExpired ? incumbentExpired : fresh.expiresAtMs > incumbent.expiresAtMs) {
+          credentials[at] = fresh
+        }
       }
     } else if (result.failure !== undefined && result.failure.reason !== 'no-auth') {
       failures.push(result.failure)

@@ -50,7 +50,7 @@ import {
   zonedDayHour,
 } from './checkin-time'
 import { WorkBuddyUpstreamClient, regionOf, upstreamErrorKind, readErrorBody } from './upstream'
-import { discoverTraeCredentials, traeRegionOfCredential, traeStorageCandidates, traeWindowsAppNames, resetTraeCredentialCache } from './trae-discovery'
+import { discoverTraeCredentials, traeAccountKey, traeRegionOfCredential, traeStorageCandidates, traeWindowsAppNames, resetTraeCredentialCache } from './trae-discovery'
 import { createTraeGateway } from './trae-gateway'
 import { pickTraeStorageIdentity, resolveTraeIdentity, TRAE_STORAGE_MISSING_PREFIX } from './trae-identity'
 import { TraeSoloUpstreamClient, TRAE_CHECKIN_DEVICE_CLAIMED, traeVariantFor } from './trae-upstream'
@@ -59,7 +59,7 @@ import { createQoderGateway } from './qoder-gateway'
 import { QoderUpstreamClient, qoderClaimableCampaignIdOf, qoderCheckinStateFrom, qoderNormalizeClaimResult, qoderRewardExpiryMs, qoderRewardValidityDaysOf } from './qoder-client'
 import { redactSecrets, safeMessage, liftUpstreamMessage } from './loopback'
 import { startDeviceLogin, pollDeviceLogin } from './login'
-import { createSourcePool, uniqueSourceLabels } from './source-pool'
+import { createSourcePool, sourceAccountId, uniqueSourceLabels } from './source-pool'
 import { atRestKeyFailure } from './at-rest'
 import { pi } from './pi-compat'
 import { accountLogTag } from './log'
@@ -1016,42 +1016,31 @@ function sourceRegionKey(source, region) {
 /** The account the user picked for one source region; "" means automatic. */
 function preferredSourceAccount(source, region) {
   const value = settings.preferredSourceAccounts?.[sourceRegionKey(source, region)];
-  return typeof value === "string" ? value : "";
+  if (typeof value === "string") {
+    const rows = source === "trae" ? traeAccountRows : qoderAccountRows;
+    return rows.find((row) => row.region === region && row.label === value)?.id ?? "";
+  }
+  return typeof value?.id === "string" ? value.id : "";
 }
 
 /** The picked account per active region of one source, for the panel's picker. */
 function sourcePreferredMap(source) {
   const regions = source === "trae" ? activeTraeRegions() : activeQoderRegions();
   const map = {};
-  for (const region of regions) map[region] = preferredSourceAccount(source, region);
+  for (const region of regions) {
+    const stored = settings.preferredSourceAccounts?.[sourceRegionKey(source, region)];
+    map[region] = preferredSourceAccount(source, region) || (typeof stored === "string" ? stored : "");
+  }
   return map;
 }
 
-/**
- * The Trae/Qoder accounts this run found, for one source.
- *
- * Both the composer chip and the panel picker name an account by this label, and
- * both have to store it. Reading them from here is what lets a choice be checked
- * against the sign-ins that actually exist instead of being written blind.
- */
-function sourceAccountLabels(source, region) {
+/** An empty id clears the choice; a selected account must still be available. */
+function sourceAccountMayBePreferred(source, region, id) {
+  if (id === "") return true;
   const rows = source === "trae" ? traeAccountRows : qoderAccountRows;
-  return rows
-    .filter((row) => row.region === region && row.expired !== true)
-    .map((row) => row.label);
-}
-
-/**
- * Whether a named account may be stored as the preferred one.
- *
- * An empty label clears the preference, which is always allowed. Any other label
- * has to name an account this run found and that has not expired: storing a name
- * nothing can match leaves the picker silently falling back to its own default,
- * so the click looks like it worked and the same account keeps serving.
- */
-function sourceAccountMayBePreferred(source, region, label) {
-  if (label === "") return true;
-  return sourceAccountLabels(source, region).includes(label);
+  const now = Date.now();
+  return rows.some((row) => row.region === region && row.id === id
+    && !sourceCredentialExpired({ expiresAtMs: row.expiresAt }, now));
 }
 
 /** Usage modes one source can follow. `expiry` spends the soonest one-off pack first. */
@@ -1103,9 +1092,9 @@ const {
   orderSourceCredentials,
 } = sourcePool;
 
-function noteSourceExpiry(source, region, label, packages) {
+function noteSourceExpiry(source, region, id, packages) {
   const at = nearestPackExpiry(packages);
-  const key = accountStateKey(source, region, label);
+  const key = accountStateKey(source, region, id);
   if (at === undefined) sourceCreditExpiry.delete(key);
   else sourceCreditExpiry.set(key, at);
 }
@@ -2058,7 +2047,7 @@ async function createTraeRuntime(region) {
       "trae",
       region,
       (await discoverTraeCredentials()).credentials.filter((credential) => traeRegionOfCredential(credential) === region),
-      traeRowLabel,
+      traeAccountId,
       purpose === "chat",
     ),
     identity: (credential) => resolveTraeIdentity(desktopCandidates, credential.edition),
@@ -2076,7 +2065,7 @@ async function createTraeRuntime(region) {
       return declared === undefined ? undefined : declared.contextWindow;
     },
     onAttemptFailure: (credential, outcome) => {
-      noteSourceFailure("trae", region, traeRowLabel(credential), outcome.retryAfter);
+      noteSourceFailure("trae", region, traeAccountId(credential), outcome.retryAfter);
     },
     port: bound,
     logger: {
@@ -2304,19 +2293,11 @@ async function createQoderRuntime(region) {
     credentials: async (purpose) => {
       const found = await discoverQoderCredentials();
       const mine = found.credentials.filter((credential) => credential.region === region);
-      return orderSourceCredentials("qoder", region, mine, qoderRowLabel, purpose === "chat").map(qoderClientCredential);
+      return orderSourceCredentials("qoder", region, mine, qoderAccountId, purpose === "chat").map(qoderClientCredential);
     },
     listedIds: () => qoderDeclarationModels(region).map((model) => model.id),
     onAttemptFailure: (credential, outcome) => {
-      // The gateway holds mapped credentials, so the label is rebuilt here the
-      // way `qoderRowLabel` builds it from the raw one. With two accounts
-      // sharing a display name, the disambiguated label must win or the hold
-      // names no row and the failed account keeps leading.
-      const label = qoderLabelOverrides.get(qoderLabelKey(credential, region))
-        ?? (typeof credential.name === "string" && credential.name !== ""
-          ? credential.name
-          : credential.userID);
-      noteSourceFailure("qoder", region, label, outcome.retryAfter);
+      noteSourceFailure("qoder", region, qoderAccountId(credential, region), outcome.retryAfter);
     },
     port: bound,
     logger: {
@@ -3122,13 +3103,12 @@ function traeBaseLabel(credential) {
   return credential.accountName ?? credential.email ?? credential.userId;
 }
 
-function traeLabelKey(credential) {
-  return traeRegionOfCredential(credential) + "\n" +
-    (credential.userId || credential.accountName || credential.email || "");
+function traeAccountId(credential) {
+  return sourceAccountId(traeRegionOfCredential(credential), traeAccountKey(credential));
 }
 
 function traeRowLabel(credential) {
-  return traeLabelOverrides.get(traeLabelKey(credential)) ?? traeBaseLabel(credential);
+  return traeLabelOverrides.get(traeAccountId(credential)) ?? traeBaseLabel(credential);
 }
 
 /**
@@ -3149,12 +3129,12 @@ function qoderBaseLabel(credential) {
   return credential.name === "" ? credential.userID : credential.name;
 }
 
-function qoderLabelKey(credential, region) {
-  return (region ?? credential.region) + "\n" + (credential.userID || credential.name || "");
+function qoderAccountId(credential, region) {
+  return sourceAccountId(region ?? credential.region, credential.userID);
 }
 
 function qoderRowLabel(credential, region) {
-  return qoderLabelOverrides.get(qoderLabelKey(credential, region)) ?? qoderBaseLabel(credential);
+  return qoderLabelOverrides.get(qoderAccountId(credential, region)) ?? qoderBaseLabel(credential);
 }
 
 /**
@@ -3341,7 +3321,7 @@ async function refreshSourceRow(source, credential, row, current) {
   sourceRowReads.delete(row);
   row.usage = probe?.usage;
   row.checkin = probe?.checkin;
-  noteSourceExpiry(source, row.region, row.label, row.usage?.credits?.packages);
+  noteSourceExpiry(source, row.region, row.id, row.usage?.credits?.packages);
 }
 
 async function refreshSourceAccounts(generation: number) {
@@ -3353,15 +3333,11 @@ async function refreshSourceAccounts(generation: number) {
     if (regions.length > 0) {
       const found = await discoverTraeCredentials();
       if (!current()) return;
-      // Labels are assigned over every discovered sign-in, before the region
-      // filter. Computing them over the enabled rows alone renamed the surviving
-      // account whenever another region was switched off: a suffix appeared or
-      // vanished with a setting that says nothing about this account, and the
-      // panel's holds, pack expiry and row state were keyed by that name.
+      // Disabled regions still participate so toggling one does not rename the other rows.
       const allLabels = uniqueSourceLabels(found.credentials, traeBaseLabel, (credential) => credential.userId);
       const overrides = new Map<string, string>();
       found.credentials.forEach((credential, index) => {
-        overrides.set(traeLabelKey(credential), allLabels[index]);
+        overrides.set(traeAccountId(credential), allLabels[index]);
       });
       // These probes are independent, and none of them paces the upstream, so
       // they read at once rather than adding one bound per account: a machine
@@ -3372,8 +3348,9 @@ async function refreshSourceAccounts(generation: number) {
         .filter(({ credential }) => regions.includes(traeRegionOfCredential(credential)));
       const rows = await Promise.all(wanted.map(async ({ credential, label }) => {
         const region = traeRegionOfCredential(credential);
-        const priorLabel = traeLabelOverrides.get(traeLabelKey(credential));
-        const row = (priorLabel === label && traeAccountRows.find((entry) => entry.label === label && entry.region === region)) || { label, region };
+        const id = traeAccountId(credential);
+        const row = traeAccountRows.find((entry) => entry.id === id) || { id, region };
+        row.label = label;
         Object.assign(row, {
           app: traeAppLabelOf(credential),
           email: credential.email === label ? undefined : credential.email,
@@ -3404,7 +3381,7 @@ async function refreshSourceAccounts(generation: number) {
       const allLabels = uniqueSourceLabels(found.credentials, qoderBaseLabel, (credential) => credential.userID);
       const overrides = new Map<string, string>();
       found.credentials.forEach((credential, index) => {
-        overrides.set(qoderLabelKey(credential), allLabels[index]);
+        overrides.set(qoderAccountId(credential), allLabels[index]);
       });
       const wanted = found.credentials
         .map((credential, index) => ({ credential, label: allLabels[index] }))
@@ -3424,8 +3401,9 @@ async function refreshSourceAccounts(generation: number) {
           if (!current()) return;
         }
         seen += 1;
-        const priorLabel = qoderLabelOverrides.get(qoderLabelKey(credential));
-        const row = (priorLabel === label && qoderAccountRows.find((entry) => entry.label === label && entry.region === credential.region)) || { label, region: credential.region };
+        const id = qoderAccountId(credential);
+        const row = qoderAccountRows.find((entry) => entry.id === id) || { id, region: credential.region };
+        row.label = label;
         row.expiresAt = credential.expiresAtMs;
         row.expired = sourceCredentialExpired(credential, now);
         if (left() > 0) await refreshSourceRow("qoder", credential, row, current);
@@ -3443,21 +3421,29 @@ async function refreshSourceAccounts(generation: number) {
   }
   if (!current()) return;
   pruneSourceState();
+  // Migrate exact legacy labels once; a now-ambiguous name cannot identify its old account.
+  if (Object.values(settings.preferredSourceAccounts ?? {}).some((value) => typeof value === "string" && value !== "")) {
+    await mutateSettings("preferredSourceAccounts", (stored) => {
+      let next;
+      for (const [source, rows] of [["trae", traeAccountRows], ["qoder", qoderAccountRows]]) {
+        for (const row of rows) {
+          const key = sourceRegionKey(source, row.region);
+          if (typeof stored?.[key] === "string" && stored[key] === row.label) {
+            next ??= { ...stored };
+            next[key] = { id: row.id };
+          }
+        }
+      }
+      return next;
+    });
+  }
 }
 
-/**
- * Drop the per-sign-in bookkeeping of a sign-in that is no longer there.
- *
- * Both maps are keyed by source and label, and a label is not unique to one
- * sign-in: a departed account's hold was inherited by the next one that happened
- * to carry the same name, which demoted it for the rest of the hold despite
- * never having failed, and its pack expiry corrupted `expiry`-mode ordering and
- * the composer's active row.
- */
+/** Release holds and pack expiries for accounts that left the roster. */
 function pruneSourceState() {
   const live = new Set();
-  for (const row of traeAccountRows) live.add(accountStateKey("trae", row.region, row.label));
-  for (const row of qoderAccountRows) live.add(accountStateKey("qoder", row.region, row.label));
+  for (const row of traeAccountRows) live.add(accountStateKey("trae", row.region, row.id));
+  for (const row of qoderAccountRows) live.add(accountStateKey("qoder", row.region, row.id));
   for (const key of [...sourceFailureHold.keys()]) {
     if (!live.has(key)) sourceFailureHold.delete(key);
   }
@@ -5018,18 +5004,17 @@ async function onPanelInvoke(channel, payload) {
     /**
      * Claim ONE Trae or Qoder account's daily reward.
      *
-     * The label and region are the pair the panel's row was built from, so a
-     * stale row cannot claim a different account; the claim itself re-reads
-     * status first, which is what keeps a double click from collecting twice.
+     * The stable account id prevents a stale row from claiming a replacement
+     * that happens to have the same name.
      */
     case "xd.sourceCheckin": {
       const generation = loadGeneration;
       if (serviceStopped) throw panelError("the plugin stopped during check-in", "STOPPED");
       const source = typeof payload?.source === "string" ? payload.source : "";
-      const label = typeof payload?.label === "string" ? payload.label : "";
+      const accountId = payload?.accountId;
       const region = typeof payload?.region === "string" ? payload.region : "";
       if (source !== "trae" && source !== "qoder") throw panelError("source must be trae or qoder", "INVALID");
-      if (label === "" || region === "") throw panelError("label and region are required", "INVALID");
+      if (typeof accountId !== "string" || accountId === "" || region === "") throw panelError("accountId and region are required", "INVALID");
       if (!regionEnabled(source, region)) throw panelError("this source region is disabled", "INACTIVE");
       // One pass at a time: a single claim landing beside a running pass collects
       // an account that pass is about to reach, and both write today's record.
@@ -5044,9 +5029,9 @@ async function onPanelInvoke(channel, payload) {
       // releasing it at the timeout let a second click claim beside a step that
       // was still talking to the upstream.
       const work = (async () => {
-        const outcome = source === "trae" ? await traeClaimOne(label, region) : await qoderClaimOne(label, region);
+        const outcome = source === "trae" ? await traeClaimOne(accountId, region) : await qoderClaimOne(accountId, region);
         if (generation !== loadGeneration) throw panelError("the plugin stopped during check-in", "STOPPED");
-        markSourceCheckinRow(source, label, region, outcome);
+        markSourceCheckinRow(source, accountId, region, outcome);
         return { state: await statusDocument({ allowNetwork: true, budgetMs: DOCUMENT_BUDGET_MS }), result: outcome };
       })();
       const answered = await settleWithin(work.finally(() => {
@@ -5067,18 +5052,18 @@ async function onPanelInvoke(channel, payload) {
     case "xd.preferSourceAccount": {
       const source = typeof payload?.source === "string" ? payload.source : "";
       const region = typeof payload?.region === "string" ? payload.region : "";
-      const label = typeof payload?.label === "string" ? payload.label : "";
+      const accountId = payload?.accountId;
       if (source !== "trae" && source !== "qoder") throw panelError("source must be trae or qoder", "INVALID");
       if (!(source === "trae" ? TRAE_REGIONS : QODER_REGIONS).includes(region)) {
         throw panelError("unknown region for this source", "INVALID");
       }
-      if (!sourceAccountMayBePreferred(source, region, label)) {
+      if (typeof accountId !== "string" || !sourceAccountMayBePreferred(source, region, accountId)) {
         throw panelError("that account is not available for this source", "INVALID");
       }
       const stored = await mutateSettings("preferredSourceAccounts", (current) => {
         const next = { ...(current && typeof current === "object" && !Array.isArray(current) ? current : {}) };
-        if (label === "") delete next[sourceRegionKey(source, region)];
-        else next[sourceRegionKey(source, region)] = label;
+        if (accountId === "") delete next[sourceRegionKey(source, region)];
+        else next[sourceRegionKey(source, region)] = { id: accountId };
         return next;
       });
       if (stored !== true) throw panelError("the account choice could not be saved", "SAVE_FAILED");
@@ -5679,9 +5664,8 @@ async function composerRefreshWork(hit) {
     const current = () => stillLoaded(generation) && (hit.source === "trae" ? traeAccountRows : qoderAccountRows).includes(row);
     if (!current()) return;
     const credential = found.credentials.find((item) => {
-      const itemLabel = hit.source === "trae" ? traeRowLabel(item) : qoderRowLabel(item);
-      const itemRegion = hit.source === "trae" ? traeRegionOfCredential(item) : item.region;
-      return itemLabel === row.label && itemRegion === row.region;
+      const id = hit.source === "trae" ? traeAccountId(item) : qoderAccountId(item);
+      return id === row.id;
     });
     if (credential === undefined) return;
     await refreshSourceRow(hit.source, credential, row, current);
@@ -6133,7 +6117,7 @@ async function qoderCheckinAll() {
     // The panel reads the source rows this pass just changed, not a probe taken
     // before it. Without this the card kept saying "claim" after a successful
     // batch, which read as an inert button.
-    markSourceCheckinRow("qoder", qoderRowLabel(credential), credential.region, result);
+    markSourceCheckinRow("qoder", qoderAccountId(credential), credential.region, result);
     if (result.retry === true) counts.retry = true;
     if (result.opensAt !== undefined && (counts.opensAt === undefined || result.opensAt < counts.opensAt)) {
       counts.opensAt = result.opensAt;
@@ -6237,7 +6221,7 @@ async function traeCheckinAll() {
     if (signal.aborted) break;
     const credential = cnCredentials[index];
     if (spentEditions.has(credential.edition)) {
-      markSourceCheckinRow("trae", traeRowLabel(credential), "cn", { outcome: "skipped", deviceCheckedIn: true });
+      markSourceCheckinRow("trae", traeAccountId(credential), "cn", { outcome: "skipped", deviceCheckedIn: true });
       counts.skipped += 1;
       continue;
     }
@@ -6247,7 +6231,7 @@ async function traeCheckinAll() {
     if (signal.aborted) break;
     counts[result.outcome] += 1;
     if (result.outcome === "failed" && counts.reason === undefined && result.reason) counts.reason = safeMessage(result.reason);
-    markSourceCheckinRow("trae", traeRowLabel(credential), "cn", result);
+    markSourceCheckinRow("trae", traeAccountId(credential), "cn", result);
     // Once an account on this edition holds the device's daily claim, each
     // remaining account on the same edition can only be refused 9095. They are
     // skipped rather than failed: nothing went wrong, the day is simply spent.
@@ -6375,11 +6359,11 @@ async function traeClaimFor(credential, desktopCandidates) {
 }
 
 /** Record a single claim in the cached source row the panel reads back. */
-function markSourceCheckinRow(source, label, region, outcome) {
+function markSourceCheckinRow(source, id, region, outcome) {
   const checkedToday = outcome?.outcome === "claimed" || outcome?.todayCheckedIn === true;
   if (!checkedToday && outcome?.deviceCheckedIn !== true) return;
   const rows = source === "trae" ? traeAccountRows : qoderAccountRows;
-  const row = rows.find((entry) => entry.label === label && entry.region === region);
+  const row = rows.find((entry) => entry.id === id && entry.region === region);
   if (row === undefined) return;
   // `statusDocument` serves this cache, not a fresh probe: without the write
   // the card kept the pre-claim badge after a successful claim, and the next
@@ -6393,15 +6377,15 @@ function markSourceCheckinRow(source, label, region, outcome) {
 }
 
 /** The one Trae account a panel row names, or a refusal that says why. */
-async function traeClaimOne(label, region) {
+async function traeClaimOne(id, region) {
   if (region !== "cn") throw panelError("Trae check-in is CN-only", "INVALID");
   const generation = loadGeneration;
   const found = await discoverTraeCredentials();
   if (!stillLoaded(generation)) throw panelError("the plugin stopped during check-in", "STOPPED");
   const credential = found.credentials.find(
-    (entry) => traeRowLabel(entry) === label && traeRegionOfCredential(entry) === region,
+    (entry) => traeAccountId(entry) === id && traeRegionOfCredential(entry) === region,
   );
-  if (credential === undefined) throw panelError("unknown Trae account: " + label, "NOT_FOUND");
+  if (credential === undefined) throw panelError("unknown Trae account", "NOT_FOUND");
   const desktopCandidates = traeStorageCandidates().filter((entry) => entry.source === "desktop");
   const result = await traeClaimFor(credential, desktopCandidates);
   if (result.outcome === "failed") throw panelError(result.reason ?? "Trae refused the check-in", "UPSTREAM");
@@ -6409,14 +6393,14 @@ async function traeClaimOne(label, region) {
 }
 
 /** The one Qoder account a panel row names, or a refusal that says why. */
-async function qoderClaimOne(label, region) {
+async function qoderClaimOne(id, region) {
   const generation = loadGeneration;
   const found = await discoverQoderCredentials();
   if (!stillLoaded(generation)) throw panelError("the plugin stopped during check-in", "STOPPED");
   const credential = found.credentials.find(
-    (entry) => qoderRowLabel(entry) === label && entry.region === region,
+    (entry) => qoderAccountId(entry) === id && entry.region === region,
   );
-  if (credential === undefined) throw panelError("unknown Qoder account: " + label, "NOT_FOUND");
+  if (credential === undefined) throw panelError("unknown Qoder account", "NOT_FOUND");
   const result = await qoderClaimFor(credential);
   if (result.outcome === "failed") throw panelError(result.reason ?? "Qoder refused the claim", "UPSTREAM");
   return result;
@@ -7097,20 +7081,18 @@ function sourceComposerAccounts(source, region) {
   // a readout built from a different rule named an account the requests were
   // never going to use. Only the sign-ins that can still answer are handed in,
   // because the gateway leads with a live token and an expired one never serves.
-  const live = rows.filter((row) => row.expired !== true);
+  const now = Date.now();
+  const live = rows.filter((row) => !sourceCredentialExpired({ expiresAtMs: row.expiresAt }, now));
   // "peek" names the account the next chat would use, including the current
   // round-robin position, without advancing it: a panel read must not decide
   // where the next request goes.
-  const active = orderSourceCredentials(source, region, live, (row) => row.label, "peek")[0];
+  const active = orderSourceCredentials(source, region, live, (row) => row.id, "peek")[0];
   return rows.map((row) => {
     const credits = row.usage?.credits;
-    // The label is this source's identity - the preference is stored by label -
-    // so the popup's row marking keys on the same value. Without it the client
-    // reads an empty id and can never tell which row a notice is about.
     return {
-      id: row.label,
+      id: row.id,
       label: row.label,
-      active: active !== undefined && active.label === row.label,
+      active: active !== undefined && active.id === row.id,
       ...typeof credits?.total === "number" ? { total: credits.total } : {},
       ...Array.isArray(credits?.packages) && credits.packages.length > 0 ? { packages: composerPackages(credits.packages) } : {},
       ...row.usage?.plan?.name ? { plan: row.usage.plan.name } : {},
@@ -7205,13 +7187,13 @@ async function composerPrefer(args) {
   }
   if (source !== "trae" && source !== "qoder") return { show: false };
   if (!(source === "trae" ? TRAE_REGIONS : QODER_REGIONS).includes(region)) return { show: false };
-  const accountLabel = typeof args?.accountLabel === "string" ? args.accountLabel : "";
-  if (!sourceAccountMayBePreferred(source, region, accountLabel)) return { show: false };
+  const accountId = args?.accountId;
+  if (typeof accountId !== "string" || !sourceAccountMayBePreferred(source, region, accountId)) return { show: false };
   // Inside the write queue, for the reason the WorkBuddy branch above documents.
   const written = await mutateSettings("preferredSourceAccounts", (current) => {
     const next = { ...(current && typeof current === "object" && !Array.isArray(current) ? current : {}) };
-    if (accountLabel === "") delete next[sourceRegionKey(source, region)];
-    else next[sourceRegionKey(source, region)] = accountLabel;
+    if (accountId === "") delete next[sourceRegionKey(source, region)];
+    else next[sourceRegionKey(source, region)] = { id: accountId };
     return next;
   });
   if (written !== true) throw panelError("the account choice could not be saved", "SAVE_FAILED");
@@ -7219,9 +7201,9 @@ async function composerPrefer(args) {
   // force, so it is reported as stored. Compare it with the account the
   // gateway would actually pick: a held sign-in still leads when it is the
   // only live one, so being held alone is not unavailable.
-  const activeLabel = sourceComposerAccounts(source, region)
-    .find((row) => row.active === true)?.label ?? "";
-  const servable = accountLabel === "" || activeLabel === accountLabel;
+  const activeId = sourceComposerAccounts(source, region)
+    .find((row) => row.active === true)?.id ?? "";
+  const servable = accountId === "" || activeId === accountId;
   return { ...composerPoints(args), saved: true, ...(servable ? {} : { unavailable: true }) };
 }
 

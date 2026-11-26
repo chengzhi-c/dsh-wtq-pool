@@ -645,12 +645,9 @@ export function collectTraeSoloModels(
 /**
  * Fold a partial directory read into the roster already held.
  *
- * A function that failed lists models the answer does not mention, so two facts
- * have to be kept apart: an id only the earlier read knows stays callable, and
- * an id both reads know keeps the variants of both. The failed function may be
- * the only one that stated a Max tier or a wider window, and dropping its answer
- * would re-publish the model at the smaller figures - the same silent narrowing
- * the variant system exists to prevent.
+ * Only failed functions retain their previous answers. A function that answered
+ * successfully may have removed a model or narrowed its window, even when an
+ * unrelated function failed during the same refresh.
  *
  * A complete read is never merged: it is the directory's current word, and a
  * model it no longer lists is one that is gone.
@@ -665,20 +662,16 @@ export function collectTraeSoloModels(
 export function mergeTraeDirectory(
   previous: readonly TraeSoloModel[],
   next: readonly TraeSoloModel[],
+  failedFunctions: readonly string[],
 ): readonly TraeSoloModel[] {
+  const failed = new Set(failedFunctions)
   const merged = new Map<string, TraeSoloModel>(next.map((model) => [model.id, model]))
-  for (const model of next) {
-    const before = previous.find((entry) => entry.id === model.id)
-    if (before === undefined) continue
-    const variants = [...model.variants ?? []]
-    for (const variant of before.variants ?? []) {
-      if (!variants.some((entry) => entry.function === variant.function)) variants.push(variant)
-    }
-    if (variants.length === (model.variants ?? []).length) continue
-    merged.set(model.id, { ...model, ...figuresFrom(variants), variants })
-  }
   for (const model of previous) {
-    if (!merged.has(model.id)) merged.set(model.id, model)
+    const retained = (model.variants ?? []).filter(variant => failed.has(variant.function))
+    if (retained.length === 0) continue
+    const current = merged.get(model.id)
+    const variants = [...current?.variants ?? [], ...retained]
+    merged.set(model.id, { ...current ?? model, ...figuresFrom(variants), variants })
   }
   return [...merged.values()]
 }
@@ -961,6 +954,7 @@ export class TraeSoloUpstreamClient {
     // priority order afterwards, so the first function to name a `config_name`
     // still decides which of its variants leads.
     const answers = await Promise.all(TRAE_DIRECTORY_FUNCTIONS[region].map(async (directoryFunction) => {
+      const transport = new AbortController()
       try {
         const response = await this.fetchImpl(traeEndpoint(base, TRAE_SOLO_MODELS_PATH), {
           redirect: 'error',
@@ -975,7 +969,7 @@ export class TraeSoloUpstreamClient {
             mode_type: null,
             agent_type: null,
           }),
-          signal: signal ?? AbortSignal.timeout(30_000),
+          signal: AbortSignal.any([transport.signal, signal ?? AbortSignal.timeout(30_000)]),
         })
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         const document = await response.json() as Record<string, unknown>
@@ -994,6 +988,8 @@ export class TraeSoloUpstreamClient {
       } catch (error: unknown) {
         failedFunctions.push(directoryFunction)
         return { directoryFunction, failure: `${directoryFunction}: ${String(error).slice(0, 80)}` }
+      } finally {
+        transport.abort()
       }
     }))
     for (const answer of answers) {
@@ -1029,6 +1025,7 @@ export class TraeSoloUpstreamClient {
     const dressing = region === 'ai'
       ? { referer: 'https://coresg-normal.trae.ai/', timezone: 'Asia/Singapore', language: 'en' }
       : { referer: 'https://solo.trae.cn/', timezone: 'Asia/Shanghai', language: 'zh-cn' }
+    const transport = new AbortController()
     try {
       const response = await this.fetchImpl(
         `${REGION_GATEWAYS[region].remote}/models?functions=${TRAE_DIRECTORY_FUNCTIONS[region].join(',')}`,
@@ -1042,7 +1039,7 @@ export class TraeSoloUpstreamClient {
             'x-preferenced-language': dressing.language,
             'Referer': dressing.referer,
           },
-          signal: signal ?? AbortSignal.timeout(30_000),
+          signal: AbortSignal.any([transport.signal, signal ?? AbortSignal.timeout(30_000)]),
         },
       )
       if (!response.ok) return new Map()
@@ -1050,6 +1047,8 @@ export class TraeSoloUpstreamClient {
       return collectTraeRemoteReasoning(json.data?.list ?? [])
     } catch {
       return new Map()
+    } finally {
+      transport.abort()
     }
   }
 

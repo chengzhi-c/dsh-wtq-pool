@@ -224,12 +224,52 @@ for (const source of ['trae', 'qoder']) test(`${source} composer refresh preserv
     assert.deepEqual(balances(source), { 'existing#existing': 42, added: 8 })
     assert.deepEqual(balances(other), { 'existing#existing': 11, added: 11 })
     const row = vm.runInContext(source + 'AccountRows', context)[0]
-    assert.equal(vm.runInContext(`sourceCreditExpiry.get(accountStateKey('${source}', 'cn', 'existing#existing'))`, context), row.usage.credits.packages[0].expiresAtMs)
+    assert.equal(vm.runInContext(`sourceCreditExpiry.get(accountStateKey('${source}', 'cn', '${row.id}'))`, context), row.usage.credits.packages[0].expiresAtMs)
     const refreshing = context.composerRefreshWork({ source, region: 'cn' })
     await new Promise(resolve => setImmediate(resolve))
-    context.markSourceCheckinRow(source, row.label, row.region, { outcome: 'claimed' })
+    context.markSourceCheckinRow(source, row.id, row.region, { outcome: 'claimed' })
     release[2]({ ...probe(1), checkin: { todayCheckedIn: false } })
     await refreshing
     assert.equal(row.checkin.todayCheckedIn, true, 'a read started before the claim cannot restore the unclaimed status')
+  }
+})
+for (const source of ['trae', 'qoder']) test(`${source} closing the gateway cancels its directory requests`, async () => {
+  const signals = [], pending = []
+  let started, cleaning = false
+  const firstStarted = new Promise(resolve => { started = resolve })
+  const fetchImpl = async (_url, { signal }) => {
+    if (cleaning) throw new Error('test cleanup')
+    signals.push(signal)
+    signal.throwIfAborted()
+    started()
+    return new Promise((_, reject) => {
+      const fail = () => reject(signal.reason)
+      signal.addEventListener('abort', fail, { once: true })
+      pending.push(() => { signal.removeEventListener('abort', fail); reject(new Error('test cleanup')) })
+    })
+  }
+  const gateway = source === 'trae'
+    ? createTraeGateway({ fetchImpl,
+      credentials: async () => ['first', 'second'].map(userId => ({ userId, accessToken: 'fixture', edition: 'cn', source: 'desktop' })),
+      identity: async () => ({ machineId: 'fixture', deviceId: 'fixture', platform: 'win32' }),
+    })
+    : createQoderGateway({ fetchImpl, region: 'cn',
+      credentials: async () => ['first', 'second'].map(userID => ({ userID, token: 'fixture' })),
+    })
+  let request
+  try {
+    await gateway.ready
+    request = requestModels(gateway.baseUrl() + '/v1/models').response.catch(() => {})
+    await firstStarted
+    const count = signals.length
+    await gateway.close()
+    assert.ok(signals.every(signal => signal.aborted), 'no upstream request may outlive its gateway')
+    await new Promise(setImmediate)
+    assert.equal(signals.length, count, 'closing must not start a directory read with another account')
+  } finally {
+    cleaning = true
+    for (const release of pending) release()
+    await gateway.close()
+    await request
   }
 })

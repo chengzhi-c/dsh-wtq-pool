@@ -130,7 +130,7 @@ export interface Config {
   /** Picked WorkBuddy account per region. */
   preferredAccountIds?: Record<string, string>
   /** Picked Trae/Qoder account per region. */
-  preferredSourceAccounts?: Record<string, string>
+  preferredSourceAccounts?: Record<string, string | { id: string }>
   /** Accounts removed from the pool, with their label and region kept so the panel can restore them. */
   removedAccounts?: unknown[]
   /** Whether the credits readout is shown beside the composer. */
@@ -663,8 +663,8 @@ const writeSettings = async (patch: Record<string, unknown>): Promise<void> => {
         disposeRegistration = undefined
         lastRows = []
         fingerprint = ''
-        const message = error instanceof Error ? error.message : String(error)
-        ctx.logger.error('dsh-wtq-pool: provider registration failed', safeMessage(error))
+        const message = safeMessage(error)
+        ctx.logger.error('dsh-wtq-pool: provider registration failed', message)
         return { ok: false, changed: false, error: message }
       }
     },

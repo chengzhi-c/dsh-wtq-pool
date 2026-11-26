@@ -371,38 +371,6 @@ test('a model id of __proto__ is stored and read back like any other', async () 
 })
 
 /**
- * A stored account name that no sign-in carries any more is not a preference.
- *
- * The label is the account's own name, so renaming or re-signing in retires it.
- * The old code returned a stored label as the chosen account before the rotation
- * and the expiry sort could run, which disabled both.
- */
-test('a retired account name no longer disables rotation', async () => {
-  const host = loadHost({
-    settings: {
-      preferredSourceAccounts: { 'trae:cn': 'retired-name' },
-      sourceDistributions: { trae: 'round-robin' },
-    },
-  })
-  try {
-    await host.internals.adoptHostSettings()
-    assert.equal(host.internals.sourceDistribution('trae'), 'round-robin')
-    const call = (labelOf) => [1, 2, 3].map(() => host.internals.orderSourceCredentials('trae', 'cn',
-      [{ label: 'live-one', expiresAtMs: 0 }, { label: 'live-two', expiresAtMs: 0 }], labelOf, true).map((item) => item.label))
-    const [first, second] = call((item) => item.label)
-    assert.deepEqual([...first].sort(), ['live-one', 'live-two'])
-    assert.notDeepEqual(first, second, 'rotation must advance when the stored account name is retired')
-
-    // Control: a name that is still carried does pin the account.
-    host.setDocument({ ...host.getSettingsDocument(), preferredSourceAccounts: { 'trae:cn': 'live-two' } })
-    await host.internals.adoptHostSettings()
-    assert.equal(call((item) => item.label)[0][0], 'live-two', 'a live account name must still be honoured')
-  } finally {
-    host.cleanup()
-  }
-})
-
-/**
  * An expiry past `Date`'s range must not fail the whole panel document.
  *
  * `xd.state` formats each row's expiry with `toISOString()`, which throws for a

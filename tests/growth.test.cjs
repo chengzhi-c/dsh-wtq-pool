@@ -753,7 +753,7 @@ test('the growth card falls back to the scheduled pass it belongs to', () => {
 function panelGrowthRun(answers) {
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
   const parts = []
-  for (const declaration of ['function runBusy', 'function runGrowth', 'function readGrowth', 'function adopt', 'async function runGrowthAction']) {
+  for (const declaration of ['function runBusy', 'function runGrowth', 'function readGrowth', 'function loadGrowthDetails', 'function adopt', 'async function runGrowthAction']) {
     const from = source.indexOf(`${declaration}(`)
     assert.notEqual(from, -1, `${declaration} must exist in the panel`)
     let depth = 0
@@ -778,9 +778,8 @@ function panelGrowthRun(answers) {
     // writes has to exist here as well.
     stateRevision: 0,
     activeSource: 'workbuddy',
+    activeTab: 'growth',
     openGrowth: {},
-    growthScrollReturn: null,
-    growthScrollVersion: 0,
     growthButton: () => ({ tag: "button", text: "claim" }),
     paintGrowthExtras() {},
     console,
@@ -792,7 +791,6 @@ function panelGrowthRun(answers) {
     announce: (message) => said.push(['announce', message]),
     notePress: () => {},
     render: () => {},
-    restoreGrowthScroll: () => {},
     pollCheckinLog: () => {},
     invoke: (channel) => {
       calls.push(channel)
@@ -822,6 +820,42 @@ test('a streak claim waits for an active read and clears a stale tier if its own
   await context.runGrowthAction(ROW, 'streak', '14d')
   assert.deepEqual(calls.slice(1), ['xd.growthAction', 'xd.growthState'])
   assert.equal(context.growthState, null)
+})
+
+test('a failed follow-up read preserves the outcome of the account action', async () => {
+  const { context, said } = panelGrowthRun({ 'xd.growthAction': { result: { prize_name: 'fixture reward' } } })
+  await context.runGrowthAction(ROW, 'streak', '14d')
+  assert.match(said.findLast(([kind]) => kind === 'note')[1], /fixture reward/)
+  assert.match(said.findLast(([kind]) => kind === 'note')[1], /xd\.growthState/)
+
+  const failed = panelGrowthRun({})
+  await failed.context.runGrowthAction(ROW, 'streak', '14d')
+  assert.match(failed.said.findLast(([kind]) => kind === 'note')[1], /xd\.growthAction/)
+})
+
+test('an account action keeps its rows visible until the refreshed result arrives', async () => {
+  const next = Promise.withResolvers()
+  const details = Promise.withResolvers()
+  const freshRow = { ...ROW, tiers: 0 }
+  const { context, said } = panelGrowthRun({ 'xd.growthAction': { result: {} }, 'xd.growthState': next.promise,
+    'xd.growthDetails': details.promise })
+  const shown = { rows: [{ ...ROW, details: { heatmap: {} } }] }
+  context.openGrowth['growth:a1'] = true
+  context.growthState = shown
+  const action = context.runGrowthAction(ROW, 'streak', '14d')
+  await new Promise(setImmediate)
+  assert.equal(context.growthReading, true)
+  assert.equal(context.growthState, shown)
+  next.resolve({ growth: { rows: [freshRow] }, readEpoch: 0 })
+  await new Promise(setImmediate)
+  assert.equal(context.growthState, shown, 'expanded details stay visible while their replacement loads')
+  context.activeTab = 'pool'
+  const newDetails = { heatmap: { cells: [] } }
+  details.resolve({ details: newDetails })
+  await action
+  assert.equal(context.growthState.rows[0].tiers, 0)
+  assert.equal(context.growthState.rows[0].details, newDetails)
+  assert.deepEqual(said, [['announce', 'growth.actionDone']], 'the receipt must not insert a banner in another view')
 })
 
 test('a finished growth run leaves the page holding the new rows', async () => {

@@ -2,7 +2,7 @@
   "name": "dsh-wtq-pool",
   "displayName": "WTQ Pool",
   "description": "将本机 WorkBuddy、Trae、Qoder 桌面登录接入 DeepSeek Harness，并在账号不可用时自动切换。",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "license": "MIT",
   "author": "chengzhi-c",
   "homepage": "https://github.com/chengzhi-c/dsh-wtq-pool#readme",

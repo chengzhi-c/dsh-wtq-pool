@@ -233,7 +233,7 @@ function loadPanelWithButtons(id) {
     list: [model], selection: { enabledModelIds: [model.id], overrides: {} },
   })
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  for (const name of ['draftFor', 'publishedModels', 'saveModels', 'discardDraft']) {
+  for (const name of ['draftFor', 'isDirty', 'publishedModels', 'saveModels', 'discardDraft']) {
     context[name] = vm.runInContext('(' + lift(source, name) + ')', context)
   }
   return { context, roster, model, saved }
@@ -265,6 +265,18 @@ test('saving a draft preserves a special model ID and closes its sheet', async (
   context.draft = { [model.id]: emptyEntry() }
   const after = context.modelListRow(model, { [model.id]: true })
   assert.equal(after.classList.contains('is-editing'), false, 'so the rebuilt row carries no mark')
+})
+
+test('alias edits use the same whitespace rules for the save bar and the saved selection', async () => {
+  const { context, model, saved } = loadPanelWithButtons()
+  const selection = { overrides: { [model.id]: { alias: 'Edited' } } }
+  context.modelPage = () => ({ key: 'cn', list: [model], selection })
+  context.draft[model.id].alias = ' Edited '
+  assert.equal(context.isDirty([model], selection), false)
+  context.draft[model.id].alias = '   '
+  assert.equal(context.isDirty([model], selection), true)
+  await context.saveModels()
+  assert.deepEqual(Object.keys(saved[0].payload.selection.overrides), [])
 })
 
 test('discarding a draft ends the session too', () => {

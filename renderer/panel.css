@@ -90,6 +90,7 @@
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
+html { scrollbar-gutter: stable; }
 
 html, body {
   margin: 0;
@@ -123,6 +124,7 @@ html, body { overscroll-behavior-y: contain; }
   flex-wrap: wrap;
   position: sticky;
   top: var(--xd-titlebar);
+  overflow-x: clip;
   z-index: 5;
   display: flex;
   align-items: center;
@@ -655,6 +657,19 @@ button.icon-only, .icon-only { min-width: 32px; min-height: 32px; padding: 6px; 
 /* Armed: the next press deletes, so the button stops looking like the idle one. */
 .acct-delete.confirming { color: var(--xd-on-danger); background: var(--xd-danger); border-color: var(--xd-danger); font-weight: 600; }
 .acct-delete.confirming:hover:not(:disabled) { background: color-mix(in srgb, var(--xd-danger) 85%, #000); border-color: color-mix(in srgb, var(--xd-danger) 85%, #000); }
+.delete-prompt {
+  position: absolute;
+  z-index: 1;
+  inset: 100% 0 auto auto;
+  margin-top: 2px;
+  width: max-content;
+  max-width: calc(100vw - 64px);
+  padding: 3px 8px;
+  border-radius: var(--xd-radius-small);
+  background: var(--xd-danger);
+  color: var(--xd-on-danger);
+  pointer-events: none;
+}
 
 /* Switched off: visibly parked without being hidden. */
 .card-off { border-style: dashed; background: transparent; }

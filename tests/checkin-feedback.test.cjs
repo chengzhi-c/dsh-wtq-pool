@@ -25,20 +25,23 @@ function panelFunction(name) {
 async function claim(result) {
   const notes = []
   const adopted = []
+  const calls = [], busyKeys = []
   const context = vm.createContext({
     Promise, String, Number, console,
     busy: null,
     checkinBusy: null,
-    invoke: async () => ({ state: { qoder: { accounts: [] } }, result }),
+    invoke: async (channel, payload) => {
+      calls.push(JSON.parse(JSON.stringify({ channel, payload })))
+      return { state: { qoder: { accounts: [] } }, result }
+    },
     adopt: (state) => adopted.push(state),
     note: (value) => notes.push(value),
-    render: () => {},
-    sourceCheckinKey: (kind, account) => `${kind}:${account.label}`,
+    render: () => busyKeys.push(context.checkinBusy),
     t: (key) => key,
   })
-  vm.runInContext(panelFunction('claimSourceCheckin'), context)
-  await context.claimSourceCheckin('qoder', { label: 'A', region: 'cn' })
-  return { notes: notes.filter((value) => value !== null), adopted }
+  vm.runInContext(panelFunction('sourceCheckinKey') + '\n' + panelFunction('claimSourceCheckin'), context)
+  await context.claimSourceCheckin('qoder', { id: 'account-a', label: 'A', region: 'cn' })
+  return { notes: notes.filter((value) => value !== null), adopted, calls, busyKeys }
 }
 
 /**
@@ -51,7 +54,9 @@ async function claim(result) {
  * click read as a failure until the panel was refreshed.
  */
 test('a click that finds the round already collected reports success', async () => {
-  const { notes, adopted } = await claim({ outcome: 'skipped', todayCheckedIn: true })
+  const { notes, adopted, calls, busyKeys } = await claim({ outcome: 'skipped', todayCheckedIn: true })
+  assert.deepEqual(calls, [{ channel: 'xd.sourceCheckin', payload: { source: 'qoder', accountId: 'account-a', region: 'cn' } }])
+  assert.equal(busyKeys[0], 'qoder:cn:account-a')
   assert.deepEqual(notes, ['source.checkinDone'])
   assert.equal(adopted.length, 1, 'the card still takes the state that marks the row collected')
 })
@@ -59,4 +64,33 @@ test('a click that finds the round already collected reports success', async () 
 test('a skipped claim that left the round open still says so', async () => {
   const { notes } = await claim({ outcome: 'skipped' })
   assert.deepEqual(notes, ['source.checkinSkipped'])
+})
+
+test('the source picker selects by account ID and can clear the preference', async () => {
+  const calls = []
+  const context = vm.createContext({
+    state: { qoder: { preferred: { cn: 'account-b' } } }, busy: null,
+    el: (tag, _className, text) => ({
+      tag, textContent: text, children: [], events: {},
+      appendChild(child) { this.children.push(child) },
+      setAttribute() {}, addEventListener(name, callback) { this.events[name] = callback },
+    }),
+    t: key => key, distributionControl: () => ({}),
+    runBusy: (_key, work) => work(),
+    invoke: async (channel, payload) => calls.push(JSON.parse(JSON.stringify({ channel, payload }))),
+  })
+  vm.runInContext(panelFunction('sourcePreferredPicker') + '\n' + panelFunction('setPreferredSourceAccount'), context)
+  const picker = context.sourcePreferredPicker('qoder', 'cn', [
+    { id: 'account-a', label: 'Shared name' }, { id: 'account-b', label: 'Shared name' },
+  ]).children[1]
+  assert.deepEqual(picker.children.map(option => option.value), ['', 'account-a', 'account-b'])
+  assert.equal(picker.value, 'account-b')
+  for (const value of ['account-a', '']) {
+    picker.value = value
+    await picker.events.change()
+  }
+  assert.deepEqual(calls, [
+    { channel: 'xd.preferSourceAccount', payload: { source: 'qoder', region: 'cn', accountId: 'account-a' } },
+    { channel: 'xd.preferSourceAccount', payload: { source: 'qoder', region: 'cn', accountId: '' } },
+  ])
 })

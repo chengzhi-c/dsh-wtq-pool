@@ -12,6 +12,7 @@ const { WebServer } = require('@deepseek-ai/dsh-host-webserver')
 const { Service } = require('@deepseek-ai/cordis')
 
 const root = path.resolve(__dirname, '..')
+const registrationToken = 'SYNTHETIC_PRIVATE_739162'
 const json = value => JSON.parse(JSON.stringify(value))
 const sourceOf = file => fs.readFileSync(path.join(root, file), 'utf8')
 const transpile = source => ts.transpileModule(source, {
@@ -51,7 +52,7 @@ function indexFixture() {
     // globals here for the same reason the imports below are: the fixture runs
     // `apply` without this module's import statements.
     AsyncLocalStorage: require('node:async_hooks').AsyncLocalStorage,
-    safeMessage: (error) => String(error && error.message ? error.message : error),
+    safeMessage: loadSource('src/loopback.ts').safeMessage,
     installPi: bridge => { installing.bridge = bridge },
     buildAdapter: rows => ({ adapter: {}, providerIds: rows.map(row => row.id) }),
     onLoad: async () => {}, onUnload: async () => {},
@@ -82,12 +83,12 @@ function indexFixture() {
       inject() {}, emit() {},
       llm: {
         registerAdapter() {
-          if (state.fail === 'adapter') throw new Error('fixture adapter registration failure')
+          if (state.fail === 'adapter') throw new Error(`fixture adapter registration failure: Bearer ${registrationToken}`)
           state.adapters += 1
           return () => { state.adapters -= 1 }
         },
         registerConfigurableProviders() {
-          if (state.fail === 'rows') throw new Error('fixture provider registration failure')
+          if (state.fail === 'rows') throw new Error(`fixture provider registration failure: Bearer ${registrationToken}`)
           state.providers += 1
           return () => { state.providers -= 1 }
         },
@@ -261,7 +262,7 @@ test('composer limits hidden-roster warmup to its startup window', async () => {
   } finally { fixture.dispose() }
 })
 
-test('the panel keeps its viewport when content grows and reloads by remounting once', () => {
+function cardFixture(globals = {}) {
   const effects = [], states = []
   const timers = []
   let cursor = 0, frame, PanelCard
@@ -281,15 +282,47 @@ test('the panel keeps its viewport when content grows and reloads by remounting 
     document: { hidden: false, documentElement: { dataset: { base: 'light' }, lang: 'zh-CN' },
       addEventListener() {}, removeEventListener() {} },
     window: { setInterval: callback => { timers.push(callback); return timers.length }, clearInterval() {} },
-    fetch: async () => ({ ok: true }),
+    fetch: async () => ({ ok: true }), ...globals,
   })
   apply({ effect: run => run(), locale: { register: () => () => {} },
     slots: { inject: (_key, run) => run(), register: (options, component) => { if (options.name === 'plugins.bundle.config') PanelCard = component } },
   })
   const render = () => { cursor = 0; return PanelCard({ t: key => key }) }
   const initial = render()
-  const initialFrame = initial.children[1]
   const cleanups = effects.map(run => run())
+  return { initial, render, frame, timers, cleanups }
+}
+
+test('a panel whose routes appear on retry replaces the initial error frame', async () => {
+  let retry, calls = 0
+  const { initial, render, cleanups } = cardFixture({
+    fetch: async () => ({ ok: ++calls > 1, status: calls > 1 ? 200 : 404 }),
+    setTimeout: callback => { retry = callback; return 1 }, clearTimeout() {},
+  })
+  try {
+    await new Promise(setImmediate)
+    retry()
+    await new Promise(setImmediate)
+    assert.notEqual(render().children[1].props.key, initial.children[1].props.key)
+  } finally { for (const cleanup of cleanups) cleanup?.() }
+})
+
+test('a disposed panel does not request another probe', async () => {
+  let retry, calls = 0
+  const { cleanups } = cardFixture({
+    fetch: async () => { calls++; return { ok: false, status: 404 } },
+    setTimeout: callback => { retry = callback; return 1 }, clearTimeout: () => { retry = undefined },
+  })
+  await new Promise(setImmediate)
+  assert.equal(typeof retry, 'function')
+  for (const cleanup of cleanups) cleanup?.()
+  retry?.()
+  assert.equal(calls, 1)
+})
+
+test('the panel keeps its viewport when content grows and reloads by remounting once', () => {
+  const { initial, render, frame, timers, cleanups } = cardFixture()
+  const initialFrame = initial.children[1]
   try {
     let navigations = 0
     const document = { body: { scrollHeight: 5000 } }
@@ -520,7 +553,9 @@ test('discovery clears failed adapter or directory replacements and recovers on 
       assert.equal(state.bridge.declareProviders([provider('old-m')]).ok, true)
       assert.deepEqual(json(await state.discovery({ provider: 'fixture-p' })).map(row => row.id), ['old-m'])
       state.fail = failure
-      assert.equal(state.bridge.declareProviders([provider('new-m')]).ok, false)
+      const refused = state.bridge.declareProviders([provider('new-m')])
+      assert.equal(refused.ok, false)
+      assert.equal(refused.error.includes(registrationToken), false, 'registration errors sent to the panel must omit credentials')
       assert.equal(state.adapters, 0)
       assert.equal(state.providers, 0)
       assert.deepEqual(json(await state.discovery({ provider: 'fixture-p' })), [], `${failure}: no removed model may be advertised`)

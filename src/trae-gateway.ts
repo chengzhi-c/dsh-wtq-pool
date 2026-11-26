@@ -64,6 +64,7 @@ export interface TraeGateway {
 }
 
 const MODELS_TTL_MS = 10 * 60 * 1000
+const MODELS_TIMEOUT_MS = 30_000
 /**
  * How long a failed directory read is not retried.
  *
@@ -115,6 +116,7 @@ function functionGone(status: number, kind: TraeUpstreamErrorKind | undefined, m
 
 export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
   const logger = options.logger
+  const shutdown = new AbortController()
 
   let cachedModels: readonly TraeSoloModel[] = []
   let catalogAt = 0
@@ -168,14 +170,17 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
         if (candidates.length === 0) throw new Error('no Trae sign-in found on this machine')
         let lastError: unknown
         for (const credential of candidates) {
+          shutdown.signal.throwIfAborted()
           try {
-            const read = await clientFor(credential).fetchModels()
+            const read = await clientFor(credential).fetchModels(
+              AbortSignal.any([shutdown.signal, AbortSignal.timeout(MODELS_TIMEOUT_MS)]),
+            )
             // A partial read is merged into what is already known rather than
             // replacing it. The function that failed is one that would have
             // listed models, and the ones only it lists are absent from this
             // answer - keeping them callable is the difference between a
             // degraded roster and a model that answers 404 for a full TTL.
-            cachedModels = read.partial ? mergeTraeDirectory(cachedModels, read.models) : read.models
+            cachedModels = read.partial ? mergeTraeDirectory(cachedModels, read.models, read.failedFunctions) : read.models
             catalogAt = Date.now()
             catalogFailedAt = 0
             return cachedModels
@@ -543,6 +548,9 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
     baseUrl,
     port,
     models: () => cachedModels,
-    close: server.close,
+    close: async () => {
+      shutdown.abort()
+      await server.close()
+    },
   }
 }

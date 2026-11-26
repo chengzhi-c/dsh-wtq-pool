@@ -84,6 +84,7 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
   const card = React.useRef<HTMLElement>(null)
   const [fullscreen, setFullscreen] = React.useState(false)
   const [generation, setGeneration] = React.useState(0)
+  const [recoveries, setRecoveries] = React.useState(0)
   const [missing, setMissing] = React.useState(false)
   const [probeFailure, setProbeFailure] = React.useState<string | null>(null)
 
@@ -94,12 +95,10 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
   }, [])
 
   const appearance = React.useMemo(() => {
-    if (typeof document === 'undefined') return { base: 'light', lang: 'zh-CN' }
     const root = document.documentElement
     const dark = root.dataset['base'] === 'dark'
       || (root.dataset['base'] === undefined
-        && typeof window !== 'undefined'
-        && window.matchMedia?.('(prefers-color-scheme: dark)').matches === true)
+        && window.matchMedia('(prefers-color-scheme: dark)').matches)
     return { base: dark ? 'dark' : 'light', lang: root.lang === '' ? 'zh-CN' : root.lang }
   }, [generation])
 
@@ -117,6 +116,7 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
   React.useEffect(() => {
     if (view === 'summary') return undefined
     let live = true
+    let retry: ReturnType<typeof setTimeout> | undefined
     setMissing(false)
     setProbeFailure(null)
     const attempts = 3
@@ -125,12 +125,13 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
         .then((response) => {
           if (!live) return
           if (response.ok) {
+            if (remaining < attempts) setRecoveries(value => value + 1)
             setMissing(false)
             setProbeFailure(null)
             return
           }
           if (remaining > 1) {
-            setTimeout(() => probe(remaining - 1), 500)
+            retry = setTimeout(() => probe(remaining - 1), 500)
             return
           }
           // A 404 is the host half still loading or missing its assets. Every
@@ -159,7 +160,7 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
         .catch(() => {
           if (!live) return
           if (remaining > 1) {
-            setTimeout(() => probe(remaining - 1), 500)
+            retry = setTimeout(() => probe(remaining - 1), 500)
             return
           }
           setMissing(true)
@@ -167,7 +168,10 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
         })
     }
     probe(attempts)
-    return () => { live = false }
+    return () => {
+      live = false
+      if (retry !== undefined) clearTimeout(retry)
+    }
   }, [view, generation])
 
   if (view === 'summary') {
@@ -202,7 +206,7 @@ function PanelCard({ t, view }: CardProps): React.ReactElement | null {
       ? React.createElement('div', { style: MISSING_STYLE },
         probeFailure === null ? t('card.missing') : `${t('card.probeFailed')} ${probeFailure}`)
       : React.createElement('iframe', {
-        key: generation,
+        key: generation + recoveries,
         title: t('card.frameTitle'),
         src: panelUrl(appearance),
         style: FRAME_STYLE,

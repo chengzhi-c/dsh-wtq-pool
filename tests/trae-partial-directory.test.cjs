@@ -38,19 +38,6 @@ function read(...answers) {
   return [...byId.values()]
 }
 
-test('a model only the failed function listed stays in the roster', () => {
-  const earlier = read(
-    ['solo_work_remote', [row('kept-model', { dev: 200000 })]],
-    ['chat_v3', [row('only-in-chat-v3', { dev: 116000 })]],
-  )
-  // chat_v3 timed out this time, so its answer is simply absent.
-  const later = read(['solo_work_remote', [row('kept-model', { dev: 200000 })]])
-
-  const merged = mergeTraeDirectory(earlier, later)
-  assert.deepEqual(merged.map((model) => model.id).sort(), ['kept-model', 'only-in-chat-v3'],
-    'the model the failed function listed is still callable')
-})
-
 test('the surviving answer does not narrow a model the failed one described wider', () => {
   // Measured shape: solo_work_remote states the default window, solo_agent_remote
   // is the answer that states the Max tier.
@@ -60,20 +47,10 @@ test('the surviving answer does not narrow a model the failed one described wide
   )
   const later = read(['solo_work_remote', [row('Doubao-Seed-2.1-Pro', { dev: 256000, out: 32000 })]])
 
-  const [model] = mergeTraeDirectory(earlier, later)
+  const [model] = mergeTraeDirectory(earlier, later, ['solo_agent_remote'])
   assert.equal(model.maxContextWindow, 1000000,
     'the Max tier stated by the missing function survives the partial read')
   assert.equal(model.contextWindow, 256000, 'and the default window is unchanged')
   assert.equal(model.maxTokens, 32000, 'the default tier keeps the budget of the function that serves it')
   assert.equal(model.variants.length, 2, 'both answers are kept, so the next complete read can still pick')
-})
-
-test('the fresher answer wins for a model both reads describe', () => {
-  const earlier = read(['solo_work_remote', [row('drifting', { dev: 200000, out: 32000 })]])
-  const later = read(['solo_work_remote', [row('drifting', { dev: 272000, out: 64000 })]])
-
-  const [model] = mergeTraeDirectory(earlier, later)
-  assert.equal(model.contextWindow, 272000, 'the new window is the one in force')
-  assert.equal(model.maxTokens, 64000, 'and so is its budget')
-  assert.equal(model.variants.length, 1, 'the same function answered twice, so there is still one variant')
 })

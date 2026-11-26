@@ -16,6 +16,7 @@
  * @module dsh-wtq-pool/source-pool
  */
 
+import { createHash } from 'node:crypto'
 import { retryAfterHeader } from './loopback'
 
 /** A sign-in as the gateways hand it over; only its expiry is read here. */
@@ -45,26 +46,23 @@ export interface SourcePool {
   sourceFailureHold: Map<string, number>
   sourceCredentialExpired(credential: SourceCredential, now: number): boolean
   /** The key both per-account maps are stored under. */
-  accountStateKey(source: string, region: string, label: string): string
-  noteSourceFailure(source: string, region: string, label: string, retryAfter?: string | null): void
+  accountStateKey(source: string, region: string, id: string): string
+  noteSourceFailure(source: string, region: string, id: string, retryAfter?: string | null): void
   orderSourceCredentials<T extends SourceCredential>(
     source: string,
     region: string,
     credentials: readonly T[],
-    labelOf: (credential: T) => string,
+    idOf: (credential: T) => string,
     rotate: boolean | "peek",
   ): T[]
 }
 
-/**
- * One label per credential, unique inside a source region.
- *
- * Trae and Qoder list an account by its display name, and two accounts can
- * share one. Every per-account decision - the picked account, a failure hold,
- * a check-in row - is keyed by that label, so a duplicate let one account's
- * failure hide the other and put a balance under the wrong name. A repeated
- * name gets the vendor's own user id appended; a name used once is unchanged.
- */
+/** Stable opaque identity, independent of display names and token renewal. */
+export function sourceAccountId(region: string, id: string): string {
+  return createHash('sha256').update(region + "\n" + id).digest('hex')
+}
+
+/** Distinguish equal display names within the account picker. */
 export function uniqueSourceLabels<T>(
   items: readonly T[],
   labelOf: (item: T) => string,
@@ -73,38 +71,48 @@ export function uniqueSourceLabels<T>(
   const labels = items.map(item => labelOf(item))
   const counts = new Map<string, number>()
   for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1)
-  return labels.map((label, index) => {
-    if ((counts.get(label) ?? 0) < 2) return label
+  const named = items.map((item, index) => {
+    const label = labels[index]!
+    if (counts.get(label) === 1) return label
     // The id is a vendor key, not display text: keep a short alphanumeric
     // suffix so the row reads as a name and the suffix still tells two apart.
     // The tail distinguishes sequential ids, whose shared prefix made the
     // suffix itself collide.
-    const item = items[index]
-    const id = item === undefined ? '' : idOf(item).replace(/[^A-Za-z0-9]/gu, '').slice(-8)
+    const id = idOf(item).replace(/[^A-Za-z0-9]/gu, '').slice(-8)
     return id === '' ? label : `${label}#${id}`
   })
+  const namedCounts = new Map<string, number>()
+  for (const name of named) namedCounts.set(name, (namedCounts.get(name) ?? 0) + 1)
+  const used = new Map([...labels, ...named].map(name => [name, '']))
+  const conflicts = items.map((item, index) => ({ index, id: idOf(item) }))
+    .filter(({ index, id }) => id !== '' && namedCounts.get(named[index]!) !== 1 && counts.get(labels[index]!) !== 1)
+    .sort((left, right) => left.id.localeCompare(right.id))
+  // Reserve existing names before sorted allocation. Generated names remember
+  // their id so copies across regions keep the same label.
+  for (const { index, id } of conflicts) {
+    const base = `${labels[index]}#${createHash('sha256').update(id).digest('hex').slice(0, 8)}`
+    let name = base
+    let suffix = 2
+    while (used.has(name) && used.get(name) !== id) name = `${base}-${suffix++}`
+    named[index] = name
+    used.set(name, id)
+  }
+  return named
 }
 
 /** Build the pool the Trae and Qoder gateways share, wired to the host's readers. */
 export function createSourcePool(host: SourcePoolHost): SourcePool {
-  /**
-   * The key one account's state is stored under.
-   *
-   * The region belongs in it: one label can name a copy in each region (the
-   * scanner keys its rows by label *and* region for exactly that reason), so a
-   * key without it hands one region's hold and pack expiry to the other region's
-   * account.
-   */
-  function accountStateKey(source: string, region: string, label: string): string {
-    return host.sourceRegionKey(source, region) + "\n" + label
+  /** Each region has its own holds and package deadlines. */
+  function accountStateKey(source: string, region: string, id: string): string {
+    return host.sourceRegionKey(source, region) + "\n" + id
   }
 
   /** account key -> the timestamp that account's soonest one-off pack runs out at. */
   const sourceCreditExpiry = new Map<string, number>()
 
   /** Unknown expiry sorts last, so it never beats a real deadline. */
-  function packUrgency(source: string, region: string, label: string, now: number): number {
-    const at = sourceCreditExpiry.get(accountStateKey(source, region, label))
+  function packUrgency(source: string, region: string, id: string, now: number): number {
+    const at = sourceCreditExpiry.get(accountStateKey(source, region, id))
     return typeof at === "number" && at > now ? at : Infinity
   }
 
@@ -117,15 +125,15 @@ export function createSourcePool(host: SourcePoolHost): SourcePool {
    */
   const sourceFailureHold = new Map<string, number>()
 
-  function noteSourceFailure(source: string, region: string, label: string, retryAfter?: string | null): void {
+  function noteSourceFailure(source: string, region: string, id: string, retryAfter?: string | null): void {
     const stated = retryAfterHeader(retryAfter)
     const waitMs = stated === undefined ? host.cooldownMs() : Number(stated) * 1000
-    sourceFailureHold.set(accountStateKey(source, region, label), Date.now() + waitMs)
+    sourceFailureHold.set(accountStateKey(source, region, id), Date.now() + waitMs)
   }
 
   /** Whether one sign-in is inside the hold a failure put on it. */
-  function sourceFailureActive(source: string, region: string, label: string, now: number): boolean {
-    const key = accountStateKey(source, region, label)
+  function sourceFailureActive(source: string, region: string, id: string, now: number): boolean {
+    const key = accountStateKey(source, region, id)
     const until = sourceFailureHold.get(key)
     if (until === undefined) return false
     if (until <= now) {
@@ -162,17 +170,13 @@ export function createSourcePool(host: SourcePoolHost): SourcePool {
     source: string,
     region: string,
     credentials: readonly T[],
-    labelOf: (credential: T) => string,
+    idOf: (credential: T) => string,
     rotate: boolean | "peek",
   ): T[] {
     const now = Date.now()
     const stored = host.preferredSourceAccount(source, region)
-    // A stored label only counts while some credential still carries it. The
-    // label is the account's own name (`accountName ?? email ?? userId`), so
-    // renaming or re-signing in retires it; treating the retired label as a live
-    // preference returned here before rotation and the expiry sort could run, and
-    // the panel went on showing round-robin while one account served every chat.
-    const preferred = stored !== "" && credentials.some((credential) => labelOf(credential) === stored)
+    // Missing accounts leave automatic distribution in effect.
+    const preferred = stored !== "" && credentials.some((credential) => idOf(credential) === stored)
       ? stored
       : ""
     const rank = (credential: T): number => {
@@ -180,8 +184,8 @@ export function createSourcePool(host: SourcePoolHost): SourcePool {
       // A sign-in the upstream just refused is tried last among the live ones:
       // the request still falls back to it when it is all there is, but a
       // healthy one answers first instead of every request paying the failure.
-      const held = expired === 0 && sourceFailureActive(source, region, labelOf(credential), now) ? 1 : 0
-      const wanted = preferred !== "" && labelOf(credential) === preferred ? 0 : 1
+      const held = expired === 0 && sourceFailureActive(source, region, idOf(credential), now) ? 1 : 0
+      const wanted = preferred !== "" && idOf(credential) === preferred ? 0 : 1
       return expired * 4 + held * 2 + wanted
     }
     const ordered = credentials.slice().sort((left, right) => rank(left) - rank(right))
@@ -193,10 +197,10 @@ export function createSourcePool(host: SourcePoolHost): SourcePool {
       // same reason it is kept out of the rotation, and re-sorting the whole
       // live set by pack urgency put it straight back in the lead whenever it
       // happened to hold the soonest-expiring pack.
-      const healthy = live.filter((credential) => !sourceFailureActive(source, region, labelOf(credential), now))
-      const held = live.filter((credential) => sourceFailureActive(source, region, labelOf(credential), now))
+      const healthy = live.filter((credential) => !sourceFailureActive(source, region, idOf(credential), now))
+      const held = live.filter((credential) => sourceFailureActive(source, region, idOf(credential), now))
       const byUrgency = (left: T, right: T) =>
-        packUrgency(source, region, labelOf(left), now) - packUrgency(source, region, labelOf(right), now)
+        packUrgency(source, region, idOf(left), now) - packUrgency(source, region, idOf(right), now)
       healthy.sort(byUrgency)
       held.sort(byUrgency)
       return healthy.concat(held, rest)
@@ -209,8 +213,8 @@ export function createSourcePool(host: SourcePoolHost): SourcePool {
     const live = ordered.filter((credential) => !sourceCredentialExpired(credential, now))
     const peek = rotate === "peek"
     if ((rotate !== true && !peek) || preferred !== "" || live.length < 2 || host.sourceDistribution(source) !== "round-robin") return ordered
-    const healthy = live.filter((credential) => !sourceFailureActive(source, region, labelOf(credential), now))
-    const held = live.filter((credential) => sourceFailureActive(source, region, labelOf(credential), now))
+    const healthy = live.filter((credential) => !sourceFailureActive(source, region, idOf(credential), now))
+    const held = live.filter((credential) => sourceFailureActive(source, region, idOf(credential), now))
     if (healthy.length < 2) return ordered
     const key = host.sourceRegionKey(source, region)
     const step = (sourceRotation.get(key) ?? 0) % healthy.length
